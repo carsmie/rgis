@@ -44,7 +44,9 @@ impl Crs {
         let proj4 = if authid == "CRS:84" {
             "+proj=longlat +datum=WGS84 +no_defs".to_string()
         } else {
-            let code: u16 = authid[5..].parse().map_err(|_| anyhow!("unsupported EPSG code in '{id}'"))?;
+            let code: u16 = authid[5..]
+                .parse()
+                .map_err(|_| anyhow!("unsupported EPSG code in '{id}'"))?;
             crs_definitions::from_code(code)
                 .ok_or_else(|| anyhow!("unknown CRS '{authid}'"))?
                 .proj4
@@ -59,16 +61,22 @@ impl Crs {
     pub fn from_authid_or_proj4(authid: &str, proj4: &str) -> Result<Crs> {
         match Crs::from_ogc(authid) {
             Ok(c) => Ok(c),
-            Err(e) if !proj4.trim().is_empty() => {
-                Crs::build(if authid.is_empty() { proj4.to_string() } else { authid.to_string() }, proj4)
-                    .map_err(|e2| anyhow!("{e}; proj4 fallback failed: {e2}"))
-            }
+            Err(e) if !proj4.trim().is_empty() => Crs::build(
+                if authid.is_empty() {
+                    proj4.to_string()
+                } else {
+                    authid.to_string()
+                },
+                proj4,
+            )
+            .map_err(|e2| anyhow!("{e}; proj4 fallback failed: {e2}")),
             Err(e) => Err(e),
         }
     }
 
     fn build(authid: String, proj4: &str) -> Result<Crs> {
-        let proj = Proj::from_proj_string(proj4).map_err(|e| anyhow!("invalid proj string '{proj4}': {e:?}"))?;
+        let proj = Proj::from_proj_string(proj4)
+            .map_err(|e| anyhow!("invalid proj string '{proj4}': {e:?}"))?;
         Ok(Crs {
             geographic: proj.is_latlong(),
             mercator: proj4.contains("+proj=merc"),
@@ -88,7 +96,9 @@ impl Crs {
     }
 
     pub fn epsg_code(&self) -> Option<u32> {
-        self.authid.strip_prefix("EPSG:").and_then(|c| c.parse().ok())
+        self.authid
+            .strip_prefix("EPSG:")
+            .and_then(|c| c.parse().ok())
     }
 
     pub fn urn(&self) -> String {
@@ -99,7 +109,13 @@ impl Crs {
     }
 
     fn same_definition(&self, other: &Crs) -> bool {
-        let canon = |a: &str| if a == "CRS:84" { "EPSG:4326".to_string() } else { a.to_string() };
+        let canon = |a: &str| {
+            if a == "CRS:84" {
+                "EPSG:4326".to_string()
+            } else {
+                a.to_string()
+            }
+        };
         canon(&self.authid) == canon(&other.authid)
     }
 
@@ -116,8 +132,10 @@ impl Crs {
 fn normalise(id: &str) -> Option<String> {
     let s = id.trim();
     let upper = s.to_ascii_uppercase();
-    if matches!(upper.as_str(), "CRS:84" | "OGC:CRS84" | "URN:OGC:DEF:CRS:OGC:1.3:CRS84" | "URN:OGC:DEF:CRS:OGC::CRS84")
-        || upper.ends_with("/OGC/1.3/CRS84")
+    if matches!(
+        upper.as_str(),
+        "CRS:84" | "OGC:CRS84" | "URN:OGC:DEF:CRS:OGC:1.3:CRS84" | "URN:OGC:DEF:CRS:OGC::CRS84"
+    ) || upper.ends_with("/OGC/1.3/CRS84")
     {
         return Some("CRS:84".into());
     }
@@ -143,7 +161,11 @@ pub struct Transform {
 
 impl Transform {
     pub fn new(src: &Crs, dst: &Crs) -> Transform {
-        Transform { identity: src == dst, src: src.clone(), dst: dst.clone() }
+        Transform {
+            identity: src == dst,
+            src: src.clone(),
+            dst: dst.clone(),
+        }
     }
 
     pub fn is_identity(&self) -> bool {
@@ -157,14 +179,23 @@ impl Transform {
         let (mut x, mut y) = (x, y);
         if self.src.geographic {
             // Mercator is undefined at the poles; QGIS clips similarly when rendering.
-            let lim = if self.dst.mercator { 85.051_128_78 } else { 90.0 };
+            let lim = if self.dst.mercator {
+                85.051_128_78
+            } else {
+                90.0
+            };
             y = y.clamp(-lim, lim);
             x = x.to_radians();
             y = y.to_radians();
         }
         let mut p = (x, y);
-        proj4rs::transform::transform(&self.src.proj, &self.dst.proj, &mut p)
-            .map_err(|e| anyhow!("transform {} -> {} failed: {e:?}", self.src.authid, self.dst.authid))?;
+        proj4rs::transform::transform(&self.src.proj, &self.dst.proj, &mut p).map_err(|e| {
+            anyhow!(
+                "transform {} -> {} failed: {e:?}",
+                self.src.authid,
+                self.dst.authid
+            )
+        })?;
         if self.dst.geographic {
             p = (p.0.to_degrees(), p.1.to_degrees());
         }
@@ -205,8 +236,14 @@ mod tests {
     #[test]
     fn parses_identifiers() {
         assert_eq!(normalise("epsg:3857").unwrap(), "EPSG:3857");
-        assert_eq!(normalise("urn:ogc:def:crs:EPSG::4326").unwrap(), "EPSG:4326");
-        assert_eq!(normalise("http://www.opengis.net/def/crs/EPSG/0/25833").unwrap(), "EPSG:25833");
+        assert_eq!(
+            normalise("urn:ogc:def:crs:EPSG::4326").unwrap(),
+            "EPSG:4326"
+        );
+        assert_eq!(
+            normalise("http://www.opengis.net/def/crs/EPSG/0/25833").unwrap(),
+            "EPSG:25833"
+        );
         assert_eq!(normalise("CRS:84").unwrap(), "CRS:84");
         assert!(Crs::from_ogc("EPSG:4326").unwrap().axis_inverted());
         assert!(!Crs::from_ogc("CRS:84").unwrap().axis_inverted());

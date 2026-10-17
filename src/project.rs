@@ -25,7 +25,7 @@ pub enum PropValue {
 #[derive(Debug, Clone)]
 pub enum TreeNode {
     Group(TreeGroup),
-    Layer { id: String, name: String, checked: bool },
+    Layer { id: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,7 +33,6 @@ pub struct TreeGroup {
     pub name: String,
     pub short_name: Option<String>,
     pub title: Option<String>,
-    pub checked: bool,
     pub children: Vec<TreeNode>,
 }
 
@@ -99,13 +98,21 @@ impl MapLayer {
     }
 
     pub fn display_title(&self) -> &str {
-        self.title.as_deref().filter(|t| !t.is_empty()).unwrap_or(&self.name)
+        self.title
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .unwrap_or(&self.name)
     }
 
-    /// Layer extent in WGS84 (from `<wgs84extent>`, else transformed `<extent>`).
+    /// Layer extent in the layer CRS: `<extent>` from the project, else from the provider.
+    pub fn full_extent(&self) -> Option<Rect> {
+        self.extent.or_else(|| self.provider().ok()?.extent)
+    }
+
+    /// Layer extent in WGS84 (from `<wgs84extent>`, else the transformed full extent).
     pub fn wgs84(&self) -> Option<Rect> {
         self.wgs84_extent.or_else(|| {
-            let e = self.extent?;
+            let e = self.full_extent()?;
             Transform::new(&self.crs(), &Crs::wgs84()).rect(&e).ok()
         })
     }
@@ -130,7 +137,10 @@ pub struct Project {
 }
 
 fn text<'a>(n: Node<'a, '_>, tag: &str) -> Option<&'a str> {
-    n.children().find(|c| c.has_tag_name(tag)).and_then(|c| c.text()).map(str::trim)
+    n.children()
+        .find(|c| c.has_tag_name(tag))
+        .and_then(|c| c.text())
+        .map(str::trim)
 }
 
 fn child<'a, 'i>(n: Node<'a, 'i>, tag: &str) -> Option<Node<'a, 'i>> {
@@ -151,14 +161,19 @@ fn srs(n: Option<Node>) -> Option<Crs> {
     if authid.is_empty() && proj4.is_empty() {
         return None;
     }
-    Crs::from_authid_or_proj4(authid, proj4).map_err(|e| warn!("unsupported layer CRS: {e:#}")).ok()
+    Crs::from_authid_or_proj4(authid, proj4)
+        .map_err(|e| warn!("unsupported layer CRS: {e:#}"))
+        .ok()
 }
 
 /// Custom properties come as `<Option type="Map">` (new) or `<property key value>` (old).
 fn custom_property(n: Node, key: &str) -> Option<String> {
     let cp = child(n, "customproperties")?;
     cp.descendants()
-        .find(|c| (c.has_tag_name("Option") && c.attribute("name") == Some(key)) || (c.has_tag_name("property") && c.attribute("key") == Some(key)))
+        .find(|c| {
+            (c.has_tag_name("Option") && c.attribute("name") == Some(key))
+                || (c.has_tag_name("property") && c.attribute("key") == Some(key))
+        })
         .and_then(|c| c.attribute("value"))
         .map(String::from)
 }
@@ -168,7 +183,6 @@ fn parse_group(n: Node) -> TreeGroup {
         name: n.attribute("name").unwrap_or("").to_string(),
         short_name: custom_property(n, "wmsShortName").filter(|s| !s.is_empty()),
         title: custom_property(n, "wmsTitle").filter(|s| !s.is_empty()),
-        checked: n.attribute("checked") != Some("Qt::Unchecked"),
         children: vec![],
     };
     for c in n.children() {
@@ -177,8 +191,6 @@ fn parse_group(n: Node) -> TreeGroup {
         } else if c.has_tag_name("layer-tree-layer") {
             g.children.push(TreeNode::Layer {
                 id: c.attribute("id").unwrap_or("").to_string(),
-                name: c.attribute("name").unwrap_or("").to_string(),
-                checked: c.attribute("checked") != Some("Qt::Unchecked"),
             });
         }
     }
@@ -190,11 +202,18 @@ fn parse_properties(n: Node, prefix: &str, out: &mut HashMap<String, PropValue>)
         let key = format!("{prefix}{}", c.tag_name().name());
         match c.attribute("type") {
             Some("QStringList") => {
-                let v = c.children().filter(|v| v.has_tag_name("value")).map(|v| v.text().unwrap_or("").to_string()).collect();
+                let v = c
+                    .children()
+                    .filter(|v| v.has_tag_name("value"))
+                    .map(|v| v.text().unwrap_or("").to_string())
+                    .collect();
                 out.insert(key, PropValue::List(v));
             }
             Some(_) => {
-                out.insert(key, PropValue::Text(c.text().unwrap_or("").trim().to_string()));
+                out.insert(
+                    key,
+                    PropValue::Text(c.text().unwrap_or("").trim().to_string()),
+                );
             }
             None => parse_properties(c, &format!("{key}/"), out),
         }
@@ -205,13 +224,22 @@ fn hidden_fields(ml: Node, flag: &str, legacy_tag: &str) -> Vec<String> {
     let mut out: Vec<String> = child(ml, "fieldConfiguration")
         .map(|fc| {
             fc.children()
-                .filter(|f| f.has_tag_name("field") && f.attribute("configurationFlags").is_some_and(|fl| fl.split('|').any(|x| x == flag)))
+                .filter(|f| {
+                    f.has_tag_name("field")
+                        && f.attribute("configurationFlags")
+                            .is_some_and(|fl| fl.split('|').any(|x| x == flag))
+                })
                 .filter_map(|f| f.attribute("name").map(String::from))
                 .collect()
         })
         .unwrap_or_default();
     if let Some(ex) = child(ml, legacy_tag) {
-        out.extend(ex.children().filter(|a| a.has_tag_name("attribute")).filter_map(|a| a.text()).map(String::from));
+        out.extend(
+            ex.children()
+                .filter(|a| a.has_tag_name("attribute"))
+                .filter_map(|a| a.text())
+                .map(String::from),
+        );
     }
     out
 }
@@ -222,9 +250,15 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
     MapLayer {
         id: text(ml, "id").unwrap_or("").to_string(),
         name: text(ml, "layername").unwrap_or("").to_string(),
-        short_name: text(ml, "shortname").filter(|s| !s.is_empty()).map(String::from),
-        title: text(ml, "title").filter(|s| !s.is_empty()).map(String::from),
-        abstract_: text(ml, "abstract").filter(|s| !s.is_empty()).map(String::from),
+        short_name: text(ml, "shortname")
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        title: text(ml, "title")
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        abstract_: text(ml, "abstract")
+            .filter(|s| !s.is_empty())
+            .map(String::from),
         kind: flag("type").unwrap_or("vector").to_string(),
         provider_key: text(ml, "provider").unwrap_or("ogr").to_string(),
         datasource: text(ml, "datasource").unwrap_or("").to_string(),
@@ -232,11 +266,22 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
         extent: rect(child(ml, "extent")),
         wgs84_extent: rect(child(ml, "wgs84extent")),
         geometry: flag("geometry").unwrap_or("").to_string(),
-        renderer: child(ml, "renderer-v2").map(Renderer::parse).unwrap_or(Renderer::Null),
-        opacity: text(ml, "layerOpacity").and_then(|v| v.parse().ok()).unwrap_or(1.0),
-        scale_range: (flag("hasScaleBasedVisibilityFlag") == Some("1")).then(|| (scale("minScale"), scale("maxScale"))),
-        style_name: child(ml, "map-layer-style-manager").and_then(|s| s.attribute("current")).filter(|s| !s.is_empty()).unwrap_or("default").to_string(),
-        identifiable: child(ml, "flags").and_then(|f| text(f, "Identifiable")).is_none_or(|v| v != "0"),
+        renderer: child(ml, "renderer-v2")
+            .map(Renderer::parse)
+            .unwrap_or(Renderer::Null),
+        opacity: text(ml, "layerOpacity")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0),
+        scale_range: (flag("hasScaleBasedVisibilityFlag") == Some("1"))
+            .then(|| (scale("minScale"), scale("maxScale"))),
+        style_name: child(ml, "map-layer-style-manager")
+            .and_then(|s| s.attribute("current"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("default")
+            .to_string(),
+        identifiable: child(ml, "flags")
+            .and_then(|f| text(f, "Identifiable"))
+            .is_none_or(|v| v != "0"),
         hidden_wms: hidden_fields(ml, "HideFromWms", "excludeAttributesWMS"),
         hidden_wfs: hidden_fields(ml, "HideFromWfs", "excludeAttributesWFS"),
         base_dir: base_dir.to_path_buf(),
@@ -246,11 +291,15 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
 
 /// Reads the project XML, unpacking `.qgz` archives like QgsProject::unzip.
 fn read_xml(path: &Path) -> Result<String> {
-    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("qgz")) {
-        let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?).context("not a valid .qgz archive")?;
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("qgz"))
+    {
+        let mut zip =
+            zip::ZipArchive::new(std::fs::File::open(path)?).context("not a valid .qgz archive")?;
         for i in 0..zip.len() {
             let mut f = zip.by_index(i)?;
-            if f.name().to_ascii_lowercase().ends_with(".qgs") {
+            if f.name()?.to_ascii_lowercase().ends_with(".qgs") {
                 let mut s = String::new();
                 f.read_to_string(&mut s)?;
                 return Ok(s);
@@ -264,11 +313,19 @@ fn read_xml(path: &Path) -> Result<String> {
 impl Project {
     pub fn read(path: &Path) -> Result<Project> {
         let started = std::time::Instant::now();
-        let path = path.canonicalize().with_context(|| format!("cannot open project {}", path.display()))?;
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("cannot open project {}", path.display()))?;
         let last_modified = std::fs::metadata(&path)?.modified()?;
         let xml = read_xml(&path)?;
-        let doc = Document::parse_with_options(&xml, ParsingOptions { allow_dtd: true, ..Default::default() })
-            .with_context(|| format!("invalid project XML in {}", path.display()))?;
+        let doc = Document::parse_with_options(
+            &xml,
+            ParsingOptions {
+                allow_dtd: true,
+                ..Default::default()
+            },
+        )
+        .with_context(|| format!("invalid project XML in {}", path.display()))?;
         let root = doc.root_element();
         if !root.has_tag_name("qgis") {
             bail!("{} is not a QGIS project", path.display());
@@ -287,9 +344,15 @@ impl Project {
             parse_properties(p, "", &mut properties);
         }
         let project = Project {
-            title: text(root, "title").filter(|t| !t.is_empty()).or(root.attribute("projectname")).unwrap_or("").to_string(),
+            title: text(root, "title")
+                .filter(|t| !t.is_empty())
+                .or(root.attribute("projectname"))
+                .unwrap_or("")
+                .to_string(),
             crs: srs(child(root, "projectCrs")).unwrap_or_else(Crs::wgs84),
-            tree: child(root, "layer-tree-group").map(parse_group).unwrap_or_default(),
+            tree: child(root, "layer-tree-group")
+                .map(parse_group)
+                .unwrap_or_default(),
             layers,
             properties,
             path,
@@ -330,16 +393,22 @@ impl Project {
     }
 
     pub fn int_prop(&self, key: &str) -> Option<i64> {
-        self.text_prop(key).and_then(|v| v.parse().ok()).filter(|v| *v > 0)
+        self.text_prop(key)
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
     }
 
     /// WMSRootName, else the project title (QgsWmsRenderContext::initNicknameLayers).
     pub fn root_name(&self) -> String {
-        self.text_prop("WMSRootName").map(String::from).unwrap_or_else(|| self.title.clone())
+        self.text_prop("WMSRootName")
+            .map(String::from)
+            .unwrap_or_else(|| self.title.clone())
     }
 
     pub fn service_title(&self) -> String {
-        self.text_prop("WMSServiceTitle").map(String::from).unwrap_or_else(|| self.title.clone())
+        self.text_prop("WMSServiceTitle")
+            .map(String::from)
+            .unwrap_or_else(|| self.title.clone())
     }
 
     /// QgsWmsRenderContext::layerNickname: id if WMSUseLayerIDs, else short name, else name.
@@ -355,15 +424,21 @@ impl Project {
     }
 
     pub fn is_restricted(&self, l: &MapLayer) -> bool {
-        self.restricted().iter().any(|r| *r == l.name)
+        self.restricted().contains(&l.name)
     }
 
     pub fn wfs_layers(&self) -> Vec<Arc<MapLayer>> {
-        self.list_prop("WFSLayers").iter().filter_map(|id| self.layers.get(id).cloned()).collect()
+        self.list_prop("WFSLayers")
+            .iter()
+            .filter_map(|id| self.layers.get(id).cloned())
+            .collect()
     }
 
     pub fn wfs_precision(&self, l: &MapLayer) -> usize {
-        self.text_prop(&format!("WFSLayersPrecision/{}", l.id)).and_then(|v| v.parse().ok()).unwrap_or(8)
+        // QgsServerProjectUtils::wfsLayerPrecision defaults to 6.
+        self.text_prop(&format!("WFSLayersPrecision/{}", l.id))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6)
     }
 
     /// Advertised CRSs (WMSCrsList), always including the project CRS, EPSG:4326 and CRS:84.
@@ -371,7 +446,11 @@ impl Project {
         let mut v = vec!["CRS:84".to_string()];
         let mut configured = self.list_prop("WMSCrsList");
         if configured.is_empty() {
-            configured = vec![self.crs.authid.clone(), "EPSG:4326".into(), "EPSG:3857".into()];
+            configured = vec![
+                self.crs.authid.clone(),
+                "EPSG:4326".into(),
+                "EPSG:3857".into(),
+            ];
         }
         for c in configured {
             if !v.contains(&c) {
@@ -384,18 +463,16 @@ impl Project {
     /// WMSExtent (in the project CRS) or the union of all layer extents.
     pub fn extent(&self) -> Rect {
         let configured = self.list_prop("WMSExtent");
-        if configured.len() == 4 {
-            if let Some(r) = Rect::parse(&configured.join(",")) {
+        if configured.len() == 4
+            && let Some(r) = Rect::parse(&configured.join(",")) {
                 return r;
             }
-        }
         let mut r = Rect::empty();
         for l in self.layers.values() {
-            if let Some(e) = l.extent {
-                if let Ok(t) = Transform::new(&l.crs(), &self.crs).rect(&e) {
+            if let Some(e) = l.full_extent()
+                && let Ok(t) = Transform::new(&l.crs(), &self.crs).rect(&e) {
                     r.union(&t);
                 }
-            }
         }
         r
     }
@@ -422,7 +499,10 @@ impl Project {
     }
 
     pub fn layer_by_nickname(&self, name: &str) -> Option<Arc<MapLayer>> {
-        self.layers.values().find(|l| self.nickname(l) == name && !self.is_restricted(l)).cloned()
+        self.layers
+            .values()
+            .find(|l| self.nickname(l) == name && !self.is_restricted(l))
+            .cloned()
     }
 
     /// Resolve a WMS layer/group name into concrete layers, top of the legend first.
@@ -431,6 +511,13 @@ impl Project {
             return Some(vec![l]);
         }
         let g = self.find_group(name)?;
-        Some(g.layer_ids().iter().filter_map(|id| self.layers.get(id)).filter(|l| !self.is_restricted(l)).cloned().collect())
+        Some(
+            g.layer_ids()
+                .iter()
+                .filter_map(|id| self.layers.get(id))
+                .filter(|l| !self.is_restricted(l))
+                .cloned()
+                .collect(),
+        )
     }
 }

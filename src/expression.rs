@@ -61,17 +61,31 @@ fn lex(s: &str) -> Result<Vec<Tok>> {
                 v.push(c[i]);
                 i += 1;
             }
-            out.push(if q == '\'' { Tok::Str(v) } else { Tok::Field(v) });
-        } else if ch.is_ascii_digit() || (ch == '.' && c.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
+            out.push(if q == '\'' {
+                Tok::Str(v)
+            } else {
+                Tok::Field(v)
+            });
+        } else if ch.is_ascii_digit()
+            || (ch == '.' && c.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
+        {
             let st = i;
-            while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '.' || ((c[i] == '-' || c[i] == '+') && matches!(c[i - 1], 'e' | 'E'))) {
+            while i < c.len()
+                && (c[i].is_ascii_alphanumeric()
+                    || c[i] == '.'
+                    || ((c[i] == '-' || c[i] == '+') && matches!(c[i - 1], 'e' | 'E')))
+            {
                 i += 1;
             }
             let t: String = c[st..i].iter().collect();
-            out.push(Tok::Num(t.parse().map_err(|_| anyhow!("bad number '{t}'"))?));
+            out.push(Tok::Num(
+                t.parse().map_err(|_| anyhow!("bad number '{t}'"))?,
+            ));
         } else if ch.is_alphabetic() || ch == '_' || ch == '$' || ch == '@' {
             let st = i;
-            while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '$' || c[i] == '@') {
+            while i < c.len()
+                && (c[i].is_alphanumeric() || c[i] == '_' || c[i] == '$' || c[i] == '@')
+            {
                 i += 1;
             }
             out.push(Tok::Ident(c[st..i].iter().collect()));
@@ -123,7 +137,8 @@ impl Parser {
         matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(k))
     }
     fn kw2(&self, a: &str, b: &str) -> bool {
-        self.kw(a) && matches!(self.t.get(self.p + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(b))
+        self.kw(a)
+            && matches!(self.t.get(self.p + 1), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(b))
     }
     fn op(&self, o: &str) -> bool {
         matches!(self.peek(), Some(Tok::Op(x)) if *x == o)
@@ -212,7 +227,11 @@ impl Parser {
             }
             let r = self.concat()?;
             let e = Expr::Binary("=", Box::new(l), Box::new(r));
-            return Ok(if neg { Expr::Unary("NOT", Box::new(e)) } else { e });
+            return Ok(if neg {
+                Expr::Unary("NOT", Box::new(e))
+            } else {
+                e
+            });
         }
         Ok(l)
     }
@@ -227,7 +246,13 @@ impl Parser {
     fn add(&mut self) -> Result<Expr> {
         let mut l = self.mul()?;
         loop {
-            let o = if self.op("+") { "+" } else if self.op("-") { "-" } else { break };
+            let o = if self.op("+") {
+                "+"
+            } else if self.op("-") {
+                "-"
+            } else {
+                break;
+            };
             self.p += 1;
             l = Expr::Binary(o, Box::new(l), Box::new(self.mul()?));
         }
@@ -258,7 +283,10 @@ impl Parser {
         self.primary()
     }
     fn primary(&mut self) -> Result<Expr> {
-        let t = self.peek().cloned().ok_or_else(|| anyhow!("unexpected end of expression"))?;
+        let t = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| anyhow!("unexpected end of expression"))?;
         self.p += 1;
         Ok(match t {
             Tok::Num(n) => Expr::Lit(serde_json::json!(n)),
@@ -273,7 +301,9 @@ impl Parser {
                 "TRUE" => Expr::Lit(Value::Bool(true)),
                 "FALSE" => Expr::Lit(Value::Bool(false)),
                 "NULL" => Expr::Lit(Value::Null),
-                _ if self.peek() == Some(&Tok::LParen) => Expr::Call(id.to_ascii_lowercase(), self.list()?),
+                _ if self.peek() == Some(&Tok::LParen) => {
+                    Expr::Call(id.to_ascii_lowercase(), self.list()?)
+                }
                 _ => Expr::Field(id),
             },
             other => bail!("unexpected token {other:?} in expression"),
@@ -302,21 +332,29 @@ impl Expr {
             Expr::Lit(v) => v.clone(),
             Expr::Field(f) => a
                 .get(f)
-                .or_else(|| a.iter().find(|(k, _)| k.eq_ignore_ascii_case(f)).map(|(_, v)| v))
+                .or_else(|| {
+                    a.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(f))
+                        .map(|(_, v)| v)
+                })
                 .cloned()
                 .unwrap_or(Value::Null),
             Expr::Unary("NOT", e) => match e.eval(a) {
                 Value::Null => Value::Null,
                 v => Value::Bool(!truthy(&v)),
             },
-            Expr::Unary(_, e) => num(&e.eval(a)).map(|n| serde_json::json!(-n)).unwrap_or(Value::Null),
+            Expr::Unary(_, e) => num(&e.eval(a))
+                .map(|n| serde_json::json!(-n))
+                .unwrap_or(Value::Null),
             Expr::IsNull(e, neg) => Value::Bool(e.eval(a).is_null() != *neg),
             Expr::In(e, list, neg) => {
                 let v = e.eval(a);
                 if v.is_null() {
                     return Value::Null;
                 }
-                let found = list.iter().any(|x| compare(&v, &x.eval(a)) == Some(std::cmp::Ordering::Equal));
+                let found = list
+                    .iter()
+                    .any(|x| compare(&v, &x.eval(a)) == Some(std::cmp::Ordering::Equal));
                 Value::Bool(found != *neg)
             }
             Expr::Binary(op, l, r) => {
@@ -357,14 +395,18 @@ impl Expr {
                             };
                             serde_json::json!(v)
                         }
-                        _ if *op == "+" && lv.is_string() && rv.is_string() => Value::String(to_str(&lv) + &to_str(&rv)),
+                        _ if *op == "+" && lv.is_string() && rv.is_string() => {
+                            Value::String(to_str(&lv) + &to_str(&rv))
+                        }
                         _ => Value::Null,
                     },
                     cmp_op => {
                         if lv.is_null() || rv.is_null() {
                             return Value::Null;
                         }
-                        let Some(o) = compare(&lv, &rv) else { return Value::Null };
+                        let Some(o) = compare(&lv, &rv) else {
+                            return Value::Null;
+                        };
                         use std::cmp::Ordering::*;
                         Value::Bool(match cmp_op {
                             "=" => o == Equal,
@@ -382,20 +424,52 @@ impl Expr {
                 let v: Vec<Value> = args.iter().map(|e| e.eval(a)).collect();
                 let first = v.first().cloned().unwrap_or(Value::Null);
                 match f.as_str() {
-                    "lower" => first.as_str().map(|s| Value::String(s.to_lowercase())).unwrap_or(Value::Null),
-                    "upper" => first.as_str().map(|s| Value::String(s.to_uppercase())).unwrap_or(Value::Null),
-                    "length" => first.as_str().map(|s| serde_json::json!(s.chars().count())).unwrap_or(Value::Null),
+                    "lower" => first
+                        .as_str()
+                        .map(|s| Value::String(s.to_lowercase()))
+                        .unwrap_or(Value::Null),
+                    "upper" => first
+                        .as_str()
+                        .map(|s| Value::String(s.to_uppercase()))
+                        .unwrap_or(Value::Null),
+                    "length" => first
+                        .as_str()
+                        .map(|s| serde_json::json!(s.chars().count()))
+                        .unwrap_or(Value::Null),
                     "coalesce" => v.into_iter().find(|x| !x.is_null()).unwrap_or(Value::Null),
-                    "to_string" | "tostring" => if first.is_null() { Value::Null } else { Value::String(to_str(&first)) },
-                    "to_int" | "toint" => num(&first).map(|n| serde_json::json!(n.trunc() as i64)).unwrap_or(Value::Null),
-                    "to_real" | "toreal" => num(&first).map(|n| serde_json::json!(n)).unwrap_or(Value::Null),
-                    "abs" => num(&first).map(|n| serde_json::json!(n.abs())).unwrap_or(Value::Null),
+                    "to_string" | "tostring" => {
+                        if first.is_null() {
+                            Value::Null
+                        } else {
+                            Value::String(to_str(&first))
+                        }
+                    }
+                    "to_int" | "toint" => num(&first)
+                        .map(|n| serde_json::json!(n.trunc() as i64))
+                        .unwrap_or(Value::Null),
+                    "to_real" | "toreal" => num(&first)
+                        .map(|n| serde_json::json!(n))
+                        .unwrap_or(Value::Null),
+                    "abs" => num(&first)
+                        .map(|n| serde_json::json!(n.abs()))
+                        .unwrap_or(Value::Null),
                     "round" => {
                         let places = v.get(1).and_then(num).unwrap_or(0.0) as i32;
-                        num(&first).map(|n| serde_json::json!((n * 10f64.powi(places)).round() / 10f64.powi(places))).unwrap_or(Value::Null)
+                        num(&first)
+                            .map(|n| {
+                                serde_json::json!(
+                                    (n * 10f64.powi(places)).round() / 10f64.powi(places)
+                                )
+                            })
+                            .unwrap_or(Value::Null)
                     }
-                    "concat" => Value::String(v.iter().filter(|x| !x.is_null()).map(to_str).collect()),
-                    "attribute" => first.as_str().and_then(|n| a.get(n).cloned()).unwrap_or(Value::Null),
+                    "concat" => {
+                        Value::String(v.iter().filter(|x| !x.is_null()).map(to_str).collect())
+                    }
+                    "attribute" => first
+                        .as_str()
+                        .and_then(|n| a.get(n).cloned())
+                        .unwrap_or(Value::Null),
                     _ => Value::Null,
                 }
             }
@@ -442,17 +516,19 @@ pub fn to_str(v: &Value) -> String {
 /// Numeric comparison when both sides are numeric, string comparison otherwise.
 pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let numeric = |v: &Value| matches!(v, Value::Number(_) | Value::Bool(_));
-    if numeric(a) || numeric(b) {
-        if let (Some(x), Some(y)) = (num(a), num(b)) {
+    if (numeric(a) || numeric(b))
+        && let (Some(x), Some(y)) = (num(a), num(b)) {
             return x.partial_cmp(&y);
         }
-    }
     Some(to_str(a).cmp(&to_str(b)))
 }
 
 fn like(s: &str, pat: &str, ci: bool) -> bool {
     let (s, pat): (Vec<char>, Vec<char>) = if ci {
-        (s.to_lowercase().chars().collect(), pat.to_lowercase().chars().collect())
+        (
+            s.to_lowercase().chars().collect(),
+            pat.to_lowercase().chars().collect(),
+        )
     } else {
         (s.chars().collect(), pat.chars().collect())
     };

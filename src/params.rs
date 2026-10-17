@@ -31,7 +31,12 @@ impl Params {
 
     pub fn list(&self, key: &str) -> Vec<String> {
         self.get(key)
-            .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

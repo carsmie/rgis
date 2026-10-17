@@ -1,0 +1,326 @@
+//! The request pipeline, mirroring QgsServer::handleRequest:
+//! parse parameters → resolve the project path → load it through the config cache →
+//! dispatch to an OGC API (no SERVICE) or to a registered OWS service module.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+use parking_lot::Mutex;
+use tracing::{info, warn};
+
+use crate::params::Params;
+use crate::project::Project;
+
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    /// Scheme + host + path, used to build OnlineResource URLs.
+    pub base_url: String,
+}
+
+pub struct Response {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    pub fn ok(content_type: &str, body: impl Into<Vec<u8>>) -> Response {
+        Response {
+            status: 200,
+            content_type: content_type.to_string(),
+            body: body.into(),
+        }
+    }
+    pub fn json(v: &serde_json::Value) -> Response {
+        Response::ok(
+            "application/json",
+            serde_json::to_vec(v).unwrap_or_default(),
+        )
+    }
+}
+
+/// An OGC service exception (QgsServiceException / QgsBadRequestException).
+#[derive(Debug)]
+pub struct OwsError {
+    pub code: String,
+    pub message: String,
+    pub status: u16,
+}
+
+impl OwsError {
+    pub fn new(code: &str, message: impl Into<String>, status: u16) -> OwsError {
+        OwsError {
+            code: code.to_string(),
+            message: message.into(),
+            status,
+        }
+    }
+    pub fn bad(code: &str, message: impl Into<String>) -> OwsError {
+        OwsError::new(code, message, 400)
+    }
+    pub fn internal(e: impl std::fmt::Display) -> OwsError {
+        OwsError::new("InternalServerError", e.to_string(), 500)
+    }
+    pub fn to_response(&self, version: &str) -> Response {
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ServiceExceptionReport version=\"{version}\" xmlns=\"http://www.opengis.net/ogc\">\n <ServiceException code=\"{}\">{}</ServiceException>\n</ServiceExceptionReport>\n",
+            esc(&self.code),
+            esc(&self.message)
+        );
+        Response {
+            status: self.status,
+            content_type: "text/xml; charset=utf-8".into(),
+            body: body.into_bytes(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for OwsError {
+    fn from(e: anyhow::Error) -> Self {
+        OwsError::internal(format!("{e:#}"))
+    }
+}
+
+pub fn esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// What a service module gets for one request.
+pub struct Context<'a> {
+    pub params: &'a Params,
+    pub project: &'a Project,
+    /// Base URL for links in capabilities, ending in '?' or '&'.
+    pub service_url: String,
+}
+
+/// An OWS service module (QgsService); WMS and WFS register themselves per version.
+pub trait Service: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn version(&self) -> &'static str;
+    fn execute(&self, ctx: &Context) -> Result<Response, OwsError>;
+}
+
+/// QgsServiceRegistry: services keyed by (NAME, version) with a default version per name.
+#[derive(Default)]
+pub struct ServiceRegistry {
+    services: HashMap<(String, String), Arc<dyn Service>>,
+    defaults: HashMap<String, String>,
+}
+
+impl ServiceRegistry {
+    pub fn register(&mut self, s: Arc<dyn Service>) {
+        let (name, version) = (s.name().to_string(), s.version().to_string());
+        info!("Adding service {name} {version}");
+        let newer = self
+            .defaults
+            .get(&name)
+            .is_none_or(|d| version_key(&version) > version_key(d));
+        if newer {
+            self.defaults.insert(name.clone(), version.clone());
+        }
+        self.services.insert((name, version), s);
+    }
+
+    pub fn get(&self, name: &str, version: Option<&str>) -> Option<Arc<dyn Service>> {
+        let default = self.defaults.get(name)?;
+        let v = version.unwrap_or(default);
+        match self.services.get(&(name.to_string(), v.to_string())) {
+            Some(s) => Some(s.clone()),
+            None => {
+                warn!("Service {name} {v} not found, returning default");
+                self.services
+                    .get(&(name.to_string(), default.clone()))
+                    .cloned()
+            }
+        }
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.defaults.keys().cloned().collect();
+        v.sort();
+        v
+    }
+}
+
+fn version_key(v: &str) -> Vec<u32> {
+    v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+}
+
+/// QgsConfigCache with the 'filesystem' strategy, done by comparing modification times.
+#[derive(Default)]
+pub struct ConfigCache {
+    projects: Mutex<HashMap<PathBuf, Arc<Project>>>,
+}
+
+impl ConfigCache {
+    pub fn project(&self, path: &Path) -> anyhow::Result<Arc<Project>> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("cannot open project {}: {e}", path.display()))?;
+        let mtime = std::fs::metadata(&canonical)?.modified()?;
+        if let Some(p) = self.projects.lock().get(&canonical) {
+            if p.last_modified >= mtime {
+                return Ok(p.clone());
+            }
+            info!("project {} changed on disk, reloading", canonical.display());
+        }
+        let p = Arc::new(Project::read(&canonical)?);
+        self.projects.lock().insert(canonical, p.clone());
+        Ok(p)
+    }
+}
+
+pub type ApiHandler = fn(&Request, &Params, Option<&Project>) -> Result<Response, OwsError>;
+
+pub struct Settings {
+    /// QGIS_PROJECT_FILE: a fixed project that overrides MAP.
+    pub fixed_project: Option<PathBuf>,
+    /// Used when no MAP is given (qgis_mapserver -p).
+    pub default_project: Option<PathBuf>,
+    /// When set, MAP must point inside this directory.
+    pub projects_dir: Option<PathBuf>,
+}
+
+pub struct Server {
+    settings: Settings,
+    cache: ConfigCache,
+    registry: ServiceRegistry,
+    apis: Vec<(&'static str, ApiHandler)>,
+}
+
+impl Server {
+    pub fn new(settings: Settings) -> Server {
+        let mut registry = ServiceRegistry::default();
+        // QgsServiceNativeLoader loads these from shared libraries; here they are compiled in.
+        crate::services::wms::register(&mut registry);
+        crate::services::wfs::register(&mut registry);
+        Server {
+            settings,
+            cache: ConfigCache::default(),
+            registry,
+            apis: vec![("/wfs3", crate::services::oapif::handle)],
+        }
+    }
+
+    /// QgsServer::configPath
+    fn config_path(&self, params: &Params) -> Result<Option<PathBuf>, OwsError> {
+        if let Some(p) = &self.settings.fixed_project {
+            return Ok(Some(p.clone()));
+        }
+        if let Some(map) = params.get("MAP") {
+            let p = PathBuf::from(map);
+            if let Some(dir) = &self.settings.projects_dir {
+                let ok = p
+                    .canonicalize()
+                    .ok()
+                    .zip(dir.canonicalize().ok())
+                    .is_some_and(|(p, d)| p.starts_with(d));
+                if !ok {
+                    return Err(OwsError::new(
+                        "Forbidden",
+                        format!("MAP '{map}' is outside the projects directory"),
+                        403,
+                    ));
+                }
+            }
+            return Ok(Some(p));
+        }
+        Ok(self.settings.default_project.clone())
+    }
+
+    pub fn handle(&self, req: &Request) -> Response {
+        let started = Instant::now();
+        let params = Params::from_query(&req.query);
+        let service = params.service();
+        let resp = self.dispatch(req, &params, &service);
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("{} {}: {} ({})", req.method, req.path, e.message, e.code);
+                let version = if service == "WFS" { "1.2.0" } else { "1.3.0" };
+                e.to_response(version)
+            }
+        };
+        info!(
+            "{} {}?{} -> {} {} ({} bytes) in {:?}",
+            req.method,
+            req.path,
+            req.query,
+            resp.status,
+            resp.content_type,
+            resp.body.len(),
+            started.elapsed()
+        );
+        resp
+    }
+
+    fn dispatch(
+        &self,
+        req: &Request,
+        params: &Params,
+        service: &str,
+    ) -> Result<Response, OwsError> {
+        let project = match self.config_path(params)? {
+            Some(path) => Some(
+                self.cache
+                    .project(&path)
+                    .map_err(|e| OwsError::bad("ProjectFileError", format!("{e:#}")))?,
+            ),
+            None => None,
+        };
+        if service.is_empty() {
+            // No SERVICE: try an OGC API (QgsServiceRegistry::apiForRequest).
+            if let Some((_, api)) = self.apis.iter().find(|(root, _)| {
+                req.path == *root
+                    || req.path.starts_with(&format!("{root}/"))
+                    || req.path.starts_with(&format!("{root}."))
+            }) {
+                return api(req, params, project.as_deref());
+            }
+            return Err(OwsError::bad(
+                "Service configuration error",
+                format!(
+                    "Service unknown or unsupported. Current supported services (case-sensitive): {}, or use a WFS3 (OGC API Features) endpoint",
+                    self.registry.names().join(" ")
+                ),
+            ));
+        }
+        let project = project.ok_or_else(|| {
+            OwsError::bad("Server", "Project file error. For OWS services: please provide a SERVICE and a MAP parameter pointing to a valid QGIS project file")
+        })?;
+        let module = self.registry.get(service, params.get("VERSION")).ok_or_else(|| {
+            OwsError::bad(
+                "Service configuration error",
+                format!("Service unknown or unsupported. Current supported services (case-sensitive): {}", self.registry.names().join(" ")),
+            )
+        })?;
+        let mut service_url = project
+            .text_prop(if service == "WFS" { "WFSUrl" } else { "WMSUrl" })
+            .map(String::from)
+            .unwrap_or_else(|| req.base_url.clone());
+        service_url.push(if service_url.contains('?') { '&' } else { '?' });
+        if let (Some(map), None) = (params.get("MAP"), &self.settings.fixed_project) {
+            service_url += &format!("MAP={}&", urlencoding::encode(map));
+        }
+        let ctx = Context {
+            params,
+            project: &project,
+            service_url,
+        };
+        module.execute(&ctx)
+    }
+}
