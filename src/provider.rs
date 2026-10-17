@@ -363,7 +363,7 @@ fn run<T: Send + 'static>(
 impl HttpFile {
     fn open(url: &str) -> Result<HttpFile> {
         let client = reqwest::Client::builder()
-            .user_agent(concat!("qgis-server-rs/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let (c, u) = (client.clone(), url.to_string());
         let len = run(async move {

@@ -1,4 +1,4 @@
-//! Compare two PNGs (e.g. QGIS Server vs qgis-server-rs output).
+//! Compare two PNGs (e.g. QGIS Server vs rGIS output).
 //!
 //! cargo run --release --example compare_png -- a.png b.png [diff.png]
 //!

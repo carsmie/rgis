@@ -1,4 +1,4 @@
-"""For each QGIS project: GetMap of the root layer from QGIS Server and qgis-server-rs."""
+"""For each QGIS project: GetMap of the root layer from QGIS Server and rGIS."""
 import os
 import sys
 import urllib.parse

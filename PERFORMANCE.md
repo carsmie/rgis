@@ -1,9 +1,9 @@
-# Performance: qgis-server-rs vs QGIS Server
+# Performance: rGIS vs QGIS Server
 
 Measured on 2026-10-17 on an Apple M5 (10 cores), both servers on the same machine and
 project (`demo/earth_local.qgs`: Natural Earth countries, lakes and boundaries as local
 FlatGeobuf files). QGIS Server 4.3.0-Master is a `Release` build from
-`~/Projekte/kartverket/QGIS/build-release`; qgis-server-rs is `cargo build --release`.
+`~/Projekte/kartverket/QGIS/build-release`; rGIS is `cargo build --release`.
 The load generator is `examples/bench.rs`; workloads come from `tools/make_bench_urls.py`
 and the matrix from `tools/run_bench.py`.
 
@@ -14,18 +14,18 @@ and the matrix from `tools/run_bench.py`.
 (`src/server/qgis_mapserver.cpp:646-650`). Production deployments scale with **several
 FastCGI processes**, one per core. So QGIS appears below in two forms: one process
 (×1), and 10 processes behind round-robin (×10, like a typical FastCGI pool on this
-machine). qgis-server-rs is always **one process** that renders on a thread pool.
+machine). rGIS is always **one process** that renders on a thread pool.
 
 ## Startup
 
-| | QGIS Server | qgis-server-rs |
+| | QGIS Server | rGIS |
 |---|---|---|
 | Launch → project loaded → first GetCapabilities answered | 0.8–1.1 s | 0.02 s |
 | First (cold) 600×700 GetMap | 98 ms | 51 ms |
 
 ## Latency, one client, sequential requests (p50 / p95)
 
-| Request | QGIS Server | qgis-server-rs | Speed-up (p50) |
+| Request | QGIS Server | rGIS | Speed-up (p50) |
 |---|---|---|---|
 | WMS GetCapabilities | 0.4 / 0.5 ms | 0.1 / 0.2 ms | ~3× |
 | GetMap world, 800×400, EPSG:4326 | 39.1 / 40.1 ms | 37.3 / 39.0 ms | 1.05× |
@@ -37,7 +37,7 @@ machine). qgis-server-rs is always **one process** that renders on a thread pool
 
 ## Throughput, tile workload, concurrent clients
 
-| Clients | QGIS ×1 | QGIS ×10 processes | qgis-server-rs ×1 |
+| Clients | QGIS ×1 | QGIS ×10 processes | rGIS ×1 |
 |---|---|---|---|
 | 1 | 202 req/s (p50 4.7 ms) | 183 req/s (p50 5.3 ms) | 344 req/s (p50 2.8 ms) |
 | 4 | 213 req/s (p50 18.6 ms) | 749 req/s (p50 5.1 ms) | 1,292 req/s (p50 3.0 ms) |
@@ -48,7 +48,7 @@ No request failed in any run.
 
 ## Memory (resident set size after the load tests)
 
-| | QGIS Server | qgis-server-rs |
+| | QGIS Server | rGIS |
 |---|---|---|
 | One process | 148–178 MB | 80 MB after the 32-client runs (16 MB after light use) |
 | Setup with the throughput above | 10 processes ≈ 1.5 GB | 1 process ≈ 80 MB |

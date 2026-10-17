@@ -1,5 +1,5 @@
 [package]
-name = "qgis-server-rs"
+name = "rgis"
 version = "0.1.0"
 edition = "2024"
 

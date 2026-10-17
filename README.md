@@ -1,4 +1,4 @@
-# qgis-server-rs
+# rGIS
 
 A QGIS-Server-like OGC map server written in Rust. It opens QGIS project files
 (`.qgs` and `.qgz`) and serves them over **WMS 1.3.0/1.1.1**, **WFS 1.1.0** and
@@ -14,10 +14,10 @@ vs ~1,400/s for 10 QGIS Server processes at ~1.5 GB, and is as fast or faster pe
 
 ```sh
 cargo build --release
-./target/release/qgis-server-rs -p demo/earth_local.qgs 127.0.0.1:8000
+./target/release/rgis -p demo/earth_local.qgs 127.0.0.1:8000
 
 # what did the server understand from the project?
-./target/release/qgis-server-rs --inspect demo/earth_local.qgz
+./target/release/rgis --inspect demo/earth_local.qgz
 ```
 
 ```
@@ -41,7 +41,7 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
 
 ## Architecture: QGIS Server → this crate
 
-| QGIS Server | qgis-server-rs |
+| QGIS Server | rGIS |
 |---|---|
 | `qgis_mapserver` / FastCGI loop calling `QgsServer::handleRequest` | `main.rs` (axum; each request runs on a blocking thread) → `server::Server::handle` |
 | `QgsServerParameters` (case-insensitive KVP) | `params.rs` |
@@ -85,7 +85,7 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
 
 ## Verification against the real QGIS Server
 
-QGIS Server 4.3.0 (built from the local checkout) and qgis-server-rs were run side by side on
+QGIS Server 4.3.0 (built from the local checkout) and rGIS were run side by side on
 the same projects. Tools: `tools/compare_with_qgis.py`, `tools/render_projects.py`,
 `cargo run --release --example compare_png`.
 

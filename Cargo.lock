@@ -1233,33 +1233,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qgis-server-rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "crs-definitions",
- "flatgeobuf",
- "geo-types",
- "geozero",
- "indexmap",
- "parking_lot",
- "proj4rs",
- "reqwest",
- "roxmltree",
- "rusqlite",
- "serde_json",
- "shapefile",
- "thiserror 2.0.21",
- "tiny-skia",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "zip",
-]
-
-[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1334,6 +1307,33 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "rgis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "crs-definitions",
+ "flatgeobuf",
+ "geo-types",
+ "geozero",
+ "indexmap",
+ "parking_lot",
+ "proj4rs",
+ "reqwest",
+ "roxmltree",
+ "rusqlite",
+ "serde_json",
+ "shapefile",
+ "thiserror 2.0.21",
+ "tiny-skia",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "zip",
 ]
 
 [[package]]

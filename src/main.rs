@@ -1,4 +1,4 @@
-//! qgis-server-rs: a QGIS-Server-like OGC map server in Rust that serves QGIS
+//! rGIS: a QGIS-Server-like OGC map server in Rust that serves QGIS
 //! project files (.qgs/.qgz) over WMS, WFS and OGC API Features.
 
 mod crs;
@@ -24,11 +24,11 @@ use crate::project::{Project, TreeGroup, TreeNode};
 use crate::server::{Request, Server, Settings};
 
 const USAGE: &str = "\
-qgis-server-rs – serve QGIS projects over WMS / WFS / OGC API Features
+rGIS – serve QGIS projects over WMS / WFS / OGC API Features
 
 USAGE:
-    qgis-server-rs [OPTIONS] [ADDRESS]          (default address 127.0.0.1:8000)
-    qgis-server-rs --inspect <PROJECT>          print how a project is understood
+    rgis [OPTIONS] [ADDRESS]          (default address 127.0.0.1:8000)
+    rgis --inspect <PROJECT>          print how a project is understood
 
 OPTIONS:
     -p, --project <FILE>       default project when no MAP parameter is given
@@ -37,7 +37,7 @@ OPTIONS:
 
 ENVIRONMENT:
     QGIS_PROJECT_FILE          fixed project, overrides MAP (as in QGIS Server)
-    RUST_LOG                   log filter, e.g. info or qgis_server_rs=debug
+    RUST_LOG                   log filter, e.g. info or rgis=debug
 ";
 
 fn print_tree(p: &Project, g: &TreeGroup, depth: usize) {
@@ -126,7 +126,7 @@ async fn handle(
                 out.headers_mut().insert(header::CONTENT_TYPE, ct);
             }
             out.headers_mut()
-                .insert(header::SERVER, HeaderValue::from_static("qgis-server-rs"));
+                .insert(header::SERVER, HeaderValue::from_static("rGIS"));
             out
         }
         Err(e) => {
@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
     let server = Arc::new(Server::new(settings));
     let app = axum::Router::new().fallback(handle).with_state(server);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("qgis-server-rs listening on http://{addr}");
+    tracing::info!("rGIS listening on http://{addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

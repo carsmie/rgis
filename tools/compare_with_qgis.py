@@ -1,4 +1,4 @@
-"""Send identical requests to QGIS Server (:8099) and qgis-server-rs (:8098) and compare."""
+"""Send identical requests to QGIS Server (:8099) and rGIS (:8098) and compare."""
 import json
 import sys
 import urllib.request
@@ -104,7 +104,7 @@ try:
     check("QGIS GML for ne_10m_lakes is well-formed", True)
 except ET.ParseError as e:
     print(f"NOTE QGIS's own GML for ne_10m_lakes is NOT well-formed ({e}); field 'feature::id' becomes <qgs:feature::id>")
-check("qgis-server-rs GML for ne_10m_lakes is well-formed", bool(pos(b)))
+check("rGIS GML for ne_10m_lakes is well-formed", bool(pos(b)))
 q = f"{M}&SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&TYPENAME=ne_10m_admin_0_countries&FEATUREID=ne_10m_admin_0_countries.137"
 a, b = get(QGIS, q)[2], get(RUST, q)[2]
 pa, pb = pos(a), pos(b)
