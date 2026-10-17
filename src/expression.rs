@@ -314,6 +314,19 @@ impl Parser {
 pub type Attrs = IndexMap<String, Value>;
 
 impl Expr {
+    /// A constant (data-defined "static value"); numbers are kept numeric.
+    pub fn literal(v: &str) -> Expr {
+        match v.trim().parse::<f64>() {
+            Ok(n) => Expr::Lit(serde_json::json!(n)),
+            Err(_) => Expr::Lit(Value::String(v.to_string())),
+        }
+    }
+
+    /// A field reference (data-defined "field").
+    pub fn field(name: &str) -> Expr {
+        Expr::Field(name.to_string())
+    }
+
     pub fn parse(s: &str) -> Result<Expr> {
         let mut p = Parser { t: lex(s)?, p: 0 };
         let e = p.or()?;

@@ -273,62 +273,130 @@ pub fn round(v: f64, precision: usize) -> f64 {
     (v * m).round() / m
 }
 
-fn simplify_line(l: &LineString<f64>, tol: f64, ring: bool) -> LineString<f64> {
-    let pts = &l.0;
-    if pts.len() <= 2 || tol <= 0.0 {
-        return l.clone();
-    }
-    let b = bbox(&Geometry::LineString(l.clone()));
-    if ring && b.width() < tol && b.height() < tol {
-        // QgsMapToPixelSimplifier: features smaller than the tolerance become their box.
-        return LineString::from(vec![
-            (b.xmin, b.ymin),
-            (b.xmax, b.ymin),
-            (b.xmax, b.ymax),
-            (b.xmin, b.ymax),
-            (b.xmin, b.ymin),
-        ]);
-    }
-    let tol2 = tol * tol;
-    let mut out = Vec::with_capacity(pts.len() / 2);
-    out.push(pts[0]);
-    let last = pts.len() - 1;
-    for (i, c) in pts.iter().enumerate().skip(1) {
-        let p = out[out.len() - 1];
-        if i == last || (c.x - p.x).powi(2) + (c.y - p.y).powi(2) >= tol2 {
-            out.push(*c);
-        }
-    }
-    if ring && out.len() < 4 {
-        return l.clone();
-    }
-    LineString(out)
+fn box_ring(b: &Rect) -> LineString<f64> {
+    LineString::from(vec![
+        (b.xmin, b.ymin),
+        (b.xmax, b.ymin),
+        (b.xmax, b.ymax),
+        (b.xmin, b.ymax),
+        (b.xmin, b.ymin),
+    ])
 }
 
-/// QGIS "Distance" map-to-pixel simplification: drop vertices closer than `tol` to the
-/// previously kept one (`simplifyAlgorithm="0"`, `simplifyDrawingTol` in pixels).
-pub fn simplify(g: &Geometry<f64>, tol: f64) -> Geometry<f64> {
-    let poly = |p: &Polygon<f64>| {
-        Polygon::new(
-            simplify_line(p.exterior(), tol, true),
-            p.interiors()
-                .iter()
-                .map(|r| simplify_line(r, tol, true))
-                .collect(),
+fn n_coords(g: &Geometry<f64>) -> usize {
+    let mut n = 0;
+    for_each_coord(g, &mut |_| n += 1);
+    n
+}
+
+/// generalizeWkbGeometryByBoundingBox: replace a geometry by its bounding box (a 2-point
+/// line for lines, a box ring/polygon otherwise) unless it is already that small.
+fn generalize_by_box(g: &Geometry<f64>, env: &Rect, ring: bool) -> Geometry<f64> {
+    let is_line = matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_));
+    if n_coords(g) <= if is_line { 2 } else { 5 } {
+        return g.clone();
+    }
+    match (is_line, ring) {
+        (true, false) => LineString::from(vec![(env.xmin, env.ymin), (env.xmax, env.ymax)]).into(),
+        (true, true) => box_ring(env).into(),
+        _ => Polygon::new(box_ring(env), vec![]).into(),
+    }
+}
+
+/// The "Distance" vertex filter of QgsMapToPixelSimplifier::simplifyGeometry for one curve.
+fn simplify_curve(l: &LineString<f64>, tol: f64, ring_hint: bool, env: &Rect) -> Geometry<f64> {
+    let pts = &l.0;
+    let n = pts.len();
+    if n == 0 {
+        return Geometry::LineString(l.clone());
+    }
+    let generalizable = n > if ring_hint { 4 } else { 2 };
+    let ring = ring_hint && pts[0].x == pts[n - 1].x && pts[0].y == pts[n - 1].y;
+    let tol2 = tol * tol;
+    let mut out: Vec<Coord<f64>> = Vec::with_capacity(n / 2 + 2);
+    let (mut last, mut has_long) = (pts[0], false);
+    for (i, c) in pts.iter().enumerate() {
+        // QGIS computes the squared length in single precision.
+        let (vx, vy) = ((c.x - last.x) as f32, (c.y - last.y) as f32);
+        let long = i > 0 && generalizable && ((vx * vx + vy * vy) as f64) > tol2;
+        if i == 0 || !generalizable || long || (!ring && (i == 1 || i + 2 >= n)) {
+            out.push(*c);
+            last = *c;
+            has_long |= long;
+        }
+    }
+    if out.len() < if ring { 4 } else { 2 } {
+        return if has_long {
+            Geometry::LineString(l.clone())
+        } else {
+            generalize_by_box(&Geometry::LineString(l.clone()), env, ring)
+        };
+    }
+    if ring && (last.x != out[0].x || last.y != out[0].y) {
+        out.push(out[0]);
+    }
+    Geometry::LineString(LineString(out))
+}
+
+fn as_line(g: Geometry<f64>, fallback: &LineString<f64>) -> LineString<f64> {
+    match g {
+        Geometry::LineString(l) => l,
+        Geometry::Polygon(p) => p.exterior().clone(),
+        _ => fallback.clone(),
+    }
+}
+
+fn simplify_geom(g: &Geometry<f64>, tol: f64, ring: bool) -> Geometry<f64> {
+    let env = bbox(g);
+    if !env.is_empty() && env.width() < tol && env.height() < tol {
+        return generalize_by_box(g, &env, ring);
+    }
+    let ring_of = |r: &LineString<f64>| {
+        as_line(
+            simplify_geom(&Geometry::LineString(r.clone()), tol, true),
+            r,
         )
     };
     match g {
-        Geometry::LineString(l) => Geometry::LineString(simplify_line(l, tol, false)),
-        Geometry::MultiLineString(m) => {
-            Geometry::MultiLineString(m.0.iter().map(|l| simplify_line(l, tol, false)).collect())
-        }
-        Geometry::Polygon(p) => Geometry::Polygon(poly(p)),
-        Geometry::MultiPolygon(m) => Geometry::MultiPolygon(m.0.iter().map(poly).collect()),
-        Geometry::GeometryCollection(gc) => {
-            Geometry::GeometryCollection(gc.0.iter().map(|g| simplify(g, tol)).collect())
-        }
+        Geometry::LineString(l) => simplify_curve(l, tol, ring, &env),
+        Geometry::Polygon(p) => Geometry::Polygon(Polygon::new(
+            ring_of(p.exterior()),
+            p.interiors().iter().map(ring_of).collect(),
+        )),
+        Geometry::MultiLineString(m) => Geometry::MultiLineString(
+            m.0.iter()
+                .map(|l| {
+                    as_line(
+                        simplify_geom(&Geometry::LineString(l.clone()), tol, false),
+                        l,
+                    )
+                })
+                .collect(),
+        ),
+        Geometry::MultiPolygon(m) => Geometry::MultiPolygon(
+            m.0.iter()
+                .map(
+                    |p| match simplify_geom(&Geometry::Polygon(p.clone()), tol, false) {
+                        Geometry::Polygon(s) => s,
+                        _ => p.clone(),
+                    },
+                )
+                .collect(),
+        ),
+        Geometry::GeometryCollection(gc) => Geometry::GeometryCollection(
+            gc.0.iter().map(|g| simplify_geom(g, tol, false)).collect(),
+        ),
         other => other.clone(),
     }
+}
+
+/// QgsMapToPixelSimplifier with SimplifyGeometry | SimplifyEnvelope and the "Distance"
+/// algorithm, as QGIS applies it while rendering (`tol` in layer units).
+pub fn simplify(g: &Geometry<f64>, tol: f64) -> Geometry<f64> {
+    if tol <= 0.0 {
+        return g.clone();
+    }
+    simplify_geom(g, tol, false)
 }
 
 /// Sutherland–Hodgman clipping of a ring against an axis-aligned rectangle.
@@ -388,9 +456,10 @@ fn clip_ring(ring: &LineString<f64>, r: &Rect) -> Vec<Coord<f64>> {
         }
     }
     if let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied())
-        && first != last {
-            pts.push(first);
-        }
+        && first != last
+    {
+        pts.push(first);
+    }
     pts
 }
 
@@ -698,9 +767,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .into();
-        // kept: 0, 0.26, 0.52, 0.78 and the last vertex
+        // QGIS keeps the 1st, 2nd and last two vertices of a line; in between, vertices
+        // farther than the tolerance from the last kept one: 0, .01, .27, .53, .79, .99, 1
         match simplify(&dense, 0.255) {
-            Geometry::LineString(l) => assert_eq!(l.0.len(), 5),
+            Geometry::LineString(l) => assert_eq!(l.0.len(), 7),
             other => panic!("{other:?}"),
         }
         match simplify(&sq, 50.0) {

@@ -33,6 +33,9 @@ pub struct TreeGroup {
     pub name: String,
     pub short_name: Option<String>,
     pub title: Option<String>,
+    /// `wms-group-request-mode="Opaque"` (QGIS 4.2+): the group is published as one layer;
+    /// its children are hidden and cannot be requested on their own.
+    pub opaque: bool,
     pub children: Vec<TreeNode>,
 }
 
@@ -75,6 +78,8 @@ pub struct MapLayer {
     pub scale_range: Option<(f64, f64)>,
     /// Render-time simplification tolerance in pixels (`simplifyDrawingHints`/`simplifyDrawingTol`).
     pub simplify_tol: Option<f64>,
+    /// Layer expression variables (custom properties `variableNames` / `variableValues`).
+    pub variables: Vec<(String, String)>,
     pub style_name: String,
     pub identifiable: bool,
     pub hidden_wms: Vec<String>,
@@ -180,11 +185,38 @@ fn custom_property(n: Node, key: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// A list-valued custom property: `<Option type="List" name=key><Option value=…/>` (new)
+/// or `<property key=key><value>…</value></property>` (old).
+fn custom_list(n: Node, key: &str) -> Vec<String> {
+    let Some(cp) = child(n, "customproperties") else {
+        return vec![];
+    };
+    for c in cp.descendants() {
+        if c.has_tag_name("Option") && c.attribute("name") == Some(key) {
+            return c
+                .children()
+                .filter(|o| o.has_tag_name("Option"))
+                .filter_map(|o| o.attribute("value"))
+                .map(String::from)
+                .collect();
+        }
+        if c.has_tag_name("property") && c.attribute("key") == Some(key) {
+            return c
+                .children()
+                .filter(|v| v.has_tag_name("value"))
+                .map(|v| v.text().unwrap_or("").to_string())
+                .collect();
+        }
+    }
+    vec![]
+}
+
 fn parse_group(n: Node) -> TreeGroup {
     let mut g = TreeGroup {
         name: n.attribute("name").unwrap_or("").to_string(),
         short_name: custom_property(n, "wmsShortName").filter(|s| !s.is_empty()),
         title: custom_property(n, "wmsTitle").filter(|s| !s.is_empty()),
+        opaque: n.attribute("wms-group-request-mode") == Some("Opaque"),
         children: vec![],
     };
     for c in n.children() {
@@ -201,7 +233,12 @@ fn parse_group(n: Node) -> TreeGroup {
 
 fn parse_properties(n: Node, prefix: &str, out: &mut HashMap<String, PropValue>) {
     for c in n.children().filter(|c| c.is_element()) {
-        let key = format!("{prefix}{}", c.tag_name().name());
+        // QGIS 3: <WMSServiceTitle type=…>; QGIS 4: <properties name="WMSServiceTitle" type=…>.
+        let name = match (c.tag_name().name(), c.attribute("name")) {
+            ("properties", Some(name)) => name,
+            (tag, _) => tag,
+        };
+        let key = format!("{prefix}{name}");
         match c.attribute("type") {
             Some("QStringList") => {
                 let v = c
@@ -276,6 +313,10 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
             .unwrap_or(1.0),
         scale_range: (flag("hasScaleBasedVisibilityFlag") == Some("1"))
             .then(|| (scale("minScale"), scale("maxScale"))),
+        variables: custom_list(ml, "variableNames")
+            .into_iter()
+            .zip(custom_list(ml, "variableValues"))
+            .collect(),
         // simplifyDrawingHints is a flag set; 0 = no simplification.
         simplify_tol: flag("simplifyDrawingHints")
             .and_then(|h| h.parse::<u32>().ok())
@@ -406,6 +447,41 @@ impl Project {
             .filter(|v| *v > 0)
     }
 
+    /// Project-scope expression variables: QGIS's built-in `@project_*` ones plus the
+    /// user variables from `<properties><Variables>`.
+    pub fn variables(&self) -> Vec<(String, String)> {
+        let file = self
+            .path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut v = vec![
+            ("project_title".to_string(), self.title.clone()),
+            ("project_path".to_string(), self.path.display().to_string()),
+            ("project_filename".to_string(), file.clone()),
+            (
+                "project_basename".to_string(),
+                file.rsplit_once('.')
+                    .map(|(b, _)| b.to_string())
+                    .unwrap_or(file),
+            ),
+            (
+                "project_folder".to_string(),
+                self.path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            ("project_crs".to_string(), self.crs.authid.clone()),
+        ];
+        v.extend(
+            self.list_prop("Variables/variableNames")
+                .into_iter()
+                .zip(self.list_prop("Variables/variableValues")),
+        );
+        v
+    }
+
     /// WMSRootName, else the project title (QgsWmsRenderContext::initNicknameLayers).
     pub fn root_name(&self) -> String {
         self.text_prop("WMSRootName")
@@ -488,12 +564,49 @@ impl Project {
     }
 
     /// Find a tree group by its WMS nickname (the root is named by `root_name`).
+    /// Layer ids and group names inside opaque groups (not requestable on their own).
+    fn hidden_by_opaque(
+        &self,
+    ) -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        let (mut ids, mut groups) = (Default::default(), Default::default());
+        fn walk(
+            g: &TreeGroup,
+            inside: bool,
+            ids: &mut std::collections::HashSet<String>,
+            groups: &mut std::collections::HashSet<String>,
+        ) {
+            for c in &g.children {
+                match c {
+                    TreeNode::Layer { id } if inside => {
+                        ids.insert(id.clone());
+                    }
+                    TreeNode::Layer { .. } => {}
+                    TreeNode::Group(sub) => {
+                        if inside {
+                            groups.insert(sub.nickname().to_string());
+                        }
+                        walk(sub, inside || sub.opaque, ids, groups);
+                    }
+                }
+            }
+        }
+        walk(&self.tree, false, &mut ids, &mut groups);
+        (ids, groups)
+    }
+
     pub fn find_group(&self, name: &str) -> Option<TreeGroup> {
         fn walk(g: &TreeGroup, name: &str) -> Option<TreeGroup> {
             for c in &g.children {
                 if let TreeNode::Group(sub) = c {
                     if sub.nickname() == name {
                         return Some(sub.clone());
+                    }
+                    // Groups inside an opaque group cannot be addressed.
+                    if sub.opaque {
+                        continue;
                     }
                     if let Some(f) = walk(sub, name) {
                         return Some(f);
@@ -508,17 +621,24 @@ impl Project {
         walk(&self.tree, name)
     }
 
-    pub fn layer_by_nickname(&self, name: &str) -> Option<Arc<MapLayer>> {
-        self.layers
-            .values()
-            .find(|l| self.nickname(l) == name && !self.is_restricted(l))
-            .cloned()
-    }
-
     /// Resolve a WMS layer/group name into concrete layers, top of the legend first.
     pub fn resolve(&self, name: &str) -> Option<Vec<Arc<MapLayer>>> {
-        if let Some(l) = self.layer_by_nickname(name) {
-            return Some(vec![l]);
+        // Several layers may share a WMS name; QGIS keeps them in a QMultiMap filled in
+        // layer-id order, so they end up stacked with the smallest id on top.
+        let (opaque_children, _) = self.hidden_by_opaque();
+        let mut same: Vec<Arc<MapLayer>> = self
+            .layers
+            .values()
+            .filter(|l| {
+                self.nickname(l) == name
+                    && !self.is_restricted(l)
+                    && !opaque_children.contains(&l.id)
+            })
+            .cloned()
+            .collect();
+        if !same.is_empty() {
+            same.sort_by(|a, b| a.id.cmp(&b.id));
+            return Some(same);
         }
         let g = self.find_group(name)?;
         Some(
@@ -529,5 +649,34 @@ impl Project {
                 .cloned()
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_both_property_encodings() {
+        for xml in [
+            r#"<properties><WMSRestrictedLayers type="QStringList"><value>a</value></WMSRestrictedLayers><Variables><variableNames type="QStringList"><value>r</value></variableNames></Variables><WMSServiceTitle type="QString">T</WMSServiceTitle></properties>"#,
+            r#"<properties name="properties"><properties name="WMSRestrictedLayers" type="QStringList"><value>a</value></properties><properties name="Variables"><properties name="variableNames" type="QStringList"><value>r</value></properties></properties><properties name="WMSServiceTitle" type="QString">T</properties></properties>"#,
+        ] {
+            let doc = Document::parse(xml).unwrap();
+            let mut out = HashMap::new();
+            parse_properties(doc.root_element(), "", &mut out);
+            assert!(
+                matches!(out.get("WMSRestrictedLayers"), Some(PropValue::List(v)) if v == &["a"]),
+                "{xml}"
+            );
+            assert!(
+                matches!(out.get("Variables/variableNames"), Some(PropValue::List(v)) if v == &["r"]),
+                "{xml}"
+            );
+            assert!(
+                matches!(out.get("WMSServiceTitle"), Some(PropValue::Text(t)) if t == "T"),
+                "{xml}"
+            );
+        }
     }
 }

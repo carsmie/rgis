@@ -215,6 +215,7 @@ fn map_settings(
         dpi: dpi(ctx),
         crs,
         background,
+        project_variables: ctx.project.variables(),
     })
 }
 
@@ -751,7 +752,7 @@ fn group_xml(
     let ind = " ".repeat(depth);
     let project = ctx.project;
     let _ = writeln!(s, "{ind}<Layer queryable=\"1\">");
-    if !(project.bool_prop("WMSSkipNameForGroup") && depth > 2) {
+    if !name.is_empty() && !(project.bool_prop("WMSSkipNameForGroup") && depth > 2) {
         let _ = writeln!(s, "{ind} <Name>{}</Name>", esc(name));
     }
     let _ = writeln!(s, "{ind} <Title>{}</Title>", esc(title));
@@ -770,7 +771,9 @@ fn group_xml(
         group_wgs84(project, g)
     };
     extent_xml(s, &wgs84, crs_list, v13, &format!("{ind} "));
-    for c in &g.children {
+    // Opaque groups are published like a single layer (qgswmsgetcapabilities.cpp:796).
+    let children: &[TreeNode] = if g.opaque { &[] } else { &g.children };
+    for c in children {
         match c {
             TreeNode::Group(sub) => {
                 if sub.layer_ids().iter().any(|id| {

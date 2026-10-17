@@ -103,6 +103,28 @@ pub struct Stroke {
     pub cap: String,
 }
 
+/// Qt's built-in brush patterns (QgsSymbolLayerUtils::decodeBrushStyle names → Qt::BrushStyle),
+/// extracted from Qt 6.11 by painting each style with PyQt6. Row y, bit x = pixel (x, y)
+/// painted; the 8×8 tile repeats from the image origin.
+pub fn qt_brush_pattern(style: &str) -> Option<[u8; 8]> {
+    Some(match style {
+        "dense1" => [0xff, 0xbb, 0xff, 0xff, 0xff, 0xbb, 0xff, 0xff],
+        "dense2" => [0x77, 0xff, 0xdd, 0xff, 0x77, 0xff, 0xdd, 0xff],
+        "dense3" => [0x55, 0xbb, 0x55, 0xee, 0x55, 0xbb, 0x55, 0xee],
+        "dense4" => [0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55, 0xaa, 0x55],
+        "dense5" => [0xaa, 0x44, 0xaa, 0x11, 0xaa, 0x44, 0xaa, 0x11],
+        "dense6" => [0x88, 0x00, 0x22, 0x00, 0x88, 0x00, 0x22, 0x00],
+        "dense7" => [0x00, 0x44, 0x00, 0x00, 0x00, 0x44, 0x00, 0x00],
+        "horizontal" => [0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00],
+        "vertical" => [0x10; 8],
+        "cross" => [0x10, 0x10, 0x10, 0xff, 0x10, 0x10, 0x10, 0x10],
+        "b_diagonal" => [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01],
+        "f_diagonal" => [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80],
+        "diagonal_x" => [0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81],
+        _ => return None,
+    })
+}
+
 /// Symbol layers, named after their QGIS classes (`class="SimpleFill"` etc.).
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
@@ -110,25 +132,202 @@ pub enum SymbolLayer {
     SimpleFill {
         color: Rgba,
         filled: bool,
-        hatched: bool,
+        /// Qt brush pattern for non-solid styles (8 rows, bit x = pixel x painted).
+        pattern: Option<[u8; 8]>,
         stroke: Stroke,
     },
     SimpleLine {
         stroke: Stroke,
     },
-    SimpleMarker {
+    /// Parallel lines drawn with a line sub-symbol (QgsLinePatternFillSymbolLayer).
+    LinePatternFill {
+        /// Line angle in degrees, counter-clockwise from horizontal.
+        angle: f64,
+        distance: Size,
+        offset: Size,
+        /// `coordinate_reference="feature"`: pattern anchored at the feature, else the map.
+        feature_ref: bool,
+        /// `clip_mode="during_render"` uses QGIS's cached image brush; other modes draw lines.
+        image_brush: bool,
+        line: Box<Symbol>,
+    },
+    /// SimpleMarker (width = height = size) and EllipseMarker (symbol_width × symbol_height).
+    Marker {
         shape: String,
-        size: Size,
+        width: Size,
+        height: Size,
+        /// EllipseMarker: data-defined `width`/`height` instead of `size`.
+        ellipse: bool,
         color: Rgba,
         stroke: Stroke,
+        /// Clockwise rotation in degrees.
+        angle: f64,
+        offset: (Size, Size),
     },
+}
+
+/// One symbol layer with its data-defined property overrides (QgsPropertyCollection),
+/// keyed by QGIS property name (`size`, `angle`, `fillColor`, `strokeColor`, …).
+#[derive(Debug, Clone)]
+pub struct Layer {
+    pub kind: SymbolLayer,
+    pub dd: HashMap<String, Expr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub kind: String,
     pub opacity: f64,
-    pub layers: Vec<SymbolLayer>,
+    pub layers: Vec<Layer>,
+    /// Any layer has data-defined properties (callers then supply expression context).
+    pub data_defined: bool,
+}
+
+fn dd_num(dd: &HashMap<String, Expr>, key: &str, ctx: &Attrs) -> Option<f64> {
+    dd.get(key).and_then(|e| num(&e.eval(ctx)))
+}
+
+fn dd_color(dd: &HashMap<String, Expr>, key: &str, ctx: &Attrs) -> Option<Rgba> {
+    dd.get(key).and_then(|e| match e.eval(ctx) {
+        Value::String(s) => Rgba::parse(&s),
+        _ => None,
+    })
+}
+
+impl Layer {
+    /// Apply data-defined overrides for one feature; `ctx` holds attributes and
+    /// `@variables`. Returns None when the layer is data-defined as disabled.
+    pub fn resolve(&self, ctx: &Attrs) -> Option<std::borrow::Cow<'_, SymbolLayer>> {
+        use std::borrow::Cow;
+        if self.dd.is_empty() {
+            return Some(Cow::Borrowed(&self.kind));
+        }
+        let dd = &self.dd;
+        if let Some(e) = dd.get("enabled")
+            && !crate::expression::truthy(&e.eval(ctx))
+            && !e.eval(ctx).is_null()
+        {
+            return None;
+        }
+        let mut k = self.kind.clone();
+        let stroke_dd = |s: &mut Stroke| {
+            if let Some(c) = dd_color(dd, "strokeColor", ctx) {
+                s.color = c;
+            }
+            if let Some(w) = dd_num(dd, "strokeWidth", ctx) {
+                s.width.value = w;
+            }
+            if let Some(Value::String(st)) = dd.get("strokeStyle").map(|e| e.eval(ctx)) {
+                s.dash = dash_for(&st);
+                s.visible = st != "no";
+            }
+        };
+        match &mut k {
+            SymbolLayer::SimpleFill {
+                color,
+                filled,
+                pattern,
+                stroke,
+            } => {
+                if let Some(c) = dd_color(dd, "fillColor", ctx) {
+                    *color = c;
+                }
+                if let Some(Value::String(st)) = dd.get("fillStyle").map(|e| e.eval(ctx)) {
+                    *filled = st != "no";
+                    *pattern = qt_brush_pattern(&st);
+                }
+                stroke_dd(stroke);
+            }
+            SymbolLayer::SimpleLine { stroke } => {
+                // Line layers use strokeColor / strokeWidth for their pen.
+                stroke_dd(stroke);
+            }
+            SymbolLayer::LinePatternFill {
+                angle, distance, ..
+            } => {
+                if let Some(a) = dd_num(dd, "lineAngle", ctx) {
+                    *angle = a;
+                }
+                if let Some(d) = dd_num(dd, "lineDistance", ctx) {
+                    distance.value = d;
+                }
+            }
+            SymbolLayer::Marker {
+                shape,
+                width,
+                height,
+                ellipse,
+                color,
+                stroke,
+                angle,
+                ..
+            } => {
+                if let Some(Value::String(n)) = dd.get("name").map(|e| e.eval(ctx)) {
+                    *shape = n;
+                }
+                if *ellipse {
+                    if let Some(w) = dd_num(dd, "width", ctx) {
+                        width.value = w;
+                    }
+                    if let Some(h) = dd_num(dd, "height", ctx) {
+                        height.value = h;
+                    }
+                } else if let Some(s) = dd_num(dd, "size", ctx) {
+                    width.value = s;
+                    height.value = s;
+                }
+                if let Some(a) = dd_num(dd, "angle", ctx) {
+                    *angle = a;
+                }
+                if let Some(c) = dd_color(dd, "fillColor", ctx) {
+                    *color = c;
+                }
+                stroke_dd(stroke);
+            }
+        }
+        Some(Cow::Owned(k))
+    }
+}
+
+/// `<data_defined_properties>`: active properties of type 1 (static value), 2 (field)
+/// or 3 (expression), as expressions.
+fn data_defined(layer: Node) -> HashMap<String, Expr> {
+    let mut out = HashMap::new();
+    let Some(props) = child(layer, "data_defined_properties").and_then(|d| {
+        d.descendants()
+            .find(|o| o.has_tag_name("Option") && o.attribute("name") == Some("properties"))
+    }) else {
+        return out;
+    };
+    for p in props.children().filter(|o| o.has_tag_name("Option")) {
+        let Some(key) = p.attribute("name") else {
+            continue;
+        };
+        let opt = |n: &str| {
+            p.children()
+                .find(|o| o.has_tag_name("Option") && o.attribute("name") == Some(n))
+                .and_then(|o| o.attribute("value"))
+        };
+        if opt("active") != Some("true") {
+            continue;
+        }
+        let expr = match opt("type") {
+            Some("1") => Some(Expr::literal(opt("val").unwrap_or(""))),
+            Some("2") => opt("field").map(Expr::field),
+            Some("3") => opt("expression").and_then(|e| match Expr::parse(e) {
+                Ok(x) => Some(x),
+                Err(err) => {
+                    warn!("data-defined {key} expression '{e}' not supported ({err})");
+                    None
+                }
+            }),
+            _ => None,
+        };
+        if let Some(e) = expr {
+            out.insert(key.to_string(), e);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -273,15 +472,22 @@ pub fn parse_symbol(n: Node) -> Symbol {
         let p = props(l);
         let class = l.attribute("class").unwrap_or("");
         let g = |k: &str| p.get(k).map(|s| s.as_str());
-        match class {
+        let offset = || {
+            let unit = g("offset_unit");
+            let mut it = g("offset").unwrap_or("0,0").split(',');
+            let (x, y) = (it.next(), it.next());
+            (Size::new(x, unit, 0.0), Size::new(y, unit, 0.0))
+        };
+        let angle = g("angle").and_then(|a| a.parse().ok()).unwrap_or(0.0);
+        let kind = match class {
             "SimpleFill" => {
                 let style = g("style").unwrap_or("solid");
-                layers.push(SymbolLayer::SimpleFill {
+                SymbolLayer::SimpleFill {
                     color: g("color")
                         .and_then(Rgba::parse)
                         .unwrap_or(Rgba(125, 139, 143, 255)),
                     filled: style != "no",
-                    hatched: !matches!(style, "solid" | "no"),
+                    pattern: qt_brush_pattern(style),
                     stroke: stroke(
                         &p,
                         "outline_color",
@@ -290,9 +496,9 @@ pub fn parse_symbol(n: Node) -> Symbol {
                         "outline_style",
                         0.26,
                     ),
-                })
+                }
             }
-            "SimpleLine" => layers.push(SymbolLayer::SimpleLine {
+            "SimpleLine" => SymbolLayer::SimpleLine {
                 stroke: stroke(
                     &p,
                     "line_color",
@@ -301,14 +507,53 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     "line_style",
                     0.26,
                 ),
-            }),
-            "SimpleMarker" | "FontMarker" | "SvgMarker" | "EllipseMarker" => {
+            },
+            "LinePatternFill" => {
+                let Some(sub) = l.children().find(|c| c.has_tag_name("symbol")) else {
+                    warn!("LinePatternFill without a line sub-symbol ignored");
+                    continue;
+                };
+                SymbolLayer::LinePatternFill {
+                    angle: g("lineangle")
+                        .or(g("angle"))
+                        .and_then(|a| a.parse().ok())
+                        .unwrap_or(45.0),
+                    distance: Size::new(g("distance"), g("distance_unit"), 5.0),
+                    offset: Size::new(g("offset"), g("offset_unit"), 0.0),
+                    feature_ref: g("coordinate_reference") == Some("feature"),
+                    image_brush: g("clip_mode").is_none_or(|m| m == "during_render"),
+                    line: Box::new(parse_symbol(sub)),
+                }
+            }
+            "EllipseMarker" => SymbolLayer::Marker {
+                shape: g("symbol_name").unwrap_or("circle").to_string(),
+                width: Size::new(g("symbol_width"), g("symbol_width_unit"), 4.0),
+                height: Size::new(g("symbol_height"), g("symbol_height_unit"), 3.0),
+                ellipse: true,
+                color: g("color")
+                    .and_then(Rgba::parse)
+                    .unwrap_or(Rgba(255, 255, 255, 255)),
+                stroke: stroke(
+                    &p,
+                    "outline_color",
+                    "outline_width",
+                    "outline_width_unit",
+                    "outline_style",
+                    0.0,
+                ),
+                angle,
+                offset: offset(),
+            },
+            "SimpleMarker" | "FontMarker" | "SvgMarker" => {
                 if class != "SimpleMarker" {
                     warn!("symbol layer {class} approximated as SimpleMarker");
                 }
-                layers.push(SymbolLayer::SimpleMarker {
+                let size = Size::new(g("size"), g("size_unit"), 2.0);
+                SymbolLayer::Marker {
                     shape: g("name").unwrap_or("circle").to_string(),
-                    size: Size::new(g("size"), g("size_unit"), 2.0),
+                    width: size,
+                    height: size,
+                    ellipse: false,
                     color: g("color")
                         .and_then(Rgba::parse)
                         .unwrap_or(Rgba(255, 0, 0, 255)),
@@ -320,10 +565,19 @@ pub fn parse_symbol(n: Node) -> Symbol {
                         "outline_style",
                         0.0,
                     ),
-                })
+                    angle,
+                    offset: offset(),
+                }
             }
-            other => warn!("unsupported symbol layer class '{other}' ignored"),
-        }
+            other => {
+                warn!("unsupported symbol layer class '{other}' ignored");
+                continue;
+            }
+        };
+        layers.push(Layer {
+            kind,
+            dd: data_defined(l),
+        });
     }
     Symbol {
         kind: n.attribute("type").unwrap_or("fill").to_string(),
@@ -331,6 +585,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
             .attribute("alpha")
             .and_then(|a| a.parse().ok())
             .unwrap_or(1.0),
+        data_defined: layers.iter().any(|l| !l.dd.is_empty()),
         layers,
     }
 }
@@ -649,7 +904,7 @@ mod tests {
         let d = roxmltree::Document::parse(new).unwrap();
         let s = parse_symbol(d.root_element());
         assert_eq!(s.opacity, 0.5);
-        match &s.layers[0] {
+        match &s.layers[0].kind {
             SymbolLayer::SimpleFill {
                 color,
                 stroke,
@@ -663,7 +918,7 @@ mod tests {
             _ => panic!(),
         }
         let d = roxmltree::Document::parse(old).unwrap();
-        match &parse_symbol(d.root_element()).layers[0] {
+        match &parse_symbol(d.root_element()).layers[0].kind {
             SymbolLayer::SimpleFill { color, filled, .. } => {
                 assert_eq!(*color, Rgba(4, 5, 6, 255));
                 assert!(!*filled);

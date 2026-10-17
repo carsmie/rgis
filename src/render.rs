@@ -11,11 +11,12 @@ use tiny_skia::{
 use tracing::{debug, warn};
 
 use crate::crs::{Crs, Transform};
-use crate::expression::Expr;
+use crate::expression::{Attrs, Expr};
 use crate::geom::{self, Rect};
 use crate::project::MapLayer;
 use crate::provider::Feature;
 use crate::symbology::{RenderUnits, Rgba, Stroke, Symbol, SymbolLayer};
+use serde_json::json;
 
 /// OGC reference pixel size (0.28 mm) as used by QgsWmsRenderContext::dotsPerMm.
 pub const OGC_DPI: f64 = 25.4 / 0.28;
@@ -29,6 +30,8 @@ pub struct MapSettings {
     pub dpi: f64,
     pub crs: Crs,
     pub background: Option<Rgba>,
+    /// Project-scope expression variables (name without `@`, value).
+    pub project_variables: Vec<(String, String)>,
 }
 
 impl MapSettings {
@@ -95,7 +98,7 @@ fn features_for_drawing(
     layer: &MapLayer,
     ms: &MapSettings,
     filter: Option<&Expr>,
-) -> Result<Vec<Feature>> {
+) -> Result<Vec<(Feature, Option<Coord<f64>>)>> {
     let provider = layer.provider()?;
     let layer_crs = layer.crs();
     let to_layer = Transform::new(&ms.crs, &layer_crs);
@@ -103,37 +106,57 @@ fn features_for_drawing(
     let mut out = provider.features(to_layer.rect(&ms.extent).ok())?;
     out.retain(|f| filter.is_none_or(|e| e.matches(&f.attrs)));
 
-    // The pixel tolerance expressed in layer units, measured at the centre of the view.
+    // The pixel tolerance in layer units, as QgsVectorLayerRenderer computes it: scale by the
+    // diagonal ratio of a small square (0.0008983° or 100 units) at the centre of the extent
+    // in the layer CRS, transformed to the map CRS.
     let e = &ms.extent;
-    let (cx, cy) = ((e.xmin + e.xmax) / 2.0, (e.ymin + e.ymax) / 2.0);
-    let tol = layer.simplify_tol.and_then(|px| {
-        let d = px * ms.mupp();
-        let a = to_layer.point(cx, cy).ok()?;
-        let b = to_layer.point(cx + d, cy).ok()?;
-        let c = to_layer.point(cx, cy + d).ok()?;
-        let dist =
-            |p: (f64, f64), q: (f64, f64)| ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt();
-        Some(dist(a, b).min(dist(a, c)))
+    let tol = layer.simplify_tol.and_then(|threshold| {
+        let mut tol = threshold * ms.mupp();
+        if !to_map.is_identity() {
+            let le = to_layer.rect(e).ok()?;
+            let (cx, cy) = ((le.xmin + le.xmax) / 2.0, (le.ymin + le.ymax) / 2.0);
+            let size = if layer_crs.geographic {
+                0.0008983
+            } else {
+                100.0
+            };
+            let a = to_map.point(cx, cy).ok()?;
+            let b = to_map.point(cx + size, cy + size).ok()?;
+            let target = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+            if target != 0.0 {
+                tol *= size * std::f64::consts::SQRT_2 / target;
+            }
+        }
+        Some(tol)
     });
     // Clip with a margin so the artificial edges along the clip boundary stay invisible.
     let m = 64.0 * ms.mupp();
     let clip = Rect::new(e.xmin - m, e.ymin - m, e.xmax + m, e.ymax + m);
-    for f in &mut out {
-        f.geometry = f.geometry.take().and_then(|g| {
-            let g = match tol {
-                Some(t) => geom::simplify(&g, t),
-                None => g,
-            };
-            let g = if to_map.is_identity() {
-                g
-            } else {
-                geom::transform(&g, &to_map)
-            };
-            geom::clip_to_rect(&g, &clip)
-        });
+    let mut prepared = Vec::with_capacity(out.len());
+    for mut f in out {
+        let Some(g) = f.geometry.take() else { continue };
+        let g = match tol {
+            Some(t) => geom::simplify(&g, t),
+            None => g,
+        };
+        // QgsSymbol::renderFeature: texture origin = (xmin, ymin) of the feature geometry as
+        // delivered by the (simplifying) feature iterator, before clipping.
+        let b = geom::bbox(&g);
+        let origin = (!matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) && !b.is_empty())
+            .then(|| to_map.point(b.xmin, b.ymin).ok())
+            .flatten()
+            .map(|(x, y)| Coord { x, y });
+        let g = if to_map.is_identity() {
+            g
+        } else {
+            geom::transform(&g, &to_map)
+        };
+        if let Some(g) = geom::clip_to_rect(&g, &clip) {
+            f.geometry = Some(g);
+            prepared.push((f, origin));
+        }
     }
-    out.retain(|f| f.geometry.is_some());
-    Ok(out)
+    Ok(prepared)
 }
 
 fn ignore_rendering_errors() -> bool {
@@ -203,7 +226,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
 fn draw_features(
     pm: &mut Pixmap,
     l: &MapLayer,
-    features: &[Feature],
+    features: &[(Feature, Option<Coord<f64>>)],
     ms: &MapSettings,
     scale: f64,
 ) {
@@ -215,10 +238,52 @@ fn draw_features(
         let y = ((ms.extent.ymax - c.y) * sy).clamp(-1e6, 1e6);
         (x as f32, y as f32)
     };
-    for f in features {
+    // Expression context scopes as QGIS stacks them: project < map settings < layer.
+    let mut vars = Attrs::new();
+    for (k, v) in &ms.project_variables {
+        vars.insert(format!("@{k}"), json!(v));
+    }
+    vars.insert("@map_id".into(), json!("canvas"));
+    vars.insert("@map_scale".into(), json!(scale));
+    vars.insert("@map_rotation".into(), json!(0));
+    vars.insert("@map_crs".into(), json!(ms.crs.authid));
+    vars.insert(
+        "@map_units".into(),
+        json!(if ms.crs.geographic {
+            "degrees"
+        } else {
+            "meters"
+        }),
+    );
+    vars.insert("@layer_name".into(), json!(l.name));
+    vars.insert("@layer_id".into(), json!(l.id));
+    for (k, v) in &l.variables {
+        vars.insert(format!("@{k}"), json!(v));
+    }
+    let empty = Attrs::new();
+    for (f, origin) in features {
         let Some(g) = &f.geometry else { continue };
-        for sym in l.renderer.symbols_for(&f.attrs, scale) {
-            draw_symbol(pm, sym, g, &to_px, &units);
+        let origin = origin.as_ref().map(to_px);
+        let symbols = l.renderer.symbols_for(&f.attrs, scale);
+        // Only symbols with data-defined properties need the merged context.
+        let ctx = if symbols.iter().any(|s| s.data_defined) {
+            let mut c = f.attrs.clone();
+            c.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+            c.insert("$id".into(), json!(f.fid));
+            Some(c)
+        } else {
+            None
+        };
+        for sym in symbols {
+            draw_symbol(
+                pm,
+                sym,
+                g,
+                &to_px,
+                &units,
+                ctx.as_ref().unwrap_or(&empty),
+                origin,
+            );
         }
     }
 }
@@ -231,6 +296,9 @@ fn add_line(
     to_px: &dyn Fn(&Coord<f64>) -> (f32, f32),
     close: bool,
 ) {
+    // Besides the QGIS-style simplification (geom::simplify), dropping sub-half-pixel steps
+    // here matches QGIS output better (measured with tools/parity.py: 0.54% vs 0.63% on
+    // Natural Earth countries), presumably as Qt's path rasterisation does similar culling.
     let mut last: Option<(f32, f32)> = None;
     let n = l.0.len();
     for (i, c) in l.0.iter().enumerate() {
@@ -286,6 +354,20 @@ fn points(g: &Geometry<f64>) -> Vec<Coord<f64>> {
             }
         }
     }
+}
+
+fn pattern_tile(bits: &[u8; 8], c: Rgba, opacity: f64) -> Pixmap {
+    let mut tile = Pixmap::new(8, 8).expect("8x8");
+    let a = (c.3 as f64 * opacity).round().clamp(0.0, 255.0) as u8;
+    let on = tiny_skia::ColorU8::from_rgba(c.0, c.1, c.2, a).premultiply();
+    for (y, row) in bits.iter().enumerate() {
+        for x in 0..8 {
+            if row >> x & 1 == 1 {
+                tile.pixels_mut()[y * 8 + x] = on;
+            }
+        }
+    }
+    tile
 }
 
 fn paint(c: Rgba, opacity: f64) -> Paint<'static> {
@@ -345,13 +427,20 @@ pub fn draw_symbol(
     g: &Geometry<f64>,
     to_px: &dyn Fn(&Coord<f64>) -> (f32, f32),
     u: &RenderUnits,
+    ctx: &Attrs,
+    // Pixel position of the feature's (xmin, ymin): image fills in feature mode anchor here.
+    origin: Option<(f32, f32)>,
 ) {
     for layer in &sym.layers {
-        match layer {
+        // Data-defined overrides for this feature (or the layer as is).
+        let Some(kind) = layer.resolve(ctx) else {
+            continue;
+        };
+        match kind.as_ref() {
             SymbolLayer::SimpleFill {
                 color,
                 filled,
-                hatched,
+                pattern,
                 stroke,
             } => {
                 let polys = polygons(g);
@@ -366,11 +455,23 @@ pub fn draw_symbol(
                 }
                 let Some(path) = pb.finish() else { continue };
                 if *filled {
-                    // Hatch patterns are approximated by a translucent solid fill.
-                    let op = sym.opacity * if *hatched { 0.35 } else { 1.0 };
+                    let tile;
+                    let mut fill = paint(*color, sym.opacity);
+                    if let Some(bits) = pattern {
+                        // Qt pattern brush: the 8×8 bitmap repeats from the device origin,
+                        // modulated by the anti-aliased polygon coverage.
+                        tile = pattern_tile(bits, *color, sym.opacity);
+                        fill.shader = tiny_skia::Pattern::new(
+                            tile.as_ref(),
+                            tiny_skia::SpreadMode::Repeat,
+                            tiny_skia::FilterQuality::Nearest,
+                            1.0,
+                            SkTransform::identity(),
+                        );
+                    }
                     pm.fill_path(
                         &path,
-                        &paint(*color, op),
+                        &fill,
                         FillRule::EvenOdd,
                         SkTransform::identity(),
                         None,
@@ -384,6 +485,71 @@ pub fn draw_symbol(
                         SkTransform::identity(),
                         None,
                     );
+                }
+            }
+            SymbolLayer::LinePatternFill {
+                angle,
+                distance,
+                offset,
+                feature_ref,
+                image_brush,
+                line,
+            } => {
+                let polys = polygons(g);
+                if polys.is_empty() {
+                    continue;
+                }
+                let mut pb = PathBuilder::new();
+                for p in &polys {
+                    for r in geom::polygon_rings(p) {
+                        add_line(&mut pb, r, to_px, true);
+                    }
+                }
+                let Some(path) = pb.finish() else { continue };
+                let tile = if *image_brush {
+                    line_pattern_tile(*angle, distance.px(u), offset.px(u), line, u, ctx)
+                } else {
+                    None
+                };
+                match tile {
+                    Some(tile) => {
+                        // Feature mode anchors the texture at the feature's (xmin, ymin),
+                        // snapped to whole pixels (verified pixel-identical against QGIS).
+                        let anchor = match (feature_ref, origin) {
+                            (true, Some((x, y))) => {
+                                SkTransform::from_translate(x.round(), y.round())
+                            }
+                            _ => SkTransform::identity(),
+                        };
+                        let fill = Paint {
+                            anti_alias: true,
+                            shader: tiny_skia::Pattern::new(
+                                tile.as_ref(),
+                                tiny_skia::SpreadMode::Repeat,
+                                tiny_skia::FilterQuality::Nearest,
+                                sym.opacity as f32,
+                                anchor,
+                            ),
+                            ..Default::default()
+                        };
+                        pm.fill_path(
+                            &path,
+                            &fill,
+                            FillRule::EvenOdd,
+                            SkTransform::identity(),
+                            None,
+                        );
+                    }
+                    None => draw_pattern_lines(
+                        pm,
+                        &path,
+                        *angle,
+                        distance.px(u),
+                        offset.px(u),
+                        line,
+                        u,
+                        ctx,
+                    ),
                 }
             }
             SymbolLayer::SimpleLine { stroke, .. } => {
@@ -404,48 +570,350 @@ pub fn draw_symbol(
                     );
                 }
             }
-            SymbolLayer::SimpleMarker {
+            SymbolLayer::Marker {
                 shape,
-                size,
+                width,
+                height,
                 color,
                 stroke,
+                angle,
+                offset,
+                ..
             } => {
-                let r = (size.px(u) / 2.0) as f32;
+                let (rx, ry) = ((width.px(u) / 2.0) as f32, (height.px(u) / 2.0) as f32);
                 // Zero-size markers are a common way to make label-only layers.
-                if r <= 0.0 {
+                if rx <= 0.0 || ry <= 0.0 {
                     continue;
                 }
+                let (ox, oy) = (offset.0.px(u) as f32, offset.1.px(u) as f32);
                 for c in points(g) {
                     let (x, y) = to_px(&c);
-                    draw_marker(pm, shape, x, y, r, *color, stroke, sym.opacity, u);
+                    let place = SkTransform::from_scale(rx, ry)
+                        .post_rotate(*angle as f32)
+                        .post_translate(x + ox, y + oy);
+                    draw_marker(pm, shape, place, *color, stroke, sym.opacity, u);
                 }
             }
         }
     }
 }
 
-fn regular(pb: &mut PathBuilder, x: f32, y: f32, r: f32, n: usize, rot: f32, inner: Option<f32>) {
-    let steps = if inner.is_some() { n * 2 } else { n };
-    for i in 0..steps {
-        let a = rot + i as f32 * std::f32::consts::TAU / steps as f32;
-        let rr = if i % 2 == 1 { inner.unwrap_or(r) } else { r };
-        let (px, py) = (x + rr * a.sin(), y - rr * a.cos());
-        if i == 0 {
-            pb.move_to(px, py)
-        } else {
-            pb.line_to(px, py)
-        }
-    }
-    pb.close();
+/// Half the widest stroke of a line symbol in pixels (QgsSymbolLayer::estimateMaxBleed).
+fn line_bleed(line: &Symbol, u: &RenderUnits) -> f64 {
+    line.layers
+        .iter()
+        .map(|l| match &l.kind {
+            SymbolLayer::SimpleLine { stroke } => stroke.width.px(u) / 2.0,
+            _ => 0.0,
+        })
+        .fold(0.0, f64::max)
 }
 
+fn draw_line_px(
+    pm: &mut Pixmap,
+    line: &Symbol,
+    a: (f64, f64),
+    b: (f64, f64),
+    u: &RenderUnits,
+    ctx: &Attrs,
+) {
+    let g: Geometry<f64> = LineString::from(vec![a, b]).into();
+    draw_symbol(pm, line, &g, &|c| (c.x as f32, c.y as f32), u, ctx, None);
+}
+
+fn point_on_line(a: (f64, f64), b: (f64, f64), d: f64) -> (f64, f64) {
+    let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+    if len == 0.0 {
+        return a;
+    }
+    (a.0 + (b.0 - a.0) * d / len, a.1 + (b.1 - a.1) * d / len)
+}
+
+/// The repeating tile of QgsLinePatternFillSymbolLayer::applyPattern, step by step:
+/// integer tile sizes (which slightly change the effective angle), a buffer of whole tiles
+/// to cover the line bleed, two or three lines drawn anti-aliased, then the buffer cut off.
+/// Returns None where QGIS falls back to drawing individual lines.
+fn line_pattern_tile(
+    line_angle: f64,
+    dist_px: f64,
+    offset_px: f64,
+    line: &Symbol,
+    u: &RenderUnits,
+    ctx: &Attrs,
+) -> Option<Pixmap> {
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-8;
+    let mut dist = dist_px;
+    let mut offset = offset_px % dist;
+    if offset > dist / 2.0 {
+        offset -= dist;
+    }
+    let bleed = line_bleed(line, u);
+    let mut angle = line_angle % 360.0;
+    if angle < 0.0 {
+        angle += 360.0;
+    }
+    let (mut width, mut height): (i64, i64);
+    if near(angle, 0.0) || near(angle, 360.0) || near(angle, 180.0) {
+        height = dist as i64;
+        width = height;
+    } else if near(angle, 90.0) || near(angle, 270.0) {
+        width = dist as i64;
+        height = width;
+    } else {
+        height = (dist / angle.to_radians().cos()) as i64;
+        width = (dist / angle.to_radians().sin()) as i64;
+        angle = (height as f64).atan2(width as f64).to_degrees();
+        if angle < 0.0 {
+            angle += 360.0;
+        }
+        height = height.abs();
+        width = width.abs();
+        dist = (height as f64 * angle.to_radians().cos()).abs();
+        let offset_height = (offset / angle.to_radians().cos()).round() as i64;
+        offset = offset_height as f64 * angle.to_radians().cos();
+    }
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // QGIS computes the buffer from the width twice (sic).
+    let buffer_multi = ((bleed / width as f64).ceil() as i64).max(1);
+    let (xbuf, ybuf) = (width * buffer_multi, height * buffer_multi);
+    let (inner_w, inner_h) = (width, height);
+    let (w, h) = (width + 2 * xbuf, height + 2 * ybuf);
+    if w > 2000 || h > 2000 {
+        return None;
+    }
+    let (wf, hf) = (w as f64, h as f64);
+    let o = (0., 0.);
+    let r = |d: f64| d.to_radians();
+    let diagonal = !(near(angle, 0.0)
+        || near(angle, 360.0)
+        || near(angle, 180.0)
+        || near(angle, 90.0)
+        || near(angle, 270.0));
+    let (mut p1, mut p2, mut p3, mut p4, mut p5, mut p6) =
+        if near(angle, 0.0) || near(angle, 360.0) || near(angle, 180.0) {
+            let (yb, yi) = (ybuf as f64, (ybuf + inner_h) as f64);
+            ((0., yb), (wf, yb), (0., yi), (wf, yi), o, o)
+        } else if near(angle, 90.0) || near(angle, 270.0) {
+            let (xb, xi) = (xbuf as f64, (xbuf + inner_w) as f64);
+            ((xb, hf), (xb, 0.), (xi, hf), (xi, 0.), o, o)
+        } else if angle < 90.0 || (angle > 180.0 && angle < 270.0) {
+            let (dx, dy) = (dist * r(90.0 - angle).cos(), dist * r(90.0 - angle).sin());
+            if angle < 90.0 {
+                (
+                    (0., hf),
+                    (wf, 0.),
+                    (-dx, hf - dy),
+                    (wf - dx, -dy),
+                    (dx, hf + dy),
+                    (wf + dx, dy),
+                )
+            } else {
+                (
+                    (wf, 0.),
+                    (0., hf),
+                    (wf - dx, -dy),
+                    (-dx, hf - dy),
+                    (wf + dx, dy),
+                    (dx, hf + dy),
+                )
+            }
+        } else {
+            let (dy, dx) = (dist * r(180.0 - angle).cos(), dist * r(180.0 - angle).sin());
+            if angle < 180.0 {
+                (
+                    (0., 0.),
+                    (wf, hf),
+                    (-dx, dy),
+                    (wf - dx, hf + dy),
+                    (dx, -dy),
+                    (wf + dx, hf - dy),
+                )
+            } else {
+                (
+                    (wf, hf),
+                    (0., 0.),
+                    (wf - dx, hf + dy),
+                    (-dx, dy),
+                    (wf + dx, hf - dy),
+                    (dx, -dy),
+                )
+            }
+        };
+    if offset_px != 0.0 {
+        p3 = point_on_line(p1, p3, dist + offset);
+        p4 = point_on_line(p2, p4, dist + offset);
+        p5 = point_on_line(p1, p5, dist - offset);
+        p6 = point_on_line(p2, p6, dist - offset);
+        p1 = point_on_line(p1, p3, offset);
+        p2 = point_on_line(p2, p4, offset);
+    }
+    let mut img = Pixmap::new(w as u32, h as u32)?;
+    draw_line_px(&mut img, line, p1, p2, u, ctx);
+    draw_line_px(&mut img, line, p3, p4, u, ctx);
+    if diagonal {
+        draw_line_px(&mut img, line, p5, p6, u, ctx);
+    }
+    // Cut off the buffer.
+    let mut tile = Pixmap::new(inner_w as u32, inner_h as u32)?;
+    tile.draw_pixmap(
+        -(xbuf as i32),
+        -(ybuf as i32),
+        img.as_ref(),
+        &PixmapPaint::default(),
+        SkTransform::identity(),
+        None,
+    );
+    Some(tile)
+}
+
+/// Vector line-pattern rendering (QgsLinePatternFillSymbolLayer::renderPolygon with
+/// lines): parallel lines across the feature, clipped to it with a coverage mask.
 #[allow(clippy::too_many_arguments)]
+fn draw_pattern_lines(
+    pm: &mut Pixmap,
+    path: &tiny_skia::Path,
+    angle: f64,
+    dist_px: f64,
+    offset_px: f64,
+    line: &Symbol,
+    u: &RenderUnits,
+    ctx: &Attrs,
+) {
+    let dist = dist_px.max(0.025);
+    let mut offset = offset_px % dist;
+    if offset > dist / 2.0 {
+        offset -= dist;
+    }
+    let Some(mut mask) = tiny_skia::Mask::new(pm.width(), pm.height()) else {
+        return;
+    };
+    mask.fill_path(path, FillRule::EvenOdd, true, SkTransform::identity());
+    let mut layer = Pixmap::new(pm.width(), pm.height()).expect("same size");
+    let b = path.bounds();
+    let (cx, cy) = (
+        ((b.left() + b.right()) / 2.0) as f64,
+        ((b.top() + b.bottom()) / 2.0) as f64,
+    );
+    // Rotate the feature's corners into line space around its centre.
+    let (s, c) = angle.to_radians().sin_cos();
+    let rot = |x: f64, y: f64| {
+        (
+            c * (x - cx) - s * (y - cy) + cx,
+            s * (x - cx) + c * (y - cy) + cy,
+        )
+    };
+    let unrot = |x: f64, y: f64| {
+        (
+            c * (x - cx) + s * (y - cy) + cx,
+            -s * (x - cx) + c * (y - cy) + cy,
+        )
+    };
+    let corners = [
+        (b.left() as f64, b.top() as f64),
+        (b.right() as f64, b.top() as f64),
+        (b.right() as f64, b.bottom() as f64),
+        (b.left() as f64, b.bottom() as f64),
+    ];
+    let t: Vec<(f64, f64)> = corners.iter().map(|(x, y)| rot(*x, *y)).collect();
+    let buffer = line_bleed(line, u) * 2.0;
+    let left = t.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) - buffer;
+    let right = t.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max) + buffer;
+    let top = t.iter().map(|p| p.1).fold(f64::INFINITY, f64::min) - buffer;
+    let bottom = t.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max) + buffer;
+    let mut y = top;
+    while y <= bottom {
+        draw_line_px(
+            &mut layer,
+            line,
+            unrot(left, y - offset),
+            unrot(right, y - offset),
+            u,
+            ctx,
+        );
+        y += dist;
+    }
+    pm.draw_pixmap(
+        0,
+        0,
+        layer.as_ref(),
+        &PixmapPaint::default(),
+        SkTransform::identity(),
+        Some(&mask),
+    );
+}
+
+/// Marker outlines in QGIS's unit coordinates (y down), from
+/// QgsSimpleMarkerSymbolLayerBase::shapeToPolygon. `None` = circle; the bool marks
+/// open shapes that are only stroked.
+/// Marker outline parts (each a list of unit-space points) and whether they are open.
+type MarkerShape = (Vec<Vec<(f32, f32)>>, bool);
+
+fn marker_shape(shape: &str) -> Option<MarkerShape> {
+    const S: f32 = 0.866_025_4; // sin(60°)
+    let closed = |p: &[(f32, f32)]| Some((vec![p.to_vec()], false));
+    match shape {
+        "square" | "rectangle" => closed(&[(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)]),
+        "diamond" => closed(&[(-1., 0.), (0., 1.), (1., 0.), (0., -1.)]),
+        "triangle" => closed(&[(-1., 1.), (1., 1.), (0., -1.)]),
+        "equilateral_triangle" => closed(&[(-S, 0.5), (S, 0.5), (0., -1.)]),
+        "pentagon" => closed(&[
+            (-0.9511, -0.3090),
+            (-0.5878, 0.8090),
+            (0.5878, 0.8090),
+            (0.9511, -0.3090),
+            (0., -1.),
+        ]),
+        "hexagon" => closed(&[
+            (-S, -0.5),
+            (-S, 0.5),
+            (0., 1.),
+            (S, 0.5),
+            (S, -0.5),
+            (0., -1.),
+        ]),
+        "octagon" => {
+            const O: f32 = 0.414_213_6;
+            closed(&[
+                (-O, -1.),
+                (O, -1.),
+                (1., -O),
+                (1., O),
+                (O, 1.),
+                (-O, 1.),
+                (-1., O),
+                (-1., -O),
+            ])
+        }
+        "star" => {
+            let inner = 72f32.to_radians().cos() / 36f32.to_radians().cos();
+            let pts: Vec<(f32, f32)> = (0..10)
+                .map(|i| {
+                    let a = (i as f32 * 36.0).to_radians();
+                    let r = if i % 2 == 0 { 1.0 } else { inner };
+                    (r * a.sin(), -r * a.cos())
+                })
+                .collect();
+            closed(&pts)
+        }
+        "cross" | "cross_fill" => Some((
+            vec![vec![(-1., 0.), (1., 0.)], vec![(0., -1.), (0., 1.)]],
+            true,
+        )),
+        "cross2" | "x" => Some((
+            vec![vec![(-1., -1.), (1., 1.)], vec![(-1., 1.), (1., -1.)]],
+            true,
+        )),
+        "line" => Some((vec![vec![(0., -1.), (0., 1.)]], true)),
+        _ => None,
+    }
+}
+
 fn draw_marker(
     pm: &mut Pixmap,
     shape: &str,
-    x: f32,
-    y: f32,
-    r: f32,
+    place: SkTransform,
     color: Rgba,
     stroke: &Stroke,
     opacity: f64,
@@ -453,45 +921,28 @@ fn draw_marker(
 ) {
     let mut pb = PathBuilder::new();
     let mut stroke_only = false;
-    match shape {
-        "square" | "rectangle" => regular(
-            &mut pb,
-            x,
-            y,
-            r * std::f32::consts::SQRT_2,
-            4,
-            std::f32::consts::FRAC_PI_4,
-            None,
-        ),
-        "diamond" => regular(&mut pb, x, y, r, 4, 0.0, None),
-        "triangle" | "equilateral_triangle" => regular(&mut pb, x, y, r, 3, 0.0, None),
-        "pentagon" => regular(&mut pb, x, y, r, 5, 0.0, None),
-        "hexagon" => regular(&mut pb, x, y, r, 6, 0.0, None),
-        "octagon" => regular(&mut pb, x, y, r, 8, std::f32::consts::PI / 8.0, None),
-        "star" => regular(&mut pb, x, y, r, 5, 0.0, Some(r * 0.4)),
-        "cross" | "cross_fill" => {
-            stroke_only = true;
-            pb.move_to(x - r, y);
-            pb.line_to(x + r, y);
-            pb.move_to(x, y - r);
-            pb.line_to(x, y + r);
+    match marker_shape(shape) {
+        Some((parts, open)) => {
+            stroke_only = open;
+            for part in parts {
+                for (i, (x, y)) in part.iter().enumerate() {
+                    if i == 0 {
+                        pb.move_to(*x, *y)
+                    } else {
+                        pb.line_to(*x, *y)
+                    }
+                }
+                if !open {
+                    pb.close();
+                }
+            }
         }
-        "cross2" | "x" => {
-            stroke_only = true;
-            let d = r * std::f32::consts::FRAC_1_SQRT_2;
-            pb.move_to(x - d, y - d);
-            pb.line_to(x + d, y + d);
-            pb.move_to(x - d, y + d);
-            pb.line_to(x + d, y - d);
-        }
-        "line" => {
-            stroke_only = true;
-            pb.move_to(x, y - r);
-            pb.line_to(x, y + r);
-        }
-        _ => pb.push_circle(x, y, r),
+        None => pb.push_circle(0.0, 0.0, 1.0),
     }
-    let Some(path) = pb.finish() else { return };
+    // Transform the outline (not the pen), so stroke widths stay in pixels.
+    let Some(path) = pb.finish().and_then(|p| p.transform(place)) else {
+        return;
+    };
     if stroke_only {
         let mut st = sk_stroke(stroke, u);
         st.width = st.width.max(1.0);
@@ -546,7 +997,15 @@ pub fn symbol_patch(sym: &Symbol, w: u32, h: u32, dpi: f64) -> Pixmap {
         )
         .into(),
     };
-    draw_symbol(&mut pm, sym, &g, &|c| (c.x as f32, c.y as f32), &u);
+    draw_symbol(
+        &mut pm,
+        sym,
+        &g,
+        &|c| (c.x as f32, c.y as f32),
+        &u,
+        &Attrs::new(),
+        Some((1.0, h as f32 - 1.0)),
+    );
     pm
 }
 

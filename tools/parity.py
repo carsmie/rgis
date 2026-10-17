@@ -58,8 +58,21 @@ for path in projects:
         if x1 <= x0 or y1 <= y0:  # point layers with one feature: pad
             x0, y0, x1, y1 = x0 - 50, y0 - 50, x1 + 50, y1 + 50
         px, py = (x1 - x0) * 0.05, (y1 - y0) * 0.05
+        x0, y0, x1, y1 = x0 - px, y0 - py, x1 + px, y1 + py
+        # Like real clients, ask for an image with the BBOX's aspect ratio (no stretching).
+        # WMS 1.3.0 EPSG:4326 boxes are lat/lon, so the height axis is the first one there.
+        geo = crs == "EPSG:4326"
+        span_w, span_h = ((y1 - y0), (x1 - x0)) if geo else ((x1 - x0), (y1 - y0))
+        height = max(32, min(4 * SIZE, round(SIZE * span_h / span_w)))
+        # Make the box match the integer image size exactly.
+        mid = (x0 + x1) / 2 if geo else (y0 + y1) / 2
+        half = span_w * height / SIZE / 2
+        if geo:
+            x0, x1 = mid - half, mid + half
+        else:
+            y0, y1 = mid - half, mid + half
         q = (f"{m}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={urllib.parse.quote(name)}&STYLES="
-             f"&CRS={crs}&BBOX={x0 - px},{y0 - py},{x1 + px},{y1 + py}&WIDTH={SIZE}&HEIGHT={SIZE}&FORMAT=image/png")
+             f"&CRS={crs}&BBOX={x0},{y0},{x1},{y1}&WIDTH={SIZE}&HEIGHT={height}&FORMAT=image/png")
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{pname}__{name}")
         files = {}
         notes = []

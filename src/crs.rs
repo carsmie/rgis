@@ -199,7 +199,12 @@ impl Transform {
         match self.fast {
             Fast::Identity => return Ok((x, y)),
             Fast::GeoToWebMercator => {
-                let lat = y.clamp(-85.051_128_78, 85.051_128_78).to_radians();
+                // Like PROJ (and therefore QGIS) no clamping: -89.9° maps to about -44.9e6 m;
+                // only the poles themselves are undefined.
+                if y.abs() >= 90.0 {
+                    bail!("latitude {y} cannot be projected to Web Mercator");
+                }
+                let lat = y.to_radians();
                 let my = WEB_MERCATOR_R * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln();
                 return Ok((WEB_MERCATOR_R * x.to_radians(), my));
             }
@@ -212,13 +217,10 @@ impl Transform {
         }
         let (mut x, mut y) = (x, y);
         if self.src.geographic {
-            // Mercator is undefined at the poles; QGIS clips similarly when rendering.
-            let lim = if self.dst.mercator {
-                85.051_128_78
-            } else {
-                90.0
-            };
-            y = y.clamp(-lim, lim);
+            if self.dst.mercator && y.abs() >= 90.0 {
+                bail!("latitude {y} cannot be projected to Mercator");
+            }
+            y = y.clamp(-90.0, 90.0);
             x = x.to_radians();
             y = y.to_radians();
         }

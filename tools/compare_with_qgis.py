@@ -51,18 +51,12 @@ for v in ("1.3.0", "1.1.1"):
     check(f"WMS {v} capabilities: same CRS lists", [x[2] for x in la] == [x[2] for x in lb], f"{la[0][2]} vs {lb[0][2]}")
     check(f"WMS {v} capabilities: same BoundingBox CRSs per layer ({sum(len(x[3]) for x in la)} boxes)", [sorted(x[3]) for x in la] == [sorted(x[3]) for x in lb],
           f"{[sorted(x[3]) for x in la]} vs {[sorted(x[3]) for x in lb]}")
-    worst, merc = 0.0, []
+    worst = 0.0
     for (na, _, _, ba), (nb, _, _, bb) in zip(la, lb):
         for crs, box in ba.items():
             if crs in bb:
-                d = max(abs(p - q) for p, q in zip(box, bb[crs]))
-                if crs == "EPSG:3857" and min(box[1], box[0]) < -2.0038e7:
-                    merc.append((na, box[1], bb[crs][1]))  # polar latitude: QGIS does not clamp
-                else:
-                    worst = max(worst, d)
+                worst = max(worst, max(abs(p - q) for p, q in zip(box, bb[crs])))
     check(f"WMS {v} capabilities: BoundingBoxes agree (max diff {worst:g})", worst < 0.01)
-    for name, qv, rv in merc:
-        print(f"NOTE {name}: EPSG:3857 miny QGIS {qv:.0f} (unclamped, lat -89.9) vs rust {rv:.0f} (clamped at Mercator limit)")
 
 # --- GetMap axis order: 1.1.1 lon/lat must equal 1.3.0 lat/lon
 q11 = "SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=Earth&SRS=EPSG:4326&BBOX=-180,-90,180,90&WIDTH=200&HEIGHT=100&FORMAT=image/png"
