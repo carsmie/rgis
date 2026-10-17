@@ -73,6 +73,8 @@ pub struct MapLayer {
     pub renderer: Renderer,
     pub opacity: f64,
     pub scale_range: Option<(f64, f64)>,
+    /// Render-time simplification tolerance in pixels (`simplifyDrawingHints`/`simplifyDrawingTol`).
+    pub simplify_tol: Option<f64>,
     pub style_name: String,
     pub identifiable: bool,
     pub hidden_wms: Vec<String>,
@@ -274,6 +276,12 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
             .unwrap_or(1.0),
         scale_range: (flag("hasScaleBasedVisibilityFlag") == Some("1"))
             .then(|| (scale("minScale"), scale("maxScale"))),
+        // simplifyDrawingHints is a flag set; 0 = no simplification.
+        simplify_tol: flag("simplifyDrawingHints")
+            .and_then(|h| h.parse::<u32>().ok())
+            .filter(|h| *h != 0)
+            .map(|_| scale("simplifyDrawingTol"))
+            .filter(|t| *t > 0.0),
         style_name: child(ml, "map-layer-style-manager")
             .and_then(|s| s.attribute("current"))
             .filter(|s| !s.is_empty())
@@ -464,15 +472,17 @@ impl Project {
     pub fn extent(&self) -> Rect {
         let configured = self.list_prop("WMSExtent");
         if configured.len() == 4
-            && let Some(r) = Rect::parse(&configured.join(",")) {
-                return r;
-            }
+            && let Some(r) = Rect::parse(&configured.join(","))
+        {
+            return r;
+        }
         let mut r = Rect::empty();
         for l in self.layers.values() {
             if let Some(e) = l.full_extent()
-                && let Ok(t) = Transform::new(&l.crs(), &self.crs).rect(&e) {
-                    r.union(&t);
-                }
+                && let Ok(t) = Transform::new(&l.crs(), &self.crs).rect(&e)
+            {
+                r.union(&t);
+            }
         }
         r
     }

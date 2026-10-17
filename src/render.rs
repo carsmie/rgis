@@ -89,6 +89,53 @@ pub fn layer_features(
     Ok(out)
 }
 
+/// Features prepared for drawing, as QgsVectorLayerRenderer does: simplified in the layer
+/// CRS with the layer's pixel tolerance, reprojected, then clipped to the (buffered) view.
+fn features_for_drawing(
+    layer: &MapLayer,
+    ms: &MapSettings,
+    filter: Option<&Expr>,
+) -> Result<Vec<Feature>> {
+    let provider = layer.provider()?;
+    let layer_crs = layer.crs();
+    let to_layer = Transform::new(&ms.crs, &layer_crs);
+    let to_map = Transform::new(&layer_crs, &ms.crs);
+    let mut out = provider.features(to_layer.rect(&ms.extent).ok())?;
+    out.retain(|f| filter.is_none_or(|e| e.matches(&f.attrs)));
+
+    // The pixel tolerance expressed in layer units, measured at the centre of the view.
+    let e = &ms.extent;
+    let (cx, cy) = ((e.xmin + e.xmax) / 2.0, (e.ymin + e.ymax) / 2.0);
+    let tol = layer.simplify_tol.and_then(|px| {
+        let d = px * ms.mupp();
+        let a = to_layer.point(cx, cy).ok()?;
+        let b = to_layer.point(cx + d, cy).ok()?;
+        let c = to_layer.point(cx, cy + d).ok()?;
+        let dist =
+            |p: (f64, f64), q: (f64, f64)| ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt();
+        Some(dist(a, b).min(dist(a, c)))
+    });
+    // Clip with a margin so the artificial edges along the clip boundary stay invisible.
+    let m = 64.0 * ms.mupp();
+    let clip = Rect::new(e.xmin - m, e.ymin - m, e.xmax + m, e.ymax + m);
+    for f in &mut out {
+        f.geometry = f.geometry.take().and_then(|g| {
+            let g = match tol {
+                Some(t) => geom::simplify(&g, t),
+                None => g,
+            };
+            let g = if to_map.is_identity() {
+                g
+            } else {
+                geom::transform(&g, &to_map)
+            };
+            geom::clip_to_rect(&g, &clip)
+        });
+    }
+    out.retain(|f| f.geometry.is_some());
+    Ok(out)
+}
+
 fn ignore_rendering_errors() -> bool {
     std::env::var("QGIS_SERVER_IGNORE_RENDERING_ERRORS")
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true"))
@@ -116,7 +163,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             continue;
         }
         let started = std::time::Instant::now();
-        let features = match layer_features(l, &ms.extent, &ms.crs, job.filter.as_ref()) {
+        let features = match features_for_drawing(l, ms, job.filter.as_ref()) {
             Ok(f) => f,
             // QgsServerSettings::ignoreRenderingErrors
             Err(e) if ignore_rendering_errors() => {

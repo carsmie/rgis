@@ -517,9 +517,10 @@ pub fn to_str(v: &Value) -> String {
 pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     let numeric = |v: &Value| matches!(v, Value::Number(_) | Value::Bool(_));
     if (numeric(a) || numeric(b))
-        && let (Some(x), Some(y)) = (num(a), num(b)) {
-            return x.partial_cmp(&y);
-        }
+        && let (Some(x), Some(y)) = (num(a), num(b))
+    {
+        return x.partial_cmp(&y);
+    }
     Some(to_str(a).cmp(&to_str(b)))
 }
 

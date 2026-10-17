@@ -273,6 +273,243 @@ pub fn round(v: f64, precision: usize) -> f64 {
     (v * m).round() / m
 }
 
+fn simplify_line(l: &LineString<f64>, tol: f64, ring: bool) -> LineString<f64> {
+    let pts = &l.0;
+    if pts.len() <= 2 || tol <= 0.0 {
+        return l.clone();
+    }
+    let b = bbox(&Geometry::LineString(l.clone()));
+    if ring && b.width() < tol && b.height() < tol {
+        // QgsMapToPixelSimplifier: features smaller than the tolerance become their box.
+        return LineString::from(vec![
+            (b.xmin, b.ymin),
+            (b.xmax, b.ymin),
+            (b.xmax, b.ymax),
+            (b.xmin, b.ymax),
+            (b.xmin, b.ymin),
+        ]);
+    }
+    let tol2 = tol * tol;
+    let mut out = Vec::with_capacity(pts.len() / 2);
+    out.push(pts[0]);
+    let last = pts.len() - 1;
+    for (i, c) in pts.iter().enumerate().skip(1) {
+        let p = out[out.len() - 1];
+        if i == last || (c.x - p.x).powi(2) + (c.y - p.y).powi(2) >= tol2 {
+            out.push(*c);
+        }
+    }
+    if ring && out.len() < 4 {
+        return l.clone();
+    }
+    LineString(out)
+}
+
+/// QGIS "Distance" map-to-pixel simplification: drop vertices closer than `tol` to the
+/// previously kept one (`simplifyAlgorithm="0"`, `simplifyDrawingTol` in pixels).
+pub fn simplify(g: &Geometry<f64>, tol: f64) -> Geometry<f64> {
+    let poly = |p: &Polygon<f64>| {
+        Polygon::new(
+            simplify_line(p.exterior(), tol, true),
+            p.interiors()
+                .iter()
+                .map(|r| simplify_line(r, tol, true))
+                .collect(),
+        )
+    };
+    match g {
+        Geometry::LineString(l) => Geometry::LineString(simplify_line(l, tol, false)),
+        Geometry::MultiLineString(m) => {
+            Geometry::MultiLineString(m.0.iter().map(|l| simplify_line(l, tol, false)).collect())
+        }
+        Geometry::Polygon(p) => Geometry::Polygon(poly(p)),
+        Geometry::MultiPolygon(m) => Geometry::MultiPolygon(m.0.iter().map(poly).collect()),
+        Geometry::GeometryCollection(gc) => {
+            Geometry::GeometryCollection(gc.0.iter().map(|g| simplify(g, tol)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Sutherland–Hodgman clipping of a ring against an axis-aligned rectangle.
+fn clip_ring(ring: &LineString<f64>, r: &Rect) -> Vec<Coord<f64>> {
+    let mut pts: Vec<Coord<f64>> = ring.0.clone();
+    type Edge = (
+        fn(&Coord<f64>, &Rect) -> bool,
+        fn(Coord<f64>, Coord<f64>, &Rect) -> Coord<f64>,
+    );
+    let edges: [Edge; 4] = [
+        (
+            |c, r| c.x >= r.xmin,
+            |a, b, r| Coord {
+                x: r.xmin,
+                y: a.y + (b.y - a.y) * (r.xmin - a.x) / (b.x - a.x),
+            },
+        ),
+        (
+            |c, r| c.x <= r.xmax,
+            |a, b, r| Coord {
+                x: r.xmax,
+                y: a.y + (b.y - a.y) * (r.xmax - a.x) / (b.x - a.x),
+            },
+        ),
+        (
+            |c, r| c.y >= r.ymin,
+            |a, b, r| Coord {
+                x: a.x + (b.x - a.x) * (r.ymin - a.y) / (b.y - a.y),
+                y: r.ymin,
+            },
+        ),
+        (
+            |c, r| c.y <= r.ymax,
+            |a, b, r| Coord {
+                x: a.x + (b.x - a.x) * (r.ymax - a.y) / (b.y - a.y),
+                y: r.ymax,
+            },
+        ),
+    ];
+    for (inside, cross) in edges {
+        if pts.is_empty() {
+            break;
+        }
+        let input = std::mem::take(&mut pts);
+        let mut prev = input[input.len() - 1];
+        for cur in input {
+            match (inside(&cur, r), inside(&prev, r)) {
+                (true, true) => pts.push(cur),
+                (true, false) => {
+                    pts.push(cross(prev, cur, r));
+                    pts.push(cur);
+                }
+                (false, true) => pts.push(cross(prev, cur, r)),
+                (false, false) => {}
+            }
+            prev = cur;
+        }
+    }
+    if let (Some(first), Some(last)) = (pts.first().copied(), pts.last().copied())
+        && first != last {
+            pts.push(first);
+        }
+    pts
+}
+
+/// Liang–Barsky clipping of a polyline, split into the pieces inside the rectangle.
+fn clip_line(l: &LineString<f64>, r: &Rect, out: &mut Vec<LineString<f64>>) {
+    let mut cur: Vec<Coord<f64>> = vec![];
+    for w in l.0.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        let mut visible = true;
+        for (p, q) in [
+            (-dx, a.x - r.xmin),
+            (dx, r.xmax - a.x),
+            (-dy, a.y - r.ymin),
+            (dy, r.ymax - a.y),
+        ] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    visible = false;
+                    break;
+                }
+            } else {
+                let t = q / p;
+                if p < 0.0 {
+                    t0 = t0.max(t);
+                } else {
+                    t1 = t1.min(t);
+                }
+            }
+        }
+        if !visible || t0 > t1 {
+            if cur.len() >= 2 {
+                out.push(LineString(std::mem::take(&mut cur)));
+            }
+            cur.clear();
+            continue;
+        }
+        let p0 = Coord {
+            x: a.x + t0 * dx,
+            y: a.y + t0 * dy,
+        };
+        let p1 = Coord {
+            x: a.x + t1 * dx,
+            y: a.y + t1 * dy,
+        };
+        if cur.last() != Some(&p0) {
+            if cur.len() >= 2 {
+                out.push(LineString(std::mem::take(&mut cur)));
+            }
+            cur.clear();
+            cur.push(p0);
+        }
+        cur.push(p1);
+        if t1 < 1.0 {
+            out.push(LineString(std::mem::take(&mut cur)));
+        }
+    }
+    if cur.len() >= 2 {
+        out.push(LineString(cur));
+    }
+}
+
+/// Clip a geometry to a rectangle for drawing (QGIS `clip_to_extent`). Polygon rings are
+/// clipped independently, so `r` should be larger than the visible area to keep the
+/// artificial edges along the clip boundary out of view.
+pub fn clip_to_rect(g: &Geometry<f64>, r: &Rect) -> Option<Geometry<f64>> {
+    let b = bbox(g);
+    if !b.intersects(r) {
+        return None;
+    }
+    if b.xmin >= r.xmin && b.xmax <= r.xmax && b.ymin >= r.ymin && b.ymax <= r.ymax {
+        return Some(g.clone());
+    }
+    let poly = |p: &Polygon<f64>| -> Option<Polygon<f64>> {
+        let ext = clip_ring(p.exterior(), r);
+        if ext.len() < 4 {
+            return None;
+        }
+        let holes = p
+            .interiors()
+            .iter()
+            .map(|h| clip_ring(h, r))
+            .filter(|h| h.len() >= 4)
+            .map(LineString)
+            .collect();
+        Some(Polygon::new(LineString(ext), holes))
+    };
+    let out = match g {
+        Geometry::Polygon(p) => Geometry::Polygon(poly(p)?),
+        Geometry::MultiPolygon(m) => {
+            let v: Vec<Polygon<f64>> = m.0.iter().filter_map(poly).collect();
+            if v.is_empty() {
+                return None;
+            }
+            Geometry::MultiPolygon(v.into())
+        }
+        Geometry::LineString(_) | Geometry::MultiLineString(_) => {
+            let mut parts = vec![];
+            match g {
+                Geometry::LineString(l) => clip_line(l, r, &mut parts),
+                Geometry::MultiLineString(m) => {
+                    m.0.iter().for_each(|l| clip_line(l, r, &mut parts))
+                }
+                _ => unreachable!(),
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            Geometry::MultiLineString(geo_types::MultiLineString(parts))
+        }
+        Geometry::GeometryCollection(gc) => {
+            Geometry::GeometryCollection(gc.0.iter().filter_map(|g| clip_to_rect(g, r)).collect())
+        }
+        other => other.clone(),
+    };
+    Some(out)
+}
+
 /// A rounded JSON number, written as an integer when it has no fraction (as QGIS does).
 pub fn jnum(v: f64, precision: usize) -> serde_json::Value {
     let r = round(v, precision);
@@ -431,6 +668,45 @@ mod tests {
         assert!(!hits(&p, 15.0, 5.0, 0.1));
         assert!(hits(&p, 10.05, 5.0, 0.1));
         assert_eq!(bbox(&p), Rect::new(0., 0., 10., 10.));
+    }
+
+    #[test]
+    fn clipping_and_simplification() {
+        let sq: Geometry<f64> =
+            polygon![(x: 0., y: 0.), (x: 10., y: 0.), (x: 10., y: 10.), (x: 0., y: 10.)].into();
+        let c = clip_to_rect(&sq, &Rect::new(5., 5., 20., 20.)).unwrap();
+        assert_eq!(bbox(&c), Rect::new(5., 5., 10., 10.));
+        assert!(clip_to_rect(&sq, &Rect::new(20., 20., 30., 30.)).is_none());
+        // A line crossing the rectangle twice is split into the inside pieces.
+        let zig: Geometry<f64> = LineString::from(vec![
+            (0., 5.),
+            (4., 5.),
+            (4., 20.),
+            (6., 20.),
+            (6., 5.),
+            (10., 5.),
+        ])
+        .into();
+        match clip_to_rect(&zig, &Rect::new(2., 0., 8., 10.)).unwrap() {
+            Geometry::MultiLineString(m) => assert_eq!(m.0.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        // Dense vertices collapse, tiny rings become their bounding box.
+        let dense: Geometry<f64> = LineString::from(
+            (0..=100)
+                .map(|i| (i as f64 * 0.01, 0.0))
+                .collect::<Vec<_>>(),
+        )
+        .into();
+        // kept: 0, 0.26, 0.52, 0.78 and the last vertex
+        match simplify(&dense, 0.255) {
+            Geometry::LineString(l) => assert_eq!(l.0.len(), 5),
+            other => panic!("{other:?}"),
+        }
+        match simplify(&sq, 50.0) {
+            Geometry::Polygon(p) => assert_eq!(p.exterior().0.len(), 5),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

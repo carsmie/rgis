@@ -6,7 +6,9 @@ A QGIS-Server-like OGC map server written in Rust. It opens QGIS project files
 its responses can be compared with QGIS Server's side by side.
 
 How QGIS Server itself works — with source line references and runtime logs — is
-documented in [EVIDENCE.md](EVIDENCE.md).
+documented in [EVIDENCE.md](EVIDENCE.md). A benchmark against QGIS Server is in
+[PERFORMANCE.md](PERFORMANCE.md): one Rust process serves ~2,100 map tiles/s at 80 MB,
+vs ~1,400/s for 10 QGIS Server processes at ~1.5 GB, and is as fast or faster per request.
 
 ## Quick start
 
@@ -98,8 +100,8 @@ DescribeFeatureType; error codes and HTTP statuses.
 
 | Project / request | Renderer, data | Differing pixels |
 |---|---|---|
-| `earth.qgs`, world, EPSG:4326 (WMS 1.3.0 lat/lon) | single symbol, FlatGeobuf | 0.72 % |
-| `earth.qgs`, Europe, EPSG:3857 | single symbol, FlatGeobuf | 0.56 % |
+| `earth.qgs`, world, EPSG:4326 (WMS 1.3.0 lat/lon) | single symbol, FlatGeobuf | 0.49 % |
+| `earth.qgs`, Europe, EPSG:3857 | single symbol, FlatGeobuf | 0.49 % |
 | QGIS test `test_project_legend_rule.qgs` | rule-based, Shapefile | 0.01 % |
 | QGIS test `test_project_wfs.qgs` | single symbol, Shapefile | 0.01 % |
 | QGIS test `test_project_mapthemes.qgs` | rule-based, GPKG + subset filters, non-square pixels | 0.39 % |

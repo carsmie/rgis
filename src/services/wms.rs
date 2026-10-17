@@ -307,10 +307,17 @@ fn get_map(ctx: &Context, version: &str) -> Result<Response, OwsError> {
             });
         }
     }
+    let t = std::time::Instant::now();
     let pm = render::render(&jobs, &ms)
         .map_err(|e| OwsError::internal(format!("Rendering error : '{e:#}'")))?;
     let pm = render::scale(&pm, requested.0, requested.1);
-    Ok(Response::ok("image/png", render::encode_png(&pm)?))
+    let rendered = t.elapsed();
+    let png = render::encode_png(&pm)?;
+    tracing::debug!(
+        "GetMap: render {rendered:?}, png encode {:?}",
+        t.elapsed() - rendered
+    );
+    Ok(Response::ok("image/png", png))
 }
 
 // ------------------------------------------------------------- GetFeatureInfo
@@ -435,14 +442,13 @@ fn get_feature_info(ctx: &Context, version: &str) -> Result<Response, OwsError> 
                         esc(&to_str(v))
                     );
                 }
-                if with_geometry
-                    && let Some(g) = &f.geometry {
-                        let _ = writeln!(
-                            s,
-                            "   <Attribute name=\"geometry\" value=\"{}\" type=\"derived\"/>",
-                            esc(&geom::to_geojson(g, 8).to_string())
-                        );
-                    }
+                if with_geometry && let Some(g) = &f.geometry {
+                    let _ = writeln!(
+                        s,
+                        "   <Attribute name=\"geometry\" value=\"{}\" type=\"derived\"/>",
+                        esc(&geom::to_geojson(g, 8).to_string())
+                    );
+                }
                 s += "  </Feature>\n";
             }
             s += " </Layer>\n";
@@ -719,14 +725,15 @@ fn layer_xml(
         esc(&legend)
     );
     if let Some((min, max)) = l.scale_range
-        && v13 {
-            if max > 0.0 {
-                let _ = writeln!(s, "{ind} <MinScaleDenominator>{max}</MinScaleDenominator>");
-            }
-            if min > 0.0 {
-                let _ = writeln!(s, "{ind} <MaxScaleDenominator>{min}</MaxScaleDenominator>");
-            }
+        && v13
+    {
+        if max > 0.0 {
+            let _ = writeln!(s, "{ind} <MinScaleDenominator>{max}</MinScaleDenominator>");
         }
+        if min > 0.0 {
+            let _ = writeln!(s, "{ind} <MaxScaleDenominator>{min}</MaxScaleDenominator>");
+        }
+    }
     let _ = writeln!(s, "{ind}</Layer>");
 }
 
@@ -749,9 +756,10 @@ fn group_xml(
     }
     let _ = writeln!(s, "{ind} <Title>{}</Title>", esc(title));
     if depth == 2
-        && let Some(a) = project.text_prop("WMSServiceAbstract") {
-            let _ = writeln!(s, "{ind} <Abstract>{}</Abstract>", esc(a));
-        }
+        && let Some(a) = project.text_prop("WMSServiceAbstract")
+    {
+        let _ = writeln!(s, "{ind} <Abstract>{}</Abstract>", esc(a));
+    }
     crs_xml(s, crs_list, v13, &format!("{ind} "));
     let wgs84 = if depth == 2 {
         // Root layer: WMSExtent (or all layers) in the project CRS.

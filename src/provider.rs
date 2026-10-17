@@ -94,13 +94,14 @@ struct Uri {
 
 fn parse_uri(ds: &str) -> Uri {
     if let Some(rest) = ds.strip_prefix("GPKG:")
-        && let Some((p, l)) = rest.rsplit_once(':') {
-            return Uri {
-                path: p.into(),
-                layer: Some(l.into()),
-                subset: None,
-            };
-        }
+        && let Some((p, l)) = rest.rsplit_once(':')
+    {
+        return Uri {
+            path: p.into(),
+            layer: Some(l.into()),
+            subset: None,
+        };
+    }
     let mut parts = ds.split('|');
     let path = parts.next().unwrap_or("").to_string();
     let mut uri = Uri {
@@ -594,9 +595,10 @@ fn gpkg_features(g: &GpkgSource, fields: &[Field], filter: Option<Rect>) -> Resu
             _ => None,
         };
         if let (Some(b), None, Some(geo)) = (filter, &g.rtree, &geometry)
-            && !bbox(geo).intersects(&b) {
-                continue;
-            }
+            && !bbox(geo).intersects(&b)
+        {
+            continue;
+        }
         let mut attrs = Attrs::new();
         for (i, f) in fields.iter().enumerate() {
             use rusqlite::types::ValueRef::*;

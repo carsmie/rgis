@@ -152,29 +152,63 @@ fn normalise(id: &str) -> Option<String> {
     Some(format!("EPSG:{code}"))
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Fast {
+    None,
+    Identity,
+    /// WGS84 → Web Mercator: EPSG:3857 is a sphere of radius 6378137 with `+nadgrids=@null`,
+    /// i.e. WGS84 degrees are used directly; the closed form is exact.
+    GeoToWebMercator,
+    WebMercatorToGeo,
+}
+
+const WEB_MERCATOR_R: f64 = 6_378_137.0;
+
 /// A transform between two CRSs, working in degrees for geographic systems.
 pub struct Transform {
     src: Crs,
     dst: Crs,
-    identity: bool,
+    fast: Fast,
 }
 
 impl Transform {
     pub fn new(src: &Crs, dst: &Crs) -> Transform {
+        let wgs84 = |c: &Crs| matches!(c.authid.as_str(), "EPSG:4326" | "CRS:84");
+        let web_merc = |c: &Crs| matches!(c.authid.as_str(), "EPSG:3857" | "EPSG:900913");
+        let fast = if src == dst {
+            Fast::Identity
+        } else if wgs84(src) && web_merc(dst) {
+            Fast::GeoToWebMercator
+        } else if web_merc(src) && wgs84(dst) {
+            Fast::WebMercatorToGeo
+        } else {
+            Fast::None
+        };
         Transform {
-            identity: src == dst,
             src: src.clone(),
             dst: dst.clone(),
+            fast,
         }
     }
 
     pub fn is_identity(&self) -> bool {
-        self.identity
+        self.fast == Fast::Identity
     }
 
     pub fn point(&self, x: f64, y: f64) -> Result<(f64, f64)> {
-        if self.identity {
-            return Ok((x, y));
+        match self.fast {
+            Fast::Identity => return Ok((x, y)),
+            Fast::GeoToWebMercator => {
+                let lat = y.clamp(-85.051_128_78, 85.051_128_78).to_radians();
+                let my = WEB_MERCATOR_R * (std::f64::consts::FRAC_PI_4 + lat / 2.0).tan().ln();
+                return Ok((WEB_MERCATOR_R * x.to_radians(), my));
+            }
+            Fast::WebMercatorToGeo => {
+                let lat = (2.0 * (y / WEB_MERCATOR_R).exp().atan() - std::f64::consts::FRAC_PI_2)
+                    .to_degrees();
+                return Ok(((x / WEB_MERCATOR_R).to_degrees(), lat));
+            }
+            Fast::None => {}
         }
         let (mut x, mut y) = (x, y);
         if self.src.geographic {
@@ -207,7 +241,7 @@ impl Transform {
 
     /// Densified bounding box transform (QgsCoordinateTransform::transformBoundingBox).
     pub fn rect(&self, r: &Rect) -> Result<Rect> {
-        if self.identity {
+        if self.is_identity() {
             return Ok(*r);
         }
         const N: usize = 20;
@@ -259,6 +293,54 @@ mod tests {
         let back = Transform::new(&Crs::from_ogc("EPSG:3857").unwrap(), &Crs::wgs84());
         let (lon, lat) = back.point(x, y).unwrap();
         assert!((lon - 10.0).abs() < 1e-7 && (lat - 60.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn web_mercator_fast_path_matches_proj4rs() {
+        let (geo, merc) = (Crs::wgs84(), Crs::from_ogc("EPSG:3857").unwrap());
+        let slow = |x: f64, y: f64, s: &Crs, d: &Crs| {
+            let mut t = Transform::new(s, d);
+            t.fast = Fast::None;
+            t.point(x, y).unwrap()
+        };
+        for (lon, lat) in [
+            (10.0, 60.0),
+            (-179.9, -85.0),
+            (179.9, 84.9),
+            (0.0, 0.0),
+            (-73.98, 40.75),
+        ] {
+            let a = Transform::new(&geo, &merc).point(lon, lat).unwrap();
+            let b = slow(lon, lat, &geo, &merc);
+            assert!(
+                (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6,
+                "{a:?} vs {b:?}"
+            );
+            let c = Transform::new(&merc, &geo).point(a.0, a.1).unwrap();
+            let d = slow(a.0, a.1, &merc, &geo);
+            assert!(
+                (c.0 - d.0).abs() < 1e-9 && (c.1 - d.1).abs() < 1e-9,
+                "{c:?} vs {d:?}"
+            );
+        }
+    }
+
+    /// cargo test --release -- --ignored --nocapture transform_speed
+    #[test]
+    #[ignore]
+    fn transform_speed() {
+        for to in ["EPSG:3857", "EPSG:25833"] {
+            let t = Transform::new(&Crs::wgs84(), &Crs::from_ogc(to).unwrap());
+            let n = 1_000_000;
+            let start = std::time::Instant::now();
+            let mut acc = 0.0;
+            for i in 0..n {
+                let (x, _) = t.point(10.0 + (i % 1000) as f64 * 1e-3, 60.0).unwrap();
+                acc += x;
+            }
+            let ns = start.elapsed().as_nanos() as f64 / n as f64;
+            println!("EPSG:4326 -> {to}: {ns:.0} ns/point ({acc:.0})");
+        }
     }
 
     #[test]
