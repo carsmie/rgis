@@ -151,6 +151,21 @@ pub enum SymbolLayer {
         image_brush: bool,
         line: Box<Symbol>,
     },
+    /// QgsSvgMarkerSymbolLayer.
+    SvgMarker {
+        /// The SVG name as stored in the project.
+        name: String,
+        /// Resolved at project load (None = missing → QGIS's "?" placeholder).
+        path: Option<std::path::PathBuf>,
+        size: Size,
+        /// `fixedAspectRatio`; 0 = from the SVG.
+        fixed_aspect: f64,
+        fill: Rgba,
+        stroke_color: Rgba,
+        stroke_width: Size,
+        angle: f64,
+        offset: (Size, Size),
+    },
     /// SimpleMarker (width = height = size) and EllipseMarker (symbol_width × symbol_height).
     Marker {
         shape: String,
@@ -241,6 +256,30 @@ impl Layer {
             SymbolLayer::SimpleLine { stroke } => {
                 // Line layers use strokeColor / strokeWidth for their pen.
                 stroke_dd(stroke);
+            }
+            SymbolLayer::SvgMarker {
+                size,
+                fill,
+                stroke_color,
+                stroke_width,
+                angle,
+                ..
+            } => {
+                if let Some(s) = dd_num(dd, "size", ctx) {
+                    size.value = s;
+                }
+                if let Some(a) = dd_num(dd, "angle", ctx) {
+                    *angle = a;
+                }
+                if let Some(c) = dd_color(dd, "fillColor", ctx) {
+                    *fill = c;
+                }
+                if let Some(c) = dd_color(dd, "strokeColor", ctx) {
+                    *stroke_color = c;
+                }
+                if let Some(w) = dd_num(dd, "strokeWidth", ctx) {
+                    stroke_width.value = w;
+                }
             }
             SymbolLayer::LinePatternFill {
                 angle, distance, ..
@@ -544,7 +583,24 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 angle,
                 offset: offset(),
             },
-            "SimpleMarker" | "FontMarker" | "SvgMarker" => {
+            "SvgMarker" => SymbolLayer::SvgMarker {
+                name: g("name").unwrap_or("").to_string(),
+                path: None,
+                size: Size::new(g("size"), g("size_unit"), 4.0),
+                fixed_aspect: g("fixedAspectRatio")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0),
+                fill: g("color")
+                    .and_then(Rgba::parse)
+                    .unwrap_or(Rgba(255, 0, 0, 255)),
+                stroke_color: g("outline_color")
+                    .and_then(Rgba::parse)
+                    .unwrap_or(Rgba(35, 35, 35, 255)),
+                stroke_width: Size::new(g("outline_width"), g("outline_width_unit"), 0.2),
+                angle,
+                offset: offset(),
+            },
+            "SimpleMarker" | "FontMarker" => {
                 if class != "SimpleMarker" {
                     warn!("symbol layer {class} approximated as SimpleMarker");
                 }
@@ -638,7 +694,37 @@ fn parse_rule(n: Node) -> Rule {
     }
 }
 
+impl Symbol {
+    /// Resolve SVG file names once, at project load (QgsSymbolLayerUtils::svgSymbolNameToPath).
+    pub fn resolve_paths(&mut self, project_dir: &std::path::Path) {
+        for l in &mut self.layers {
+            match &mut l.kind {
+                SymbolLayer::SvgMarker { name, path, .. } => {
+                    *path = crate::svg::resolve(name, project_dir);
+                    if path.is_none() {
+                        warn!("SVG '{name}' not found; drawn as QGIS's '?' placeholder");
+                    }
+                }
+                SymbolLayer::LinePatternFill { line, .. } => line.resolve_paths(project_dir),
+                _ => {}
+            }
+        }
+    }
+}
+
 impl Renderer {
+    pub fn resolve_paths(&mut self, project_dir: &std::path::Path) {
+        match self {
+            Renderer::Single(s) => s.resolve_paths(project_dir),
+            Renderer::Categorized { symbols, .. }
+            | Renderer::Graduated { symbols, .. }
+            | Renderer::Rules { symbols, .. } => symbols
+                .values_mut()
+                .for_each(|s| s.resolve_paths(project_dir)),
+            Renderer::Null => {}
+        }
+    }
+
     pub fn parse(r: Node) -> Renderer {
         let ty = r.attribute("type").unwrap_or("");
         match ty {

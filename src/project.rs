@@ -305,9 +305,13 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
         extent: rect(child(ml, "extent")),
         wgs84_extent: rect(child(ml, "wgs84extent")),
         geometry: flag("geometry").unwrap_or("").to_string(),
-        renderer: child(ml, "renderer-v2")
-            .map(Renderer::parse)
-            .unwrap_or(Renderer::Null),
+        renderer: {
+            let mut r = child(ml, "renderer-v2")
+                .map(Renderer::parse)
+                .unwrap_or(Renderer::Null);
+            r.resolve_paths(base_dir);
+            r
+        },
         opacity: text(ml, "layerOpacity")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.0),

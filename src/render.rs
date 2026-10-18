@@ -570,6 +570,33 @@ pub fn draw_symbol(
                     );
                 }
             }
+            SymbolLayer::SvgMarker {
+                path,
+                size,
+                fixed_aspect,
+                fill,
+                stroke_color,
+                stroke_width,
+                angle,
+                offset,
+                ..
+            } => {
+                let marker = crate::svg::Marker {
+                    path: path.as_deref(),
+                    width: size.px(u),
+                    fixed_aspect: *fixed_aspect,
+                    fill: *fill,
+                    stroke: *stroke_color,
+                    stroke_width: stroke_width.px(u),
+                    angle: *angle,
+                    opacity: sym.opacity,
+                };
+                let (ox, oy) = (offset.0.px(u) as f32, offset.1.px(u) as f32);
+                for c in points(g) {
+                    let (x, y) = to_px(&c);
+                    crate::svg::draw(pm, &marker, x + ox, y + oy);
+                }
+            }
             SymbolLayer::Marker {
                 shape,
                 width,

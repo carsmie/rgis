@@ -10,6 +10,7 @@ mod provider;
 mod render;
 mod server;
 mod services;
+mod svg;
 mod symbology;
 
 use std::path::PathBuf;

@@ -14,7 +14,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-QGIS, RGIS = "http://127.0.0.1:8099/", "http://127.0.0.1:8098/"
+QGIS = os.environ.get("QGIS_URL", "http://127.0.0.1:8099/")
+RGIS = os.environ.get("RGIS_URL", "http://127.0.0.1:8098/")
 outdir, projects = sys.argv[1], sys.argv[2:]
 os.makedirs(outdir, exist_ok=True)
 strip = lambda t: t.split("}")[-1]
