@@ -160,6 +160,7 @@ impl Provider {
             "gpkg" => open_gpkg(path, uri.layer, uri.subset),
             "shp" => open_shapefile(&path),
             "geojson" | "json" => open_geojson(&path),
+            "csv" => open_csv(&path),
             other => bail!("unsupported OGR format '.{other}' ({})", path.display()),
         }
     }
@@ -701,6 +702,125 @@ fn open_shapefile(path: &Path) -> Result<Provider> {
     })
 }
 
+// ---------------------------------------------------------------------- CSV
+
+/// Split one CSV record (RFC 4180 quoting).
+fn csv_fields(line: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let (mut quoted, mut chars) = (false, line.chars().peekable());
+    while let Some(c) = chars.next() {
+        match (c, quoted) {
+            ('"', true) if chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            ('"', _) => quoted = !quoted,
+            (',', false) => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Records of a CSV file; quoted fields may span lines.
+fn csv_records(text: &str) -> Vec<Vec<String>> {
+    let mut records = vec![];
+    let mut pending = String::new();
+    for line in text.lines() {
+        if !pending.is_empty() {
+            pending.push('\n');
+        }
+        pending.push_str(line.trim_end_matches('\r'));
+        if pending.matches('"').count() % 2 == 0 {
+            records.push(csv_fields(&std::mem::take(&mut pending)));
+        }
+    }
+    records
+}
+
+/// GDAL's CSV driver: a `WKT` column becomes the geometry (and stays an attribute),
+/// field types come from an optional `.csvt` file (else strings), unnamed columns are
+/// `field_N`, and FIDs start at 1.
+fn open_csv(path: &Path) -> Result<Provider> {
+    use wkt::TryFromWkt;
+    let text = std::fs::read_to_string(path)?;
+    let mut records = csv_records(&text).into_iter();
+    let header = records
+        .next()
+        .ok_or_else(|| anyhow!("empty CSV {}", path.display()))?;
+    let types: Vec<String> = std::fs::read_to_string(path.with_extension("csvt"))
+        .ok()
+        .and_then(|t| csv_records(&t).into_iter().next())
+        .unwrap_or_default();
+    let fields: Vec<Field> = header
+        .iter()
+        .enumerate()
+        .map(|(i, n)| Field {
+            name: if n.trim().is_empty() {
+                format!("field_{}", i + 1)
+            } else {
+                n.trim().to_string()
+            },
+            kind: match types.get(i).map(|t| t.trim().to_ascii_lowercase()) {
+                Some(t) if t.starts_with("integer") => FieldKind::Int,
+                Some(t) if t.starts_with("real") => FieldKind::Real,
+                Some(t) if t == "date" => FieldKind::Date,
+                Some(t) if t == "datetime" => FieldKind::DateTime,
+                _ => FieldKind::String,
+            },
+        })
+        .collect();
+    let wkt_col = fields
+        .iter()
+        .position(|f| f.name.eq_ignore_ascii_case("wkt"));
+    let mut all = vec![];
+    for (i, rec) in records.enumerate() {
+        if rec.len() == 1 && rec[0].is_empty() {
+            continue;
+        }
+        let mut attrs = Attrs::new();
+        for (j, f) in fields.iter().enumerate() {
+            let raw = rec.get(j).map(|s| s.as_str()).unwrap_or("");
+            let v = match f.kind {
+                _ if raw.is_empty() => Value::Null,
+                FieldKind::Int => raw
+                    .trim()
+                    .parse::<i64>()
+                    .map(|n| json!(n))
+                    .unwrap_or(Value::Null),
+                FieldKind::Real => raw
+                    .trim()
+                    .parse::<f64>()
+                    .map(|n| json!(n))
+                    .unwrap_or(Value::Null),
+                _ => json!(raw),
+            };
+            attrs.insert(f.name.clone(), v);
+        }
+        let geometry = wkt_col
+            .and_then(|c| rec.get(c))
+            .filter(|w| !w.trim().is_empty())
+            .and_then(|w| Geometry::<f64>::try_from_wkt_str(w).ok());
+        let r = geometry.as_ref().map(bbox).unwrap_or(Rect::empty());
+        all.push((
+            r,
+            Feature {
+                fid: i as i64 + 1,
+                geometry,
+                attrs,
+            },
+        ));
+    }
+    Ok(Provider {
+        extent: memory_extent(&all),
+        kind: Kind::Memory(all),
+        fields,
+        description: format!("CSV {}", path.display()),
+    })
+}
+
 // ------------------------------------------------------------------ GeoJSON
 
 fn coord(v: &Value) -> Option<Coord<f64>> {
@@ -802,6 +922,16 @@ fn open_geojson(path: &Path) -> Result<Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_csv_records() {
+        let recs = csv_records(
+            "WKT,name\n\"POINT (1 2)\",\"a, \"\"b\"\"\"\n\"POLYGON ((0 0,\n1 0,1 1,0 0))\",c\n",
+        );
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[1], vec!["POINT (1 2)", "a, \"b\""]);
+        assert_eq!(recs[2][0], "POLYGON ((0 0,\n1 0,1 1,0 0))");
+    }
 
     #[test]
     fn parses_ogr_uris() {

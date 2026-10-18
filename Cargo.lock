@@ -1530,6 +1530,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "wkt",
  "zip",
 ]
 
