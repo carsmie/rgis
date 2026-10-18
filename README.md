@@ -61,14 +61,21 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
 
 ## What is supported
 
-* Projects: `.qgs`, `.qgz`; QGIS 3.x property encodings (`<Option>` maps and legacy `<prop k v>`);
-  relative and absolute data source paths.
-* Data: OGR provider with FlatGeobuf (local or `/vsicurl/` HTTP range requests, spatial index
-  used), GeoPackage (R-tree used, `subset=` filters), Shapefile, GeoJSON.
+* Projects: `.qgs`, `.qgz`; QGIS 3 and QGIS 4 property encodings (`<Option>` maps, legacy
+  `<prop k v>`, `<properties name=…>`); relative and absolute data source paths; project and
+  layer variables; opaque layer-tree groups; several layers sharing one WMS name.
+  The XML is parsed once at load into typed structures; requests never touch XML (QGIS
+  Server, by contrast, keeps a parsed DOM per project in `QgsConfigCache`).
+* Vector data: OGR provider with FlatGeobuf (local or `/vsicurl/` HTTP range requests, spatial
+  index used), GeoPackage (R-tree used, `subset=` filters), Shapefile, GeoJSON, CSV (WKT).
+* Raster data (feature `raster`, on by default): GDAL provider — single-band gray and multiband
+  colour renderers with contrast enhancement, transparency, alpha bands, reprojection and
+  warped VRTs, ported from QGIS's raster pipeline.
 * Symbology: single symbol, categorized, graduated, rule-based (filters, ELSE, scale ranges,
-  nested rules), null; SimpleFill / SimpleLine / SimpleMarker layers (colours, alpha, widths in
-  mm/px/pt/map units/meters, dash styles, joins, caps, marker shapes); layer opacity;
-  scale-based layer visibility.
+  nested rules), null; SimpleFill (incl. Qt brush patterns), SimpleLine, SimpleMarker,
+  EllipseMarker, SvgMarker (QGIS SVG search paths, `param()` substitution), LinePatternFill;
+  data-defined properties (static, field, expression); render-time simplification and
+  clipping exactly as QGIS does; layer opacity; scale-based layer visibility.
 * Expressions: comparisons, `AND/OR/NOT`, `IN`, `IS [NOT] NULL`, `LIKE/ILIKE`, arithmetic, `||`,
   `lower/upper/length/coalesce/to_int/to_real/round/concat/…`.
 * WMS: GetCapabilities (1.3.0 & 1.1.1), GetMap (PNG; `LAYERS` with groups, `CRS`/`SRS`,
@@ -96,7 +103,13 @@ GetFeature with `BBOX`, `FEATUREID`, `EXP_FILTER`, `PROPERTYNAME`, `STARTINDEX` 
 identical ids, properties and geometries; GML 3 coordinates in lat/lon order matching to 1e-6;
 DescribeFeatureType; error codes and HTTP statuses.
 
-**Rendering — share of pixels differing by more than 64/255 in any channel:**
+**Rendering — `tools/parity.py`** renders every published layer of all 58 QGIS server test
+projects (plus `earth.qgs`) with both servers and diffs them: **129 layers, 119 within 0.5 %
+differing pixels**. The remaining layers above 2 % are label layers (not implemented yet) and
+one SVG marker whose file is missing on this machine (QGIS's "?" placeholder; with QGIS's SVG
+library available on both servers the layer is 0.00 %).
+
+Selected results (share of pixels differing by more than 64/255 in any channel):
 
 | Project / request | Renderer, data | Differing pixels |
 |---|---|---|
@@ -107,7 +120,12 @@ DescribeFeatureType; error codes and HTTP statuses.
 | QGIS test `test_project_mapthemes.qgs` | rule-based, GPKG + subset filters, non-square pixels | 0.39 % |
 | QGIS test `bug_gh32020.qgs` | categorized, GeoPackage | 0.21 % |
 | QGIS test `test_project_meters_at_scaledsymbols.qgs` | categorized, sizes in meters | 0.00 % |
-| QGIS test `test_project_wms_grouped_layers.qgs` (zoomed, EPSG:25832) | nested groups, categorized | 3.09 % — labels and an OSM raster not drawn |
+| QGIS test `test_project_opaque.qgz` `streetarea` | LinePatternFill (QGIS 4 project) | < 0.5 % |
+| QGIS test `wms_tile_buffer.qgs` with QGIS's SVG library | SvgMarker | 0.00 % |
+| QGIS test `test_project.qgs` `landsat` | raster, gray stretch, UTM → Web Mercator | 0.02 % |
+| QGIS test `test_project_wms_grouped_layers.qgs` `osm` | raster, GeoPackage RGBA tiles | 0.00 % |
+| QGIS test `test_raster_nodata.qgz` | rotated raster via warped VRT, custom CRS | 0.00 % |
+| QGIS test `bug_gh30817_atlas_pk.qgs` | CSV with WKT | 0.00 % |
 
 The remaining differences are isolated anti-aliasing pixels along edges (see the `*_diff.png`
 images in `evidence/`). `/vsicurl/`: a map rendered from FlatGeobuf over HTTP range requests is
@@ -117,18 +135,21 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 
 * WMS image size is capped at 10000 px when neither `WMSMaxWidth/Height` nor
   `QGIS_SERVER_WMS_MAX_*` is set (QGIS is unlimited and rendered a 99999 px image).
-* Web Mercator bounding boxes are clamped to ±85.0511° (QGIS reports −44 927 326 m for −89.9°).
 * Field names are sanitised into valid XML element names in GML (QGIS emits
   `<qgs:feature::id>`, which is not well-formed).
 
 ## Limitations
 
-* No labels (no text rendering), no raster layers (skipped with a warning), no diagrams,
-  no 3D, no print layouts (GetPrint), no DXF/PDF output, no WMTS/WCS, no WFS-T, no Python
-  server plugins or access control.
-* Only the `ogr` provider for the formats listed above (no PostGIS, WMS cascading, etc.).
-* Symbol layers other than Simple Fill/Line/Marker are approximated or skipped (logged),
-  data-defined properties are ignored, hatch patterns are drawn as translucent fills.
+* **No labels yet.** Exact parity needs a port of QGIS's PAL labelling engine (placement
+  candidates and collision optimisation, ~27k lines of C++ including the text renderer).
+* Stretched GetMap requests (BBOX aspect ≠ WIDTH/HEIGHT) are resized bilinearly, not with
+  Qt's area-averaging `SmoothTransformation`, so thin lines differ there.
+* Raster: paletted, pseudocolour and hillshade renderers, non-nearest resampling, and
+  raster GetFeatureInfo are not implemented yet.
+* Not implemented: diagrams, 3D, print layouts (GetPrint), DXF/PDF output, WMTS/WCS, WFS-T,
+  Python server plugins, access control; PostGIS and other non-file providers;
+  GeometryGenerator, MarkerLine, PointPatternFill and other less common symbol layers
+  (skipped with a warning); blend modes and paint effects.
 * PNG output only; GetLegendGraphic PNG has symbol patches without text (use
   `FORMAT=application/json` for titles).
 * The expression engine covers the common subset listed above, not all QGIS functions.
