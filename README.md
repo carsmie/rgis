@@ -143,8 +143,8 @@ Labelling speed (median GetMap, 1024 px wide): the test projects' label layers r
 under a millisecond for hundreds of labels; most of the remaining time is anti-aliased
 filling of glyph outlines and text buffers.
 
-The remaining differences are isolated anti-aliasing pixels along edges (see the `*_diff.png`
-images in `evidence/`). `/vsicurl/`: a map rendered from FlatGeobuf over HTTP range requests is
+The remaining differences are isolated anti-aliasing pixels along edges (`tools/parity.py`
+writes `*_diff.png` images for each layer). `/vsicurl/`: a map rendered from FlatGeobuf over HTTP range requests is
 byte-identical to the one rendered from local files (14 range requests for 4 MB of data).
 
 ### Deliberate differences

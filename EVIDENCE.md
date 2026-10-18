@@ -127,7 +127,8 @@ The actual drawing is the same `QgsMapRendererJob` → `QgsVectorLayerRenderer` 
 
 ## 6. Observed behaviours (black-box, against `earth.qgs`)
 
-Requests and responses are stored in `evidence/qgis-reference/`.
+The requests and responses were captured locally (not part of the repository); the file names
+below refer to those captures and can be regenerated with `tools/compare_with_qgis.py`.
 
 | Observation | Evidence |
 |---|---|
