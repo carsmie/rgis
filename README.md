@@ -56,6 +56,8 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
 | `QgsCoordinateReferenceSystem` / `QgsCoordinateTransform` (PROJ) | `crs.rs` (proj4rs, pure Rust; EPSG definitions from crs-definitions) |
 | `QgsFeatureRenderer` / `QgsSymbol` / `QgsExpression` | `symbology.rs`, `expression.rs` |
 | `QgsMapRendererJob` + `QPainter` on `QImage` | `render.rs` (tiny-skia, anti-aliased) |
+| `QgsPalLayerSettings`, `QgsLabelingEngine`, PAL (`src/core/pal`) | `labeling/` (settings, registration, placement, FALP + chain solver, the PAL R-tree) |
+| `QgsTextRenderer` + Qt font engine (CoreText / FreeType) | `text.rs` (skrifa outlines, harfrust shaping, Qt's metric rounding) |
 | `services/wms/*` | `services/wms.rs` |
 | `services/wfs/*` | `services/wfs.rs` |
 
@@ -76,6 +78,12 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
   EllipseMarker, SvgMarker (QGIS SVG search paths, `param()` substitution), LinePatternFill;
   data-defined properties (static, field, expression); render-time simplification and
   clipping exactly as QGIS does; layer opacity; scale-based layer visibility.
+* Labels: simple and rule-based labeling for point layers (and polygon centroids) with
+  over-point, around-point and ordered-position placement; fixed (data-defined) positions and
+  rotation; text buffers; obstacles; PAL's candidate costs, conflict graph and FALP + chain
+  search, ported from QGIS so the same labels win. Text is laid out with Qt's numbers: font
+  metrics in 26.6 fixed point, HarfBuzz kerning and `trak` tracking as Qt applies them, Qt 6
+  weight semantics. QGIS Server's bundled "QGIS Vera Sans" fonts are built in.
 * Expressions: comparisons, `AND/OR/NOT`, `IN`, `IS [NOT] NULL`, `LIKE/ILIKE`, arithmetic, `||`,
   `lower/upper/length/coalesce/to_int/to_real/round/concat/…`.
 * WMS: GetCapabilities (1.3.0 & 1.1.1), GetMap (PNG; `LAYERS` with groups, `CRS`/`SRS`,
@@ -104,10 +112,10 @@ identical ids, properties and geometries; GML 3 coordinates in lat/lon order mat
 DescribeFeatureType; error codes and HTTP statuses.
 
 **Rendering — `tools/parity.py`** renders every published layer of all 58 QGIS server test
-projects (plus `earth.qgs`) with both servers and diffs them: **129 layers, 119 within 0.5 %
-differing pixels**. The remaining layers above 2 % are label layers (not implemented yet) and
-one SVG marker whose file is missing on this machine (QGIS's "?" placeholder; with QGIS's SVG
-library available on both servers the layer is 0.00 %).
+projects with both servers and diffs them: **126 layers, 123 within 0.5 % differing pixels,
+all label layers 0.00 %**. The one layer above 2 % is an SVG marker whose file is missing on
+this machine (QGIS's "?" placeholder; with QGIS's SVG library available on both servers the
+layer is 0.00 %).
 
 Selected results (share of pixels differing by more than 64/255 in any channel):
 
@@ -126,6 +134,14 @@ Selected results (share of pixels differing by more than 64/255 in any channel):
 | QGIS test `test_project_wms_grouped_layers.qgs` `osm` | raster, GeoPackage RGBA tiles | 0.00 % |
 | QGIS test `test_raster_nodata.qgz` | rotated raster via warped VRT, custom CRS | 0.00 % |
 | QGIS test `bug_gh30817_atlas_pk.qgs` | CSV with WKT | 0.00 % |
+| QGIS test `test_project_wms_grouped_layers.qgs` `cdb_labels` | labels over point, text buffer | 0.00 % |
+| QGIS test `wms_tile_buffer.qgs` labels / rotated labels | data-defined positions, PAL solver | 0.00 % |
+
+Labelling speed (median GetMap, 1024 px wide): the test projects' label layers render
+1.4–1.6× faster than QGIS Server; with 3 036 labelled points in view, 1445 ms → 204 ms
+(7.1×) and, for rotated labels, 2465 ms → 921 ms (2.7×). The placement itself takes well
+under a millisecond for hundreds of labels; most of the remaining time is anti-aliased
+filling of glyph outlines and text buffers.
 
 The remaining differences are isolated anti-aliasing pixels along edges (see the `*_diff.png`
 images in `evidence/`). `/vsicurl/`: a map rendered from FlatGeobuf over HTTP range requests is
@@ -140,8 +156,13 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 
 ## Limitations
 
-* **No labels yet.** Exact parity needs a port of QGIS's PAL labelling engine (placement
-  candidates and collision optimisation, ~27k lines of C++ including the text renderer).
+* Labels: line and curved placements, free/horizontal polygon placement, outside-polygon
+  placement, callouts, backgrounds, shadows, HTML text, line wrapping and label masks are not
+  ported yet. Text metrics follow Qt's CoreText engine on macOS (verified glyph by glyph) and
+  its FreeType engine elsewhere (not yet verified against a Linux QGIS Server). When a
+  project's font is missing on macOS, Qt falls back to the variable system font, whose
+  CoreText advances rGIS reproduces to within 1/64 px but not always exactly; with thousands
+  of touching labels this can change which of two equally good labels wins.
 * Stretched GetMap requests (BBOX aspect ≠ WIDTH/HEIGHT) are resized bilinearly, not with
   Qt's area-averaging `SmoothTransformation`, so thin lines differ there.
 * Raster: paletted, pseudocolour and hillshade renderers, non-nearest resampling, and

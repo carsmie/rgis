@@ -138,7 +138,8 @@ pub struct TextFormat {
     pub capitalization: i64,
 }
 
-/// QgsPalLayerSettings.
+/// QgsPalLayerSettings (all settings are parsed; some serve placements not ported yet).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PalSettings {
     pub field_name: String,
@@ -203,6 +204,7 @@ pub struct PalSettings {
 }
 
 /// A layer's labeling (QgsVectorLayerSimpleLabeling / QgsRuleBasedLabeling, rules flattened).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LabelingRule {
     pub filter: Option<Expr>,

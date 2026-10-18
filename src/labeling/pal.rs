@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4, PI};
 
 use super::index::{BBox, GridIndex};
+use super::rtree::PalRtree;
 use super::settings::{EngineSettings, ObstacleType, OverlapHandling, Placement, PointPosition};
 use super::shape::{self, Pt, Shape};
 
@@ -38,6 +39,7 @@ pub enum Quadrant {
 }
 
 /// QgsLabelFeature: what a layer's label provider registers for one feature.
+#[allow(dead_code)] // some fields are for line/polygon placements not ported yet
 #[derive(Debug, Clone)]
 pub struct LabelFeature {
     pub fid: i64,
@@ -76,6 +78,7 @@ pub struct LabelFeature {
 }
 
 /// pal::Layer.
+#[allow(dead_code)]
 pub struct PalLayer {
     pub name: String,
     pub arrangement: Placement,
@@ -114,6 +117,7 @@ struct Part {
     is_hole: bool,
 }
 
+#[allow(dead_code)]
 impl Part {
     fn new(layer: usize, feature: usize, shape: Shape) -> Part {
         let (kind, coords): (Kind, Vec<Pt>) = match &shape {
@@ -176,6 +180,7 @@ impl Part {
 }
 
 /// pal::LabelPosition.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LabelPosition {
     layer: usize,
@@ -265,10 +270,6 @@ impl LabelPosition {
         [(self.x[0], self.y[0]), (self.x[1], self.y[1]), (self.x[2], self.y[2]), (self.x[3], self.y[3])]
     }
 
-    pub fn cost(&self) -> f64 {
-        self.cost
-    }
-
     /// LabelPosition::getDistanceToPoint (no outer bounds).
     fn distance_to_point(&self, p: Pt) -> f64 {
         let contains = if self.alpha == 0.0 {
@@ -319,6 +320,7 @@ impl LabelPosition {
 }
 
 /// QgsLabelingEngine output: the placed labels, sorted for drawing.
+#[allow(dead_code)]
 pub struct Placed {
     pub layer: usize,
     pub feature: usize,
@@ -337,6 +339,7 @@ pub struct Pal {
     map_units_per_cm: f64,
 }
 
+#[allow(dead_code)]
 impl PalLayer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -890,8 +893,8 @@ struct Problem {
     count: Vec<usize>,
     unlabeled_cost: Vec<f64>,
     total: usize,
-    all_index: GridIndex,
-    active_index: GridIndex,
+    all_index: PalRtree,
+    active_index: PalRtree,
     sol: Vec<i64>,
     conflict_cache: HashMap<(usize, usize), bool>,
 }
@@ -956,7 +959,7 @@ impl Problem {
                                 self.positions[lpid].num_overlaps -= 1;
                             }
                         }
-                        self.all_index.remove(lpid);
+                        self.all_index.remove(lpid, &self.positions[lpid].bbox);
                     }
                     self.count[f] = ci + 1;
                     break;
@@ -1002,7 +1005,7 @@ impl Problem {
                 self.ignore_label(layers, c, &mut list);
             }
             let b = self.positions[label].bbox;
-            self.active_index.insert(label, b);
+            self.active_index.insert(label, &b);
         }
         if display_all {
             for f in 0..nf {
@@ -1023,7 +1026,7 @@ impl Problem {
                 if let Some(b) = best {
                     self.sol[f] = b as i64;
                     let bb = self.positions[b].bbox;
-                    self.active_index.insert(b, bb);
+                    self.active_index.insert(b, &bb);
                 }
             }
         }
@@ -1137,11 +1140,11 @@ impl Problem {
             let old = tmpsol[seed];
             current.push((seed, old, retained_label));
             if old != -1 {
-                self.active_index.remove(old as usize);
+                self.active_index.remove(old as usize, &self.positions[old as usize].bbox);
             }
             if retained_label != -1 {
                 let b = self.positions[retained_label as usize].bbox;
-                self.active_index.insert(retained_label as usize, b);
+                self.active_index.insert(retained_label as usize, &b);
             }
             tmpsol[seed] = retained_label;
             delta += self.positions[retained_label as usize].cost;
@@ -1149,11 +1152,11 @@ impl Problem {
         }
         for (_, old, new) in current {
             if new != -1 {
-                self.active_index.remove(new as usize);
+                self.active_index.remove(new as usize, &self.positions[new as usize].bbox);
             }
             if old != -1 {
                 let b = self.positions[old as usize].bbox;
-                self.active_index.insert(old as usize, b);
+                self.active_index.insert(old as usize, &b);
             }
         }
         retained
@@ -1184,7 +1187,7 @@ impl Problem {
                         let (fid, lid) = (*fid, *lid);
                         if self.sol[fid] >= 0 {
                             let old = self.sol[fid] as usize;
-                            self.active_index.remove(old);
+                            self.active_index.remove(old, &self.positions[old].bbox);
                             let b = self.positions[old].bbox;
                             for o in self.all_index.query(&b) {
                                 if self.conflicting(layers, old, o) {
@@ -1195,7 +1198,7 @@ impl Problem {
                         self.sol[fid] = lid;
                         if lid >= 0 {
                             let b = self.positions[lid as usize].bbox;
-                            self.active_index.insert(lid as usize, b);
+                            self.active_index.insert(lid as usize, &b);
                         }
                         ok[fid] = false;
                     }
@@ -1291,6 +1294,9 @@ impl Pal {
         let partial = self.settings.partial_labels;
         let version2 = self.settings.version2;
         let gext = grid_extent(&extent);
+        // Pal::extractProblem: index bounds = extent buffered by 1000 × its larger side.
+        let buf = (extent.xmax - extent.xmin).max(extent.ymax - extent.ymin) * 1000.0;
+        let rtree_bounds = BBox { xmin: extent.xmin - buf, ymin: extent.ymin - buf, xmax: extent.xmax + buf, ymax: extent.ymax + buf };
         let mut first_round = GridIndex::new(gext, 64);
         let mut feats: Vec<Feats> = Vec::new();
         let mut first_round_positions: Vec<(usize, usize)> = Vec::new();
@@ -1433,8 +1439,8 @@ impl Pal {
             count: vec![0; nf],
             unlabeled_cost: vec![0.0; nf],
             total: 0,
-            all_index: GridIndex::new(gext, 64),
-            active_index: GridIndex::new(gext, 64),
+            all_index: PalRtree::new(rtree_bounds),
+            active_index: PalRtree::new(rtree_bounds),
             sol: Vec::new(),
             conflict_cache: HashMap::new(),
         };
@@ -1490,7 +1496,7 @@ impl Pal {
             for mut c in cands {
                 c.prob_feat = fi;
                 c.id = next;
-                prob.all_index.insert(next, c.bbox);
+                prob.all_index.insert(next, &c.bbox);
                 prob.positions.push(c);
                 next += 1;
             }

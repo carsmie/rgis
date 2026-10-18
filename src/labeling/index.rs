@@ -76,21 +76,6 @@ impl GridIndex {
         }
     }
 
-    pub fn remove(&mut self, id: usize) {
-        let Some(b) = self.boxes.get_mut(id).and_then(|b| b.take()) else {
-            return;
-        };
-        let (x0, y0, x1, y1) = self.range(&b);
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let c = &mut self.cells[y * self.n + x];
-                if let Some(i) = c.iter().position(|v| *v as usize == id) {
-                    c.swap_remove(i);
-                }
-            }
-        }
-    }
-
     /// Ids whose boxes intersect `b`, ascending.
     pub fn query(&mut self, b: &BBox) -> Vec<usize> {
         self.epoch = self.epoch.wrapping_add(1);

@@ -269,11 +269,14 @@ pub struct SizedFont {
     location: Location,
     pub ascent: f64,
     pub descent: f64,
+    #[allow(dead_code)]
     pub leading: f64,
     pub cap_height: f64,
     /// CoreText `trak` at the pixel size, in 1/64 px.
     ct_trak64: f64,
     glyphs: Mutex<HashMap<u32, Arc<Vec<Seg>>>>,
+    /// Stroked glyph outlines (buffers), keyed by glyph, pen width bits and join.
+    strokes: Mutex<HashMap<(u32, u32, u8), Option<Arc<tiny_skia::Path>>>>,
     runs: Mutex<HashMap<String, Arc<Run>>>,
 }
 
@@ -317,6 +320,7 @@ impl SizedFont {
             ct_trak64: 0.0,
             location,
             glyphs: Default::default(),
+            strokes: Default::default(),
             runs: Default::default(),
             face: face.clone(),
         };
@@ -336,42 +340,63 @@ impl SizedFont {
         self.px as f64 * 64.0 / self.face.upem
     }
 
-    /// The default instance's advance in 1/64 px, rounded like HarfBuzz's em scaling.
-    fn default_adv64(&self, gid: u32) -> f64 {
-        let font = self.face.font();
-        let adv = font
-            .glyph_metrics(Size::unscaled(), skrifa::instance::LocationRef::default())
-            .advance_width(GlyphId::new(gid))
-            .unwrap_or(0.0) as f64;
-        (adv * self.scale64()).round()
-    }
-
     /// Shape on the default instance (as Qt's HarfBuzz font does): glyph ids and 26.6 advances.
-    fn hb_shape(&self, text: &str, ptem: f64) -> Vec<(u32, f64)> {
+    /// Shape on the default instance at 26.6 scale. With `engine`, glyph advances come from
+    /// the font engine (Qt's HarfBuzz font functions), else from the font's tables.
+    /// Returns (glyph, x advance, x offset).
+    fn hb_shape(&self, text: &str, ptem: f64, engine: bool) -> Vec<(u32, f64, f64)> {
+        struct EngineAdvances<'a>(&'a SizedFont);
+        impl harfrust::font::FontFuncs for EngineAdvances<'_> {
+            fn advance_width(&mut self, _: &harfrust::font::BuiltinFontFuncs, glyph: GlyphId) -> i32 {
+                self.0.engine_adv64(glyph.to_u32()) as i32
+            }
+        }
         let font = self.face.font();
         let shaper = self.face.shaper.shaper(&font).build();
         let mut buf = UnicodeBuffer::new();
         buf.push_str(text);
         buf.guess_segment_properties();
-        let scale = (self.px * 64 * self.face.upem as i32) / self.face.upem as i32;
-        let out = shaper.shape(buf, ShapeOptions::new().point_size(Some(ptem as f32)).scale(Some(scale)));
+        let mut funcs = EngineAdvances(self);
+        let mut opts = ShapeOptions::new().point_size(Some(ptem as f32)).scale(Some(self.px * 64));
+        if engine {
+            opts = opts.font_funcs(Some(&mut funcs));
+        }
+        let out = shaper.shape(buf, opts);
         out.glyph_infos()
             .iter()
             .zip(out.glyph_positions())
-            .map(|(i, p)| (i.glyph_id, p.x_advance as f64))
+            .map(|(i, p)| (i.glyph_id, p.x_advance as f64, p.x_offset as f64))
             .collect()
     }
 
     /// Advance of a glyph as Qt's font engine reports it, in 1/64 px.
     fn engine_adv64(&self, gid: u32) -> f64 {
         let font = self.face.font();
-        let adv = font
-            .glyph_metrics(Size::new(self.px as f32), &self.location)
-            .advance_width(GlyphId::new(gid))
-            .unwrap_or(0.0) as f64;
         match *ENGINE {
-            Engine::CoreText => (adv * 64.0 + self.ct_trak64).trunc(),
-            Engine::FreeType => (adv * 64.0).round(),
+            Engine::CoreText => {
+                // CoreText applies HVAR deltas unrounded (skrifa truncates them like FreeType).
+                use skrifa::raw::TableProvider;
+                let glyph = GlyphId::new(gid);
+                let base = font
+                    .glyph_metrics(Size::unscaled(), skrifa::instance::LocationRef::default())
+                    .advance_width(glyph)
+                    .unwrap_or(0.0) as f64;
+                let units = match font.hvar().ok().and_then(|h| h.advance_width_delta(glyph, self.location.coords()).ok()) {
+                    Some(delta) => base + delta.to_f64(),
+                    None => font
+                        .glyph_metrics(Size::unscaled(), &self.location)
+                        .advance_width(glyph)
+                        .unwrap_or(0.0) as f64,
+                };
+                (units * self.scale64() + self.ct_trak64).trunc()
+            }
+            Engine::FreeType => {
+                let adv = font
+                    .glyph_metrics(Size::new(self.px as f32), &self.location)
+                    .advance_width(GlyphId::new(gid))
+                    .unwrap_or(0.0) as f64;
+                (adv * 64.0).round()
+            }
         }
     }
 
@@ -380,13 +405,14 @@ impl SizedFont {
         if let Some(r) = self.runs.lock().get(text) {
             return r.clone();
         }
-        let shaped = self.hb_shape(text, self.px as f64 * 72.0 / 96.0);
+        // Qt shapes with HarfBuzz using the font engine's advances; HarfBuzz adds kerning and
+        // `trak` tracking (at ptem = pixel size · 72/96).
+        let shaped = self.hb_shape(text, self.px as f64 * 72.0 / 96.0, true);
         let mut x64 = 0.0;
         let mut glyphs = Vec::with_capacity(shaped.len());
-        for (gid, hb_adv64) in shaped {
-            glyphs.push((gid, x64 / 64.0, 0.0));
-            // HarfBuzz's adjustments (kerning, tracking) on top of the engine's advance.
-            x64 += self.engine_adv64(gid) + hb_adv64 - self.default_adv64(gid);
+        for (gid, adv64, off64) in shaped {
+            glyphs.push((gid, (x64 + off64) / 64.0, 0.0));
+            x64 += adv64;
         }
         let run = Arc::new(Run { glyphs, width: x64 / 64.0 });
         let mut runs = self.runs.lock();
@@ -398,6 +424,7 @@ impl SizedFont {
     }
 
     /// QFontMetricsF::horizontalAdvance.
+    #[allow(dead_code)] // used by tests and upcoming curved-label metrics
     pub fn horizontal_advance(&self, text: &str) -> f64 {
         self.shape(text).width
     }
@@ -414,6 +441,57 @@ impl SizedFont {
         let g = Arc::new(pen.segs);
         self.glyphs.lock().insert(gid, g.clone());
         g
+    }
+
+    /// A glyph's outline stroked with `stroke` (cached). The stroke of a whole text path is
+    /// the nonzero union of its contours' strokes, so per-glyph strokes filled together draw
+    /// exactly what stroking the label path would, without re-stroking every label.
+    fn stroked(&self, gid: u32, stroke: &tiny_skia::Stroke) -> Option<Arc<tiny_skia::Path>> {
+        let key = (gid, stroke.width.to_bits(), stroke.line_join as u8);
+        if let Some(p) = self.strokes.lock().get(&key) {
+            return p.clone();
+        }
+        let mut pb = PathBuilder::new();
+        let run = Run { glyphs: vec![(gid, 0.0, 0.0)], width: 0.0 };
+        self.append_run(&mut pb, &run, Transform::identity());
+        let p = pb.finish().and_then(|p| p.stroke(stroke, 1.0)).map(Arc::new);
+        self.strokes.lock().insert(key, p.clone());
+        p
+    }
+
+    /// Append a run's stroked glyph outlines (the buffer) mapped through `ts`.
+    pub fn append_run_stroked(&self, pb: &mut PathBuilder, run: &Run, ts: Transform, stroke: &tiny_skia::Stroke) {
+        use tiny_skia::PathSegment;
+        for &(gid, gx, gy) in &run.glyphs {
+            let Some(path) = self.stroked(gid, stroke) else { continue };
+            let t = ts.pre_translate(gx as f32, gy as f32);
+            let map = |p: tiny_skia::Point| {
+                let mut q = [p];
+                t.map_points(&mut q);
+                q[0]
+            };
+            for seg in path.segments() {
+                match seg {
+                    PathSegment::MoveTo(p) => {
+                        let p = map(p);
+                        pb.move_to(p.x, p.y)
+                    }
+                    PathSegment::LineTo(p) => {
+                        let p = map(p);
+                        pb.line_to(p.x, p.y)
+                    }
+                    PathSegment::QuadTo(a, p) => {
+                        let (a, p) = (map(a), map(p));
+                        pb.quad_to(a.x, a.y, p.x, p.y)
+                    }
+                    PathSegment::CubicTo(a, b, p) => {
+                        let (a, b, p) = (map(a), map(b), map(p));
+                        pb.cubic_to(a.x, a.y, b.x, b.y, p.x, p.y)
+                    }
+                    PathSegment::Close => pb.close(),
+                }
+            }
+        }
     }
 
     /// Append a run's glyph outlines (QPainterPath::addText) mapped through `ts`.
@@ -491,6 +569,21 @@ impl LabelDocument {
     /// The text outline for a label whose bottom-left corner is at `origin` (pixels), rotated
     /// by `rotation` radians counter-clockwise (pal::LabelPosition::getAlpha).
     pub fn path(&self, origin: (f64, f64), rotation: f64, align: HAlign) -> Option<tiny_skia::Path> {
+        self.build(origin, rotation, align, |f, pb, run, ts| f.append_run(pb, run, ts))
+    }
+
+    /// The buffer outline: the text path stroked with `stroke` (as a fillable path).
+    pub fn buffer_path(&self, origin: (f64, f64), rotation: f64, align: HAlign, stroke: &tiny_skia::Stroke) -> Option<tiny_skia::Path> {
+        self.build(origin, rotation, align, |f, pb, run, ts| f.append_run_stroked(pb, run, ts, stroke))
+    }
+
+    fn build(
+        &self,
+        origin: (f64, f64),
+        rotation: f64,
+        align: HAlign,
+        mut add: impl FnMut(&SizedFont, &mut PathBuilder, &Run, Transform),
+    ) -> Option<tiny_skia::Path> {
         let mut pb = PathBuilder::new();
         let base = Transform::from_translate(origin.0 as f32, origin.1 as f32)
             .pre_rotate((-rotation.to_degrees()) as f32);
@@ -501,7 +594,7 @@ impl LabelDocument {
                 HAlign::Right => self.width - run.width,
             };
             let ts = base.pre_translate(x as f32, *baseline as f32);
-            self.font.append_run(&mut pb, run, ts);
+            add(&self.font, &mut pb, run, ts);
         }
         pb.finish()
     }
@@ -527,18 +620,21 @@ fn color_paint(c: Rgba, alpha: f64) -> Paint<'static> {
 /// Buffer pass: the text path filled with the buffer colour (unless "no fill") and stroked
 /// with a pen of the buffer width. Colour alpha is replaced by the buffer opacity
 /// (QColor::setAlphaF), as QGIS does.
-pub fn draw_buffer(pm: &mut Pixmap, path: &tiny_skia::Path, b: &Buffer) {
+pub fn draw_buffer(pm: &mut Pixmap, doc: &LabelDocument, path: &tiny_skia::Path, origin: (f64, f64), rotation: f64, align: HAlign, b: &Buffer) {
     let paint = color_paint(b.color, b.opacity);
     if b.fill_interior {
         pm.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
     }
-    let stroke = tiny_skia::Stroke {
-        width: b.width_px as f32,
-        line_join: b.join,
-        miter_limit: 2.0,
-        ..Default::default()
-    };
-    pm.stroke_path(path, &paint, &stroke, Transform::identity(), None);
+    if let Some(outline) = doc.buffer_path(origin, rotation, align, &b.stroke()) {
+        pm.fill_path(&outline, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+impl Buffer {
+    /// The pen QgsTextRenderer::renderDeferredBuffer sets up (QPen default miter limit 2).
+    pub fn stroke(&self) -> tiny_skia::Stroke {
+        tiny_skia::Stroke { width: self.width_px as f32, line_join: self.join, miter_limit: 2.0, ..Default::default() }
+    }
 }
 
 /// Text pass: the outline filled (Qt::WindingFill) with the text colour at the format opacity.
@@ -566,6 +662,19 @@ mod tests {
         }
         assert!((run.width - 75.078125).abs() < 0.02, "{}", run.width);
         assert!((f.horizontal_advance("Hehlingen") - 89.921875).abs() < 0.02);
+    }
+
+    /// Print advances for comparison with Qt: RGIS_WIDTHS=family,weight,px,file.
+    #[test]
+    #[ignore]
+    fn print_widths() {
+        let spec = std::env::var("RGIS_WIDTHS").unwrap();
+        let p: Vec<&str> = spec.split(',').collect();
+        let req = FontRequest { family: p[0].into(), weight: p[1].parse().unwrap(), italic: false, style: String::new() };
+        let f = font(&req, p[2].parse().unwrap()).unwrap();
+        for t in std::fs::read_to_string(p[3]).unwrap().lines() {
+            println!("{t}\t{:.6}", f.horizontal_advance(t));
+        }
     }
 
     #[test]

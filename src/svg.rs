@@ -29,6 +29,11 @@ static OPTIONS: LazyLock<usvg::Options<'static>> = LazyLock::new(|| {
     opt.font_family = std::env::var("RGIS_SVG_FONT").unwrap_or_else(|_| default.into());
     let started = std::time::Instant::now();
     opt.fontdb_mut().load_system_fonts();
+    // QgsServer::initServer loads QGIS's standard test fonts ("QGIS Vera Sans" Roman and Bold).
+    opt.fontdb_mut()
+        .load_font_data(include_bytes!("../fonts/QGIS-Vera.ttf").to_vec());
+    opt.fontdb_mut()
+        .load_font_data(include_bytes!("../fonts/QGIS-VeraBd.ttf").to_vec());
     debug!(
         "loaded {} fonts for SVG text in {:?}",
         opt.fontdb.len(),

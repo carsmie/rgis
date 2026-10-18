@@ -9,6 +9,7 @@ pub mod settings;
 
 mod index;
 mod pal;
+mod rtree;
 mod shape;
 
 use std::f64::consts::PI;
@@ -149,6 +150,16 @@ impl Engine {
             let mut ctx = f.attrs.clone();
             ctx.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
             ctx.insert("$id".into(), json!(f.fid));
+            // $x / $y: the point (first point of a multipoint), else the centroid.
+            let xy = match f.geometry {
+                Geometry::Point(p) => Some((p.x(), p.y())),
+                Geometry::MultiPoint(mp) => mp.0.first().map(|p| (p.x(), p.y())),
+                g => shapes(g).first().map(shape::centroid),
+            };
+            if let Some((x, y)) = xy {
+                ctx.insert("$x".into(), json!(x));
+                ctx.insert("$y".into(), json!(y));
+            }
             if let Some(lf) = self.label_feature(s, layer, f, &ctx, visible, render_order) {
                 pl.register(li, lf);
             }
@@ -422,7 +433,10 @@ impl Engine {
     /// Solve and draw (QgsLabelingEngine::solve + drawLabels).
     pub fn draw(mut self, pm: &mut Pixmap) {
         let e = &self.extent;
+        let t0 = std::time::Instant::now();
         let placed = self.pal.solve(BBox { xmin: e.xmin, ymin: e.ymin, xmax: e.xmax, ymax: e.ymax });
+        let solve_time = t0.elapsed();
+        let (mut t_path, mut t_buffer, mut t_text) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
         let mut placed: Vec<_> = placed.into_iter().collect();
         // QgsLabelSorter: z-index, then layer order (lower layers first), then larger labels first.
         placed.sort_by(|a, b| {
@@ -474,12 +488,19 @@ impl Engine {
                 }
                 continue;
             }
+            let t = std::time::Instant::now();
             let Some(path) = pay.doc.path(origin, p.alpha, align) else { continue };
+            t_path += t.elapsed();
+            let t = std::time::Instant::now();
             if let Some(b) = &pay.buffer {
-                text::draw_buffer(pm, &path, b);
+                text::draw_buffer(pm, &pay.doc, &path, origin, p.alpha, align, b);
             }
+            t_buffer += t.elapsed();
+            let t = std::time::Instant::now();
             text::draw_text(pm, &path, pay.color, pay.opacity);
+            t_text += t.elapsed();
         }
+        tracing::debug!(?solve_time, ?t_path, ?t_buffer, ?t_text, "labeling stages");
     }
 }
 
