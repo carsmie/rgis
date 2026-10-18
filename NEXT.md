@@ -35,29 +35,46 @@ Written 2026-10-18 when moving development from macOS to Windows. Read README.md
    GitHub may still serve the pre-rewrite commit f429e75 by SHA (ask GitHub support or
    recreate the repo if that matters).
 
-## Windows specifics (new machine)
+## New machine: Windows with WSL + Docker
 
-* **Build:** the `raster` feature needs GDAL headers/libs + libclang for `gdal-sys`
-  (`bindgen`). Quick start without it: `cargo build --release --no-default-features`.
-  With OSGeo4W: set `GDAL_HOME`/`GDAL_VERSION` and `LIBCLANG_PATH` (LLVM install).
-* **Reference server:** QGIS Server from OSGeo4W (`qgis_mapserver.exe`, or `qgis_mapserv.fcgi`
-  behind a web server). Start it on :8099 with the project via `QGIS_PROJECT_FILE`
-  or `-p`; rGIS on :8098 (`target\release\rgis -p demo/earth_local.qgs 127.0.0.1:8098`).
-  The tools use `MAP=` per request, so one running instance serves all test projects.
-  QGIS test data: clone QGIS and use `tests/testdata/qgis_server/`.
-* **Fonts — important:** text metrics are modelled per Qt font engine (`src/text.rs`,
-  `Engine`). macOS = CoreText (verified glyph by glyph). Everything else currently uses the
-  "FreeType" model, but **Qt on Windows uses DirectWrite**, which is NOT modelled yet:
-  expect label differences until a `DirectWrite` engine variant exists. Do it the same way
-  as for CoreText: dump Qt's numbers with PyQt6 on the same machine
-  (`QFontMetricsF.ascent/descent/horizontalAdvance`, `QRawFont.advancesForGlyphIndexes`,
-  `QTextLayout.glyphRuns` positions, `QPainterPath.addText`) and fit
-  `SizedFont::{new, engine_adv64}` + `shape()` until `matches_qt_*` style tests pass.
-  Override for experiments: `RGIS_TEXT_ENGINE=coretext|freetype`.
-  Fallback font when a project font is missing: Qt's default on Windows (likely
-  "Segoe UI"); set `RGIS_LABEL_FONT` / adjust `resolve_face` accordingly.
+Work inside WSL (Ubuntu); keep the repo and the QGIS checkout in the WSL filesystem
+(`~/…`, not `/mnt/c/…` — much faster builds and file access).
+
+* **Build in WSL:**
+  `sudo apt install build-essential pkg-config libclang-dev libgdal-dev gdal-bin libfontconfig1-dev`
+  then `cargo build --release` (the `raster` feature uses the distro GDAL through
+  `gdal-sys` + bindgen). Without GDAL: `cargo build --release --no-default-features`.
+  `cargo test` — the `#[cfg(target_os = "macos")]` text tests are skipped on Linux.
+* **Reference QGIS Server in Docker:** use a QGIS Server image (e.g. the official
+  `qgis/qgis-server` images, or `camptocamp/qgis-server`; check the current tags and how
+  each passes the project — `QGIS_PROJECT_FILE` env or `MAP=` parameter). Mount the QGIS test
+  data (`QGIS/tests/testdata/qgis_server`) and `demo/` read-only at the **same paths** inside
+  the container as in WSL, so the `MAP=` paths `tools/parity.py` sends work for both servers.
+  Publish it on `localhost:8099`; run rGIS on `:8098`
+  (`./target/release/rgis -p demo/earth_local.qgs 127.0.0.1:8098`). Point the tools at other
+  ports with `QGIS_URL=…` / `RGIS_URL=…`. Note the QGIS version of the image (labels were
+  verified against 4.3.0-master); differences between QGIS versions are real.
+  Run `tools/compare_with_qgis.py` and `tools/parity.py` first to get a baseline on Linux.
+* **Fonts — the main thing to sort out:** text metrics are modelled per Qt font engine
+  (`src/text.rs`, `Engine`): macOS = CoreText (verified glyph by glyph); Linux = the
+  "FreeType" model, which is written but **not yet verified** against Qt. QGIS Server in
+  the container uses Qt's FreeType engine with that container's fonts and fontconfig.
+  1. rGIS must see the same font files: run rGIS in a container built from the same base
+     image / font packages, or install the same packages in WSL (compare `fc-match "Sans
+     Serif"`, `fc-match "Liberation Sans:bold"` in both). Missing families fall back to
+     fontconfig's sans-serif in Qt; rGIS falls back to `RGIS_LABEL_FONT` (default
+     "DejaVu Sans") — make both agree.
+  2. Fit the FreeType model like the CoreText one: install PyQt6 in the QGIS container (or a
+     container with the same Qt + fonts) and dump `QFontMetricsF` ascent/descent/
+     horizontalAdvance, `QRawFont.advancesForGlyphIndexes`, `QTextLayout` glyph positions and
+     `QPainterPath.addText` for the label fonts at the label pixel sizes. Things to check:
+     hinting (Qt's default hinting on the offscreen platform rounds metrics/advances to
+     whole pixels?), ascent/descent rounding, kerning, variable fonts. Adjust
+     `SizedFont::{new, engine_adv64}` / `shape()` until `matches_qt_*`-style tests pass.
+     `RGIS_TEXT_ENGINE=coretext|freetype` overrides the model.
   QGIS Server loads "QGIS Vera Sans" Roman/Bold itself — bundled in `fonts/`.
-* Tests marked `#[cfg(target_os = "macos")]` in `src/text.rs` only run on macOS.
+* Then re-run label parity (`cdb_labels`, `wms_tile_buffer_labels[_rotated]`) on Linux and
+  only then continue with line/polygon labels.
 
 ## Tools and tricks that worked
 
