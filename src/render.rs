@@ -159,6 +159,31 @@ fn features_for_drawing(
     Ok(prepared)
 }
 
+#[cfg(feature = "raster")]
+fn render_raster(pm: &mut Pixmap, l: &MapLayer, ms: &MapSettings) -> Result<()> {
+    if l.provider_key != "gdal" {
+        warn!(
+            "raster provider '{}' of layer {} is not supported",
+            l.provider_key, l.name
+        );
+        return Ok(());
+    }
+    let Some(renderer) = &l.raster_renderer else {
+        return Ok(());
+    };
+    let src = crate::raster::RasterSource::open(&l.datasource, &l.base_dir)?;
+    crate::raster::render(pm, &src, renderer, &l.crs(), ms)
+}
+
+#[cfg(not(feature = "raster"))]
+fn render_raster(_pm: &mut Pixmap, l: &MapLayer, _ms: &MapSettings) -> Result<()> {
+    warn!(
+        "layer {} is a raster layer; rGIS was built without the `raster` feature",
+        l.name
+    );
+    Ok(())
+}
+
 fn ignore_rendering_errors() -> bool {
     std::env::var("QGIS_SERVER_IGNORE_RENDERING_ERRORS")
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true"))
@@ -178,11 +203,18 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             debug!("layer {} not visible at 1:{scale:.0}", l.name);
             continue;
         }
+        if l.kind == "raster" {
+            if let Err(e) = render_raster(&mut pm, l, ms) {
+                if ignore_rendering_errors() {
+                    warn!("Rendering error: {e:#} (ignored)");
+                } else {
+                    return Err(e);
+                }
+            }
+            continue;
+        }
         if l.kind != "vector" {
-            warn!(
-                "layer {} is a {} layer; only vector layers are rendered",
-                l.name, l.kind
-            );
+            warn!("layer {} is a {} layer; not rendered", l.name, l.kind);
             continue;
         }
         let started = std::time::Instant::now();

@@ -733,7 +733,7 @@ fn csv_records(text: &str) -> Vec<Vec<String>> {
             pending.push('\n');
         }
         pending.push_str(line.trim_end_matches('\r'));
-        if pending.matches('"').count() % 2 == 0 {
+        if pending.matches('"').count().is_multiple_of(2) {
             records.push(csv_fields(&std::mem::take(&mut pending)));
         }
     }

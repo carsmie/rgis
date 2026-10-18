@@ -7,6 +7,7 @@ mod geom;
 mod params;
 mod project;
 mod provider;
+mod raster;
 mod render;
 mod server;
 mod services;
