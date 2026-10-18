@@ -32,6 +32,11 @@ pub struct MapSettings {
     pub background: Option<Rgba>,
     /// Project-scope expression variables (name without `@`, value).
     pub project_variables: Vec<(String, String)>,
+    /// QgsMapSettings::extentBuffer (map units): layers and labels are processed this far
+    /// beyond the visible extent (WMS `TILED=true` with the project's WMSTileBuffer).
+    pub extent_buffer: f64,
+    /// The project's labeling engine settings.
+    pub labeling: crate::labeling::settings::EngineSettings,
 }
 
 impl MapSettings {
@@ -94,16 +99,24 @@ pub fn layer_features(
 
 /// Features prepared for drawing, as QgsVectorLayerRenderer does: simplified in the layer
 /// CRS with the layer's pixel tolerance, reprojected, then clipped to the (buffered) view.
+///
+/// With `keep_full`, the reprojected but unclipped geometry is kept too (for labeling).
+type Prepared = (Feature, Option<Coord<f64>>, Option<Geometry<f64>>);
+
 fn features_for_drawing(
     layer: &MapLayer,
     ms: &MapSettings,
     filter: Option<&Expr>,
-) -> Result<Vec<(Feature, Option<Coord<f64>>)>> {
+    keep_full: bool,
+) -> Result<Vec<Prepared>> {
     let provider = layer.provider()?;
     let layer_crs = layer.crs();
     let to_layer = Transform::new(&ms.crs, &layer_crs);
     let to_map = Transform::new(&layer_crs, &ms.crs);
-    let mut out = provider.features(to_layer.rect(&ms.extent).ok())?;
+    // QgsMapRendererJob renders the extent grown by the extent buffer.
+    let b = ms.extent_buffer;
+    let render_extent = Rect::new(ms.extent.xmin - b, ms.extent.ymin - b, ms.extent.xmax + b, ms.extent.ymax + b);
+    let mut out = provider.features(to_layer.rect(&render_extent).ok())?;
     out.retain(|f| filter.is_none_or(|e| e.matches(&f.attrs)));
 
     // The pixel tolerance in layer units, as QgsVectorLayerRenderer computes it: scale by the
@@ -130,7 +143,7 @@ fn features_for_drawing(
         Some(tol)
     });
     // Clip with a margin so the artificial edges along the clip boundary stay invisible.
-    let m = 64.0 * ms.mupp();
+    let m = 64.0 * ms.mupp() + b;
     let clip = Rect::new(e.xmin - m, e.ymin - m, e.xmax + m, e.ymax + m);
     let mut prepared = Vec::with_capacity(out.len());
     for mut f in out {
@@ -151,9 +164,14 @@ fn features_for_drawing(
         } else {
             geom::transform(&g, &to_map)
         };
+        let full = keep_full.then(|| g.clone());
         if let Some(g) = geom::clip_to_rect(&g, &clip) {
             f.geometry = Some(g);
-            prepared.push((f, origin));
+            prepared.push((f, origin, full));
+        } else if let Some(full) = full {
+            // Not drawn, but its label may still reach into the view.
+            f.geometry = None;
+            prepared.push((f, origin, Some(full)));
         }
     }
     Ok(prepared)
@@ -197,7 +215,11 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
         pm.fill(tiny_skia::Color::from_rgba8(bg.0, bg.1, bg.2, bg.3));
     }
     let scale = ms.scale();
-    for job in jobs {
+    let mut labels = jobs
+        .iter()
+        .any(|j| !j.layer.labeling.is_empty())
+        .then(|| crate::labeling::Engine::new(ms, ms.labeling.clone()));
+    for (order, job) in jobs.iter().enumerate() {
         let l = &job.layer;
         if !l.visible_at(scale) {
             debug!("layer {} not visible at 1:{scale:.0}", l.name);
@@ -218,7 +240,8 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             continue;
         }
         let started = std::time::Instant::now();
-        let features = match features_for_drawing(l, ms, job.filter.as_ref()) {
+        let labeled = labels.is_some() && !l.labeling.is_empty();
+        let features = match features_for_drawing(l, ms, job.filter.as_ref(), labeled) {
             Ok(f) => f,
             // QgsServerSettings::ignoreRenderingErrors
             Err(e) if ignore_rendering_errors() => {
@@ -251,26 +274,34 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             features.len(),
             started.elapsed()
         );
+        if let (true, Some(engine)) = (labeled, labels.as_mut()) {
+            // Labels are registered for rendered features (QgsVectorLayerRenderer::drawRenderer).
+            let sources: Vec<crate::labeling::LabelSource> = features
+                .iter()
+                .filter_map(|(f, _, full)| {
+                    let symbols = l.renderer.symbols_for(&f.attrs, scale);
+                    let rendered = !symbols.is_empty() || matches!(l.renderer, crate::symbology::Renderer::Null);
+                    Some(crate::labeling::LabelSource {
+                        fid: f.fid,
+                        attrs: &f.attrs,
+                        geometry: full.as_ref().filter(|_| rendered)?,
+                        symbols,
+                    })
+                })
+                .collect();
+            engine.register_layer(l, &sources, &layer_vars(l, ms, scale), order);
+        }
+    }
+    if let Some(engine) = labels.filter(|e| e.has_layers()) {
+        let started = std::time::Instant::now();
+        engine.draw(&mut pm);
+        debug!("labeling took {:?}", started.elapsed());
     }
     Ok(pm)
 }
 
-fn draw_features(
-    pm: &mut Pixmap,
-    l: &MapLayer,
-    features: &[(Feature, Option<Coord<f64>>)],
-    ms: &MapSettings,
-    scale: f64,
-) {
-    let units = ms.units();
-    let sx = 1.0 / ms.mupp();
-    let sy = ms.height as f64 / ms.extent.height();
-    let to_px = |c: &Coord<f64>| -> (f32, f32) {
-        let x = ((c.x - ms.extent.xmin) * sx).clamp(-1e6, 1e6);
-        let y = ((ms.extent.ymax - c.y) * sy).clamp(-1e6, 1e6);
-        (x as f32, y as f32)
-    };
-    // Expression context scopes as QGIS stacks them: project < map settings < layer.
+/// Expression context scopes as QGIS stacks them: project < map settings < layer.
+fn layer_vars(l: &MapLayer, ms: &MapSettings, scale: f64) -> Attrs {
     let mut vars = Attrs::new();
     for (k, v) in &ms.project_variables {
         vars.insert(format!("@{k}"), json!(v));
@@ -292,8 +323,27 @@ fn draw_features(
     for (k, v) in &l.variables {
         vars.insert(format!("@{k}"), json!(v));
     }
+    vars
+}
+
+fn draw_features(
+    pm: &mut Pixmap,
+    l: &MapLayer,
+    features: &[Prepared],
+    ms: &MapSettings,
+    scale: f64,
+) {
+    let units = ms.units();
+    let sx = 1.0 / ms.mupp();
+    let sy = ms.height as f64 / ms.extent.height();
+    let to_px = |c: &Coord<f64>| -> (f32, f32) {
+        let x = ((c.x - ms.extent.xmin) * sx).clamp(-1e6, 1e6);
+        let y = ((ms.extent.ymax - c.y) * sy).clamp(-1e6, 1e6);
+        (x as f32, y as f32)
+    };
+    let vars = layer_vars(l, ms, scale);
     let empty = Attrs::new();
-    for (f, origin) in features {
+    for (f, origin, _) in features {
         let Some(g) = &f.geometry else { continue };
         let origin = origin.as_ref().map(to_px);
         let symbols = l.renderer.symbols_for(&f.attrs, scale);

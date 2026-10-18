@@ -56,7 +56,7 @@ pub struct Size {
 }
 
 impl Size {
-    fn new(value: Option<&str>, unit: Option<&str>, default: f64) -> Size {
+    pub fn new(value: Option<&str>, unit: Option<&str>, default: f64) -> Size {
         let unit = match unit.unwrap_or("MM") {
             "Pixel" => Unit::Pixel,
             "Point" => Unit::Point,
@@ -331,8 +331,16 @@ impl Layer {
 /// `<data_defined_properties>`: active properties of type 1 (static value), 2 (field)
 /// or 3 (expression), as expressions.
 fn data_defined(layer: Node) -> HashMap<String, Expr> {
+    child(layer, "data_defined_properties")
+        .map(data_defined_in)
+        .unwrap_or_default()
+}
+
+/// Active data-defined properties of a QgsPropertyCollection element (`<data_defined_properties>`,
+/// labeling's `<dd_properties>`), as expressions keyed by property name.
+pub fn data_defined_in(container: Node) -> HashMap<String, Expr> {
     let mut out = HashMap::new();
-    let Some(props) = child(layer, "data_defined_properties").and_then(|d| {
+    let Some(props) = Some(container).and_then(|d| {
         d.descendants()
             .find(|o| o.has_tag_name("Option") && o.attribute("name") == Some("properties"))
     }) else {

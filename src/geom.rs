@@ -53,6 +53,10 @@ impl Rect {
     pub fn intersects(&self, o: &Rect) -> bool {
         self.xmin <= o.xmax && o.xmin <= self.xmax && self.ymin <= o.ymax && o.ymin <= self.ymax
     }
+    pub fn contains_rect(&self, o: &Rect) -> bool {
+        o.xmin >= self.xmin && o.xmax <= self.xmax && o.ymin >= self.ymin && o.ymax <= self.ymax
+    }
+
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.xmin && x <= self.xmax && y >= self.ymin && y <= self.ymax
     }

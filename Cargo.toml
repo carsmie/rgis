@@ -11,6 +11,7 @@ flatgeobuf = { version = "6.0.1", default-features = false }
 gdal-sys = { version = "0.12.0", optional = true, features = ["bindgen"] }
 geo-types = "0.7.20"
 geozero = { version = "0.15.1", features = ["with-wkb", "with-geo"] }
+harfrust = "0.12.0"
 indexmap = "2.14.2"
 parking_lot = "0.12.5"
 proj4rs = "0.2.1"
@@ -20,6 +21,7 @@ roxmltree = "0.21.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde_json = "1.0.154"
 shapefile = { version = "0.9.0", features = ["geo-types"] }
+skrifa = "0.44.0"
 thiserror = "2.0.21"
 tiny-skia = "0.12.0"
 tokio = { version = "1.53.3", features = ["full"] }

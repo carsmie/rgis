@@ -4,6 +4,7 @@
 mod crs;
 mod expression;
 mod geom;
+mod labeling;
 mod params;
 mod project;
 mod provider;
@@ -13,6 +14,7 @@ mod server;
 mod services;
 mod svg;
 mod symbology;
+mod text;
 
 use std::path::PathBuf;
 use std::sync::Arc;

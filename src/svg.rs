@@ -37,6 +37,11 @@ static OPTIONS: LazyLock<usvg::Options<'static>> = LazyLock::new(|| {
     opt
 });
 
+/// The system font database (shared with label text rendering).
+pub fn fontdb() -> &'static usvg::fontdb::Database {
+    &OPTIONS.fontdb
+}
+
 /// Rasterised markers, keyed like QgsSvgCache entries.
 static IMAGES: LazyLock<Mutex<HashMap<String, Option<Arc<Pixmap>>>>> =
     LazyLock::new(Default::default);
@@ -93,6 +98,12 @@ fn leading_number(s: &str) -> Option<f64> {
 }
 
 /// viewBox size, else width/height (QgsSvgCache::calcSizeScaleFactor).
+/// Height / width of an SVG file's view box (QgsSvgCache::svgViewboxSize).
+pub fn aspect(path: &Path) -> Option<f64> {
+    let (w, h) = viewbox_size(&std::fs::read_to_string(path).ok()?)?;
+    (w > 0.0).then(|| h / w)
+}
+
 fn viewbox_size(svg: &str) -> Option<(f64, f64)> {
     let doc = roxmltree::Document::parse_with_options(
         svg,

@@ -216,6 +216,8 @@ fn map_settings(
         crs,
         background,
         project_variables: ctx.project.variables(),
+        extent_buffer: 0.0,
+        labeling: crate::labeling::engine_settings(ctx.project),
     })
 }
 
@@ -283,6 +285,11 @@ fn get_map(ctx: &Context, version: &str) -> Result<Response, OwsError> {
     let requested = (ms.width, ms.height);
     if version != "1.1.1" {
         (ms.width, ms.height) = render::square_pixel_size(&ms.extent, ms.width, ms.height);
+    }
+    // QgsWmsRenderContext::mapTileBuffer: only for TILED requests.
+    if ctx.params.bool("TILED") {
+        let tile_buffer: f64 = ctx.project.text_prop("WMSTileBuffer").and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+        ms.extent_buffer = tile_buffer * ms.extent.width() / ms.width as f64;
     }
     let opacities: Vec<f64> = ctx
         .params
