@@ -107,6 +107,17 @@ fn quad_covers(q: &[Pt; 4], p: Pt) -> bool {
 }
 
 /// GEOSIntersects(shape, quad).
+/// Distance between two quads (0 when they intersect), as GEOSDistance.
+pub fn quad_distance(a: &[Pt; 4], b: &[Pt; 4]) -> f64 {
+    if quad_intersects(a, &Shape::Polygon(vec![vec![b[0], b[1], b[2], b[3], b[0]]])) {
+        return 0.0;
+    }
+    let ring = |q: &[Pt; 4]| [q[0], q[1], q[2], q[3], q[0]];
+    let (ra, rb) = (ring(a), ring(b));
+    let d2 = a.iter().map(|p| min_dist2_to_line(&rb, *p)).chain(b.iter().map(|p| min_dist2_to_line(&ra, *p))).fold(f64::MAX, f64::min);
+    d2.sqrt()
+}
+
 pub fn quad_intersects(q: &[Pt; 4], shape: &Shape) -> bool {
     let qr = quad_ring(q);
     match shape {

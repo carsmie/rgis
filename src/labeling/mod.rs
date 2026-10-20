@@ -8,9 +8,11 @@
 pub mod settings;
 
 mod index;
+mod line;
 mod pal;
 mod rtree;
 mod shape;
+mod stdsort;
 
 use std::f64::consts::PI;
 use geo_types::{Coord, Geometry};
@@ -25,8 +27,8 @@ use crate::symbology::{RenderUnits, Size, Symbol, SymbolLayer, Unit};
 use crate::text::{self, HAlign, LabelDocument};
 
 use index::BBox;
-use pal::{LabelFeature, Pal, PalLayer, Quadrant};
-use settings::{EngineSettings, LabelingRule, MultiLineAlign, ObstacleType, PalSettings, Placement};
+use pal::{LabelFeature, LineLabel, Pal, PalLayer, Quadrant};
+use settings::{EngineSettings, LabelingRule, MultiLineAlign, ObstacleType, PalSettings, Placement, TextAnchor};
 use shape::Shape;
 
 /// What is needed to draw a placed label.
@@ -39,6 +41,9 @@ struct Payload {
     z_index: f64,
     render_order: usize,
     area: f64,
+    /// Curved labels: the graphemes each part draws, and the letter spacing (pixels).
+    graphemes: Option<(Vec<String>, f64)>,
+    background: Option<settings::BackgroundSettings>,
 }
 
 /// QgsLabelingEngine for one map render.
@@ -135,6 +140,7 @@ impl Engine {
             s.draw_labels,
             render_order,
         );
+        pl.merge_lines = s.merge_lines;
         let li = self.pal.layers.len();
         // QgsPalLayerSettings::isLabelVisible (scale part).
         let visible = !s.scale_visibility
@@ -215,13 +221,29 @@ impl Engine {
         }
         let wrap = if s.wrap_char.is_empty() { "\n" } else { s.wrap_char.as_str() };
         let lines: Vec<&str> = label.split(wrap).flat_map(|l| l.split('\n')).collect();
-        let doc = LabelDocument::new(font.clone(), &lines, s.format.line_height);
+        // QgsPalLayerSettings::dataDefinedValEval FontLetterSpacing: in the font size unit,
+        // converted to painter units (QFont::AbsoluteSpacing).
+        let letter_spacing = self.dd(s, "FontLetterSpacing", ctx).and_then(|v| num(&v)).unwrap_or(s.format.letter_spacing);
+        let letter_spacing = self.px(&Size { value: letter_spacing, ..s.format.size });
+        let doc = LabelDocument::new(font.clone(), &lines, s.format.line_height, letter_spacing);
+        let curved = matches!(s.placement, Placement::Curved | Placement::PerimeterCurved);
+        // QgsTextLabelFeature::calculateTextMetrics: each grapheme's own advance (letter
+        // spacing included, no kerning between graphemes) and the font's height and descent.
+        let graphemes: Vec<String> = if curved { lines.iter().flat_map(|l| split_graphemes(l)).collect() } else { Vec::new() };
+        let metrics = curved.then(|| line::TextMetrics {
+            widths: graphemes.iter().map(|g| font.shape_spaced(g, letter_spacing).width * self.mupp).collect(),
+            heights: vec![(font.ascent + font.descent) * self.mupp; graphemes.len()],
+            descents: vec![font.descent * self.mupp; graphemes.len()],
+            graphemes: graphemes.clone(),
+        });
 
         // Geometry: clipped to the (buffered) extent unless a whole-polygon centroid is wanted.
         let g = f.geometry;
         let centroid_poly = matches!(s.placement, Placement::AroundPoint | Placement::OverPoint)
             && matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
-        let do_clip = !centroid_poly || !s.centroid_whole;
+        let is_line = matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_));
+        // UseEntireLine: the whole (unclipped) line, so anchors follow the full feature.
+        let do_clip = (!centroid_poly || !s.centroid_whole) && !(is_line && s.line_anchor_entire_line);
         let g = if do_clip && !self.extent.contains_rect(&geom::bbox(g)) {
             geom::clip_to_rect(g, &self.extent)?
         } else {
@@ -365,10 +387,35 @@ impl Engine {
             z_index,
             render_order,
             area: w * h,
+            graphemes: curved.then(|| (graphemes, letter_spacing)),
+            background: s.format.background.clone(),
         });
 
         let visual_margin = (0.0, (0.25 * font.ascent).max(0.0) * self.mupp, 0.0, (1.0 + font.descent) * self.mupp);
         let _ = layer;
+        // generateLabelFeature: curved angle limits (degrees in, radians out), line anchor and
+        // overrun (smoothed over a fixed 1 mm).
+        let (angle_in, angle_out) = if curved {
+            (s.max_curved_char_angle_in, -s.max_curved_char_angle_out.abs())
+        } else {
+            (20.0, -20.0)
+        };
+        let text_point = self
+            .dd(s, "LineAnchorTextPoint", ctx)
+            .and_then(|v| TextAnchor::from_dd(&to_str(&v)))
+            .unwrap_or(s.line_anchor_text_point);
+        let line = matches!(f.geometry, Geometry::LineString(_) | Geometry::MultiLineString(_)).then(|| LineLabel {
+            flags: s.line_flags,
+            anchor_percent: s.line_anchor_percent,
+            anchor_strict: s.line_anchor_strict,
+            text_point: text_point.resolve(s.line_anchor_percent),
+            overrun: if s.overrun_distance.value != 0.0 { self.map_units(s.overrun_distance.value, s.overrun_distance.unit) } else { 0.0 },
+            overrun_smooth: self.map_units(1.0, Unit::Mm),
+            max_angle_inside: angle_in.clamp(20.0, 60.0) * PI / 180.0,
+            max_angle_outside: angle_out.clamp(-95.0, -20.0) * PI / 180.0,
+            metrics,
+            ignore_whitespace: s.ignore_whitespace_collisions,
+        });
         Some(LabelFeature {
             fid: f.fid,
             sub_part: 0,
@@ -396,6 +443,14 @@ impl Engine {
             label_text: label,
             z_index,
             payload,
+            line,
+            repeat_distance: if s.repeat_distance.value != 0.0 { self.map_units(s.repeat_distance.value, s.repeat_distance.unit) } else { 0.0 },
+            no_repeat_distance: s.min_distance_to_duplicates.filter(|d| d.value > 0.0).map(|d| self.map_units(d.value, d.unit)).unwrap_or(0.0),
+            min_size: if s.merge_lines && s.min_feature_size > 0.0 && matches!(f.geometry, Geometry::LineString(_) | Geometry::MultiLineString(_)) {
+                self.map_units(s.min_feature_size, Unit::Mm)
+            } else {
+                0.0
+            },
         })
     }
 
@@ -430,6 +485,75 @@ impl Engine {
         out
     }
 
+    /// QgsTextRenderer::drawBackground for a placed label part (shape backgrounds): the
+    /// label rectangle grown by the buffer size (or a fixed size), centred on the label and
+    /// rotated with it, filled with the background's fill symbol.
+    fn draw_background(&self, pm: &mut Pixmap, bg: &settings::BackgroundSettings, xs: &[f64; 4], ys: &[f64; 4], alpha: f64) {
+        let c: Vec<(f64, f64)> = (0..4).map(|i| self.to_px(xs[i], ys[i])).collect();
+        let (lw, lh) = ((c[1].0 - c[0].0).hypot(c[1].1 - c[0].1), (c[3].0 - c[0].0).hypot(c[3].1 - c[0].1));
+        let center = ((c[0].0 + c[2].0) / 2.0, (c[0].1 + c[2].1) / 2.0);
+        let (sx, sy) = (self.px(&bg.size.0), self.px(&bg.size.1));
+        let (mut w, mut h) = (lw, lh);
+        if bg.size_type == 1 {
+            (w, h) = (sx, sy);
+        } else if bg.size_type == 0 {
+            match bg.shape {
+                1 => {
+                    w = w.max(h);
+                    h = w;
+                }
+                3 => {
+                    h = w.hypot(h);
+                    w = h;
+                }
+                2 => {
+                    h *= std::f64::consts::SQRT_2;
+                    w *= std::f64::consts::SQRT_2;
+                }
+                _ => {}
+            }
+            w += 2.0 * sx;
+            h += 2.0 * sy;
+        }
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        // Painter rotation in degrees (y down): synced with the label, plus/or a fixed one.
+        let (rot, rot_offset) = match bg.rotation_type {
+            2 => (0.0, bg.rotation),
+            1 => (-alpha.to_degrees(), bg.rotation),
+            _ => (-alpha.to_degrees(), 0.0),
+        };
+        let (xoff, yoff) = (self.px(&bg.offset.0), self.px(&bg.offset.1));
+        let (s0, c0) = rot.to_radians().sin_cos();
+        let (s1, c1) = rot_offset.to_radians().sin_cos();
+        let local = |x: f64, y: f64| {
+            let (x, y) = (x * c1 - y * s1 + xoff, x * s1 + y * c1 + yoff);
+            (center.0 + x * c0 - y * s0, center.1 + x * s0 + y * c0)
+        };
+        let ring: Vec<geo_types::Coord<f64>> = match bg.shape {
+            2 | 3 => (0..=72)
+                .map(|i| {
+                    let t = i as f64 * PI / 36.0;
+                    let (x, y) = local(w / 2.0 * t.cos(), h / 2.0 * t.sin());
+                    geo_types::Coord { x, y }
+                })
+                .collect(),
+            _ => [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)]
+                .iter()
+                .map(|(a, b)| {
+                    let (x, y) = local(a * w / 2.0, b * h / 2.0);
+                    geo_types::Coord { x, y }
+                })
+                .collect(),
+        };
+        let poly = Geometry::Polygon(geo_types::Polygon::new(geo_types::LineString(ring), vec![]));
+        let mut sym = bg.fill.clone();
+        sym.opacity *= bg.opacity;
+        let attrs = Attrs::new();
+        crate::render::draw_symbol(pm, &sym, &poly, &|c| (c.x as f32, c.y as f32), &self.units, &attrs, None);
+    }
+
     /// Solve and draw (QgsLabelingEngine::solve + drawLabels).
     pub fn draw(mut self, pm: &mut Pixmap) {
         let e = &self.extent;
@@ -450,6 +574,21 @@ impl Engine {
         let rects_only = std::env::var("RGIS_LABEL_RECTS").is_ok();
         for p in placed {
             let pay = &self.payloads[p.payload];
+            if tracing::enabled!(target: "rgis::labels", tracing::Level::DEBUG) {
+                // One line per placed label (bbox over all parts), to diff against QGIS's
+                // QgsLabelingResults.
+                let (mut b0, mut b1) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+                let quads = std::iter::once((p.x, p.y)).chain(p.parts.iter().map(|q| (q.x, q.y)));
+                for (xs, ys) in quads {
+                    for i in 0..4 {
+                        b0 = (b0.0.min(xs[i]), b0.1.min(ys[i]));
+                        b1 = (b1.0.max(xs[i]), b1.1.max(ys[i]));
+                    }
+                }
+                let lf = self.pal.layers[p.layer].feature(p.feature);
+                let origins: Vec<[f64; 3]> = std::iter::once([p.x[0], p.y[0], p.alpha]).chain(p.parts.iter().map(|q| [q.x[0], q.y[0], q.alpha])).collect();
+                tracing::debug!(target: "rgis::labels", "{}", json!({"layer": self.pal.layers[p.layer].name, "fid": lf.fid, "text": lf.label_text, "bbox": [b0.0, b0.1, b1.0, b1.1], "origins": origins}));
+            }
             let align = match pay.align {
                 MultiLineAlign::Left => HAlign::Left,
                 MultiLineAlign::Center => HAlign::Center,
@@ -488,6 +627,38 @@ impl Engine {
                 }
                 continue;
             }
+            // drawLabelPrivate(Background) for every part, before buffers and text.
+            if let Some(bg) = &pay.background {
+                let quads = std::iter::once((p.x, p.y, p.alpha)).chain(p.parts.iter().map(|q| (q.x, q.y, q.alpha)));
+                for (xs, ys, a) in quads {
+                    self.draw_background(pm, bg, &xs, &ys, a);
+                }
+            }
+            if let Some((graphemes, spacing)) = &pay.graphemes {
+                // drawLabelPrivate per part: every grapheme's buffer, then every grapheme's text.
+                let parts: Vec<(f64, f64, f64, usize)> = std::iter::once((p.x[0], p.y[0], p.alpha, p.part_id))
+                    .chain(p.parts.iter().map(|q| (q.x[0], q.y[0], q.alpha, q.part_id)))
+                    .collect();
+                let docs: Vec<_> = parts
+                    .iter()
+                    .filter_map(|&(x, y, a, i)| {
+                        let g = graphemes.get(i)?;
+                        let doc = LabelDocument::new(pay.doc.font.clone(), &[g.as_str()], 1.0, *spacing);
+                        let o = self.to_px(x, y);
+                        let path = doc.path(o, a, align)?;
+                        Some((doc, path, o, a))
+                    })
+                    .collect();
+                if let Some(b) = &pay.buffer {
+                    for (doc, path, o, a) in &docs {
+                        text::draw_buffer(pm, doc, path, *o, *a, align, b);
+                    }
+                }
+                for (_, path, _, _) in &docs {
+                    text::draw_text(pm, path, pay.color, pay.opacity);
+                }
+                continue;
+            }
             let t = std::time::Instant::now();
             let Some(path) = pay.doc.path(origin, p.alpha, align) else { continue };
             t_path += t.elapsed();
@@ -502,6 +673,24 @@ impl Engine {
         }
         tracing::debug!(?solve_time, ?t_path, ?t_buffer, ?t_text, "labeling stages");
     }
+}
+
+/// QgsPalLabeling::splitToGraphemes for the scripts used here: each character with the
+/// combining marks, joiners and variation selectors that follow it.
+fn split_graphemes(s: &str) -> Vec<String> {
+    let extends = |c: char| {
+        matches!(c as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F | 0x200D | 0xFE00..=0xFE0F)
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut join_next = false;
+    for c in s.chars() {
+        match out.last_mut() {
+            Some(last) if extends(c) || join_next => last.push(c),
+            _ => out.push(c.to_string()),
+        }
+        join_next = c == '\u{200D}';
+    }
+    out
 }
 
 /// Simple geometries of a (multi) geometry, as PAL's Util::unmulti.

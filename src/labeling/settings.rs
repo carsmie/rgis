@@ -8,7 +8,7 @@ use roxmltree::Node;
 use tracing::warn;
 
 use crate::expression::Expr;
-use crate::symbology::{data_defined_in, Rgba, Size, Unit};
+use crate::symbology::{data_defined_in, parse_symbol, Rgba, Size, Symbol, Unit};
 use crate::text::{qt_join, FontRequest};
 
 /// Qgis::LabelPlacement.
@@ -107,6 +107,42 @@ pub enum MultiLineAlign {
     Justify,
 }
 
+/// Qgis::TextAnchorPoint for line anchors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextAnchor {
+    Follow,
+    Start,
+    Center,
+    End,
+}
+
+impl TextAnchor {
+    fn parse(s: &str) -> Option<TextAnchor> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "followplacement" | "follow" => TextAnchor::Follow,
+            "startoftext" | "start" => TextAnchor::Start,
+            "centeroftext" | "center" => TextAnchor::Center,
+            "endoftext" | "end" => TextAnchor::End,
+            _ => return None,
+        })
+    }
+
+    /// QgsLabelFeature::lineAnchorTextPoint: FollowPlacement resolved by the anchor percent.
+    pub fn resolve(self, percent: f64) -> TextAnchor {
+        match self {
+            TextAnchor::Follow if percent < 0.25 => TextAnchor::Start,
+            TextAnchor::Follow if percent > 0.75 => TextAnchor::End,
+            TextAnchor::Follow => TextAnchor::Center,
+            a => a,
+        }
+    }
+
+    /// The data-defined `LineAnchorTextPoint` value.
+    pub fn from_dd(s: &str) -> Option<TextAnchor> {
+        TextAnchor::parse(s.trim())
+    }
+}
+
 /// QgsLabelObstacleSettings::ObstacleType.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ObstacleType {
@@ -125,6 +161,53 @@ pub struct BufferSettings {
     pub join: tiny_skia::LineJoin,
 }
 
+/// QgsTextBackgroundSettings (shape backgrounds; SVG and marker symbols are not drawn).
+#[derive(Debug, Clone)]
+pub struct BackgroundSettings {
+    /// QgsTextBackgroundSettings::ShapeType: 0 rectangle, 1 square, 2 ellipse, 3 circle.
+    pub shape: i64,
+    /// SizeType: 0 buffer around the text, 1 fixed.
+    pub size_type: i64,
+    pub size: (Size, Size),
+    pub offset: (Size, Size),
+    /// RotationType: 0 sync with label, 1 offset, 2 fixed.
+    pub rotation_type: i64,
+    pub rotation: f64,
+    pub opacity: f64,
+    pub fill: Symbol,
+}
+
+fn background(ts: Option<Node>) -> Option<BackgroundSettings> {
+    let bg = ts.and_then(|t| child(t, "background"));
+    if int(bg, "shapeDraw", 0) == 0 {
+        return None;
+    }
+    let shape = int(bg, "shapeType", 0);
+    if !(0..=3).contains(&shape) {
+        warn!("label background shape type {shape} (SVG/marker) is not supported");
+        return None;
+    }
+    let pair = |kx: &str, ky: &str, ku: &str| {
+        let u = unit(attr(bg, ku), Unit::Mm);
+        (sized(num(bg, kx, 0.0), u), sized(num(bg, ky, 0.0), u))
+    };
+    let fill = bg?.children().find(|c| c.has_tag_name("symbol") && c.attribute("name") == Some("fillSymbol"));
+    let Some(fill) = fill.map(parse_symbol) else {
+        warn!("label background without fillSymbol is not supported");
+        return None;
+    };
+    Some(BackgroundSettings {
+        shape,
+        size_type: int(bg, "shapeSizeType", 0),
+        size: pair("shapeSizeX", "shapeSizeY", "shapeSizeUnit"),
+        offset: pair("shapeOffsetX", "shapeOffsetY", "shapeOffsetUnit"),
+        rotation_type: int(bg, "shapeRotationType", 0),
+        rotation: num(bg, "shapeRotation", 0.0),
+        opacity: num(bg, "shapeOpacity", 1.0),
+        fill,
+    })
+}
+
 /// The parts of QgsTextFormat labels use.
 #[derive(Debug, Clone)]
 pub struct TextFormat {
@@ -136,6 +219,9 @@ pub struct TextFormat {
     pub buffer: Option<BufferSettings>,
     /// Qgis::Capitalization (0 = mixed case).
     pub capitalization: i64,
+    /// Absolute letter spacing, in the font size unit.
+    pub letter_spacing: f64,
+    pub background: Option<BackgroundSettings>,
 }
 
 /// QgsPalLayerSettings (all settings are parsed; some serve placements not ported yet).
@@ -172,6 +258,13 @@ pub struct PalSettings {
     pub repeat_distance: Size,
     pub overrun_distance: Size,
     pub line_anchor_percent: f64,
+    /// QgsLabelLineSettings::AnchorType: false = hint only, true = strict.
+    pub line_anchor_strict: bool,
+    pub line_anchor_text_point: TextAnchor,
+    /// QgsLabelLineSettings::AnchorClipping::UseEntireLine: line labels use the unclipped line.
+    pub line_anchor_entire_line: bool,
+    /// Qgis::LabelWhitespaceCollisionHandling::IgnoreWhitespaceCollisions.
+    pub ignore_whitespace_collisions: bool,
     pub max_curved_char_angle_in: f64,
     pub max_curved_char_angle_out: f64,
     pub max_distance: Size,
@@ -196,6 +289,8 @@ pub struct PalSettings {
     pub limit_num_labels: bool,
     pub max_num_labels: i64,
     pub label_margin_distance: Size,
+    /// QgsLabelThinningSettings duplicate removal: minimum distance between same-text labels.
+    pub min_distance_to_duplicates: Option<Size>,
     pub obstacle: bool,
     pub obstacle_factor: f64,
     pub obstacle_type: ObstacleType,
@@ -296,6 +391,8 @@ fn text_format(settings: Node) -> TextFormat {
         line_height,
         buffer,
         capitalization,
+        letter_spacing: num(ts, "fontLetterSpacing", 0.0),
+        background: background(ts),
     }
 }
 
@@ -388,6 +485,10 @@ pub fn parse_settings(settings: Node) -> PalSettings {
         repeat_distance: sized(num(pl, "repeatDistance", 0.0), repeat_unit),
         overrun_distance: sized(num(pl, "overrunDistance", 0.0), unit(attr(pl, "overrunDistanceUnit"), Unit::Mm)),
         line_anchor_percent: num(pl, "lineAnchorPercent", 0.5),
+        line_anchor_strict: int(pl, "lineAnchorType", 0) == 1,
+        line_anchor_entire_line: int(pl, "lineAnchorClipping", 0) == 1,
+        line_anchor_text_point: attr(pl, "lineAnchorTextPoint").and_then(TextAnchor::parse).unwrap_or(TextAnchor::Center),
+        ignore_whitespace_collisions: attr(pl, "whitespaceCollisions") == Some("IgnoreWhitespaceCollisions"),
         max_curved_char_angle_in: num(pl, "maxCurvedCharAngleIn", 25.0),
         max_curved_char_angle_out: num(pl, "maxCurvedCharAngleOut", -25.0),
         max_distance: sized(num(pl, "maximumDistance", 0.0), unit(attr(pl, "maximumDistanceUnit"), Unit::Mm)),
@@ -411,6 +512,9 @@ pub fn parse_settings(settings: Node) -> PalSettings {
             num(pl, "labelMarginDistance", 0.0),
             unit(attr(pl, "labelMarginDistanceUnit"), Unit::Mm),
         ),
+        min_distance_to_duplicates: (int(pl, "allowDuplicateRemoval", 0) != 0).then(|| {
+            sized(num(pl, "minDistanceToDuplicates", 20.0), unit(attr(pl, "minDistanceToDuplicatesUnit"), Unit::Mm))
+        }),
         obstacle: int(rd, "obstacle", 1) != 0,
         obstacle_factor: num(rd, "obstacleFactor", 1.0),
         obstacle_type: match int(rd, "obstacleType", 0) {
