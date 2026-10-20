@@ -2,3 +2,4 @@
 /.claude/
 /evidence/
 /out/
+__pycache__/
