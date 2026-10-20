@@ -353,6 +353,9 @@ impl Server {
             if let Some(dir) = &self.settings.projects_dir {
                 // A /vsigs/ projects "directory" is a prefix of the object key.
                 let dir_str = dir.to_string_lossy();
+                if !map.starts_with("/vsigs/") && !p.exists() {
+                    return Err(OwsError::new("ProjectFileError", format!("project '{map}' not found"), 404));
+                }
                 let ok = if map.starts_with("/vsigs/") || dir_str.starts_with("/vsigs/") {
                     dir_str.starts_with("/vsigs/") && map.starts_with(dir_str.as_ref()) && !map.contains("..")
                 } else {
