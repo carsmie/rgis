@@ -212,6 +212,52 @@ fn ignore_rendering_errors() -> bool {
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
+/// Bounds the pixels being rendered at once. Each request's working set (output, per-layer
+/// scratch pixmaps, PNG buffer) scales with its pixel count, and spawn_blocking alone would
+/// run hundreds of renders in parallel (QGIS Server is bounded by its worker count instead).
+/// RGIS_RENDER_BUDGET_MPX sets the budget in megapixels (default 16); a request larger than
+/// the budget waits for the whole budget.
+pub struct RenderGate {
+    budget: u64,
+    used: parking_lot::Mutex<u64>,
+    freed: parking_lot::Condvar,
+}
+
+static GATE: std::sync::LazyLock<RenderGate> = std::sync::LazyLock::new(|| RenderGate {
+    budget: std::env::var("RGIS_RENDER_BUDGET_MPX")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .map_or(16_000_000, |v| (v * 1e6) as u64),
+    used: Default::default(),
+    freed: Default::default(),
+});
+
+pub struct RenderPermit(u64);
+
+impl Drop for RenderPermit {
+    fn drop(&mut self) {
+        *GATE.used.lock() -= self.0;
+        GATE.freed.notify_all();
+    }
+}
+
+/// Wait until `width`×`height` pixels fit in the render budget.
+pub fn render_permit(width: u32, height: u32) -> RenderPermit {
+    let need = (width as u64 * height as u64).clamp(1, GATE.budget);
+    let mut used = GATE.used.lock();
+    let started = std::time::Instant::now();
+    while *used + need > GATE.budget {
+        GATE.freed.wait(&mut used);
+    }
+    *used += need;
+    let waited = started.elapsed();
+    if waited.as_millis() > 100 {
+        debug!("render gate: waited {waited:?} for {need} px");
+    }
+    RenderPermit(need)
+}
+
 /// Render layers bottom-to-top into a new pixmap.
 pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
     let mut pm =

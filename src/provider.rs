@@ -377,7 +377,30 @@ fn fgb_features<R: Read + Seek>(
 // ------------------------------------------------- HTTP range reads (/vsicurl/)
 
 const BLOCK: u64 = 256 * 1024;
-const MAX_CACHED_BLOCKS: usize = 1024;
+
+/// Blocks of all remote files, evicted oldest-first beyond RGIS_HTTP_CACHE_MB (default 256).
+/// One budget for the process: a per-file cap grows with the number of files opened.
+struct BlockCache {
+    blocks: HashMap<(u64, u64), Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<(u64, u64)>,
+    bytes: usize,
+    budget: usize,
+}
+
+static BLOCK_CACHE: LazyLock<Mutex<BlockCache>> = LazyLock::new(|| {
+    let mb = std::env::var("RGIS_HTTP_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);
+    Mutex::new(BlockCache {
+        blocks: HashMap::new(),
+        order: Default::default(),
+        bytes: 0,
+        budget: mb << 20,
+    })
+});
+
+static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static IO_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -394,7 +417,8 @@ pub struct HttpFile {
     url: String,
     len: u64,
     client: reqwest::Client,
-    blocks: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+    /// Key of this file's blocks in BLOCK_CACHE.
+    id: u64,
     /// GCS canonical resource (`/bucket/object`) when requests are HMAC-signed (/vsigs/).
     gcs_resource: Option<String>,
 }
@@ -491,13 +515,13 @@ impl HttpFile {
             url: url.to_string(),
             len,
             client,
-            blocks: Mutex::new(HashMap::new()),
+            id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             gcs_resource,
         })
     }
 
     fn block(&self, n: u64) -> Result<Arc<Vec<u8>>> {
-        if let Some(b) = self.blocks.lock().get(&n) {
+        if let Some(b) = BLOCK_CACHE.lock().blocks.get(&(self.id, n)) {
             return Ok(b.clone());
         }
         let start = n * BLOCK;
@@ -513,12 +537,37 @@ impl HttpFile {
         })?;
         debug!("vsicurl: fetched bytes {start}-{end} of {}", self.url);
         let data = Arc::new(data);
-        let mut blocks = self.blocks.lock();
-        if blocks.len() >= MAX_CACHED_BLOCKS {
-            blocks.clear();
+        let mut c = BLOCK_CACHE.lock();
+        if c.blocks.insert((self.id, n), data.clone()).is_none() {
+            c.bytes += data.len();
+            c.order.push_back((self.id, n));
         }
-        blocks.insert(n, data.clone());
+        while c.bytes > c.budget {
+            let Some(k) = c.order.pop_front() else { break };
+            if let Some(b) = c.blocks.remove(&k) {
+                c.bytes -= b.len();
+            }
+        }
         Ok(data)
+    }
+}
+
+// Projects reload every RGIS_REMOTE_PROJECT_TTL; their files' blocks go with them.
+impl Drop for HttpFile {
+    fn drop(&mut self) {
+        let mut c = BLOCK_CACHE.lock();
+        let c = &mut *c;
+        let id = self.id;
+        c.order.retain(|k| k.0 != id);
+        let mut freed = 0;
+        c.blocks.retain(|k, b| {
+            let keep = k.0 != id;
+            if !keep {
+                freed += b.len();
+            }
+            keep
+        });
+        c.bytes -= freed;
     }
 }
 

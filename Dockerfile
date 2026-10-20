@@ -39,6 +39,9 @@ RUN apt-get update \
  # here: the entrypoint is rgis) and carries Go stdlib CVEs.
  && rm -rf /usr/bin/pebble /var/lib/pebble
 ENV RGIS_LABEL_FONT="Noto Sans"
+# glibc keeps an arena per busy thread and hands little back after a burst of parallel
+# renders (RSS stayed ~2x higher); two arenas cost no measurable latency.
+ENV MALLOC_ARENA_MAX=2
 COPY --from=build /usr/local/bin/rgis /usr/local/bin/rgis
 COPY demo /opt/rgis/demo
 RUN useradd --uid 10001 --no-create-home rgis
