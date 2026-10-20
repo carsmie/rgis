@@ -48,9 +48,14 @@ ENVIRONMENT:
     GDAL_HTTP_HEADERS          extra headers for /vsigs/ without HMAC keys,
                                e.g. \"Authorization: Bearer <token>\"
     CPL_GS_ENDPOINT            GCS endpoint (default https://storage.googleapis.com/)
-    RGIS_REMOTE_PROJECT_TTL    seconds a /vsigs/ project is cached (default 300)
+    RGIS_REMOTE_PROJECT_TTL    seconds before a /vsigs/ project is revalidated by ETag
+                               (default 300; unchanged projects keep their warm caches)
+    RGIS_WARM_PROJECTS         projects to load at startup (names under --projects-dir,
+                               comma-separated; * = all in a local directory)
+    RGIS_RENDER_BUDGET_MPX     megapixels rendered at once (default 16)
+    RGIS_HTTP_CACHE_MB         remote-file block cache size (default 256)
 
-    GET /health answers 200 (liveness/readiness probes).
+    GET /health answers 200 (liveness); GET /ready answers 503 until the warm-up is done.
 ";
 
 fn print_tree(p: &Project, g: &TreeGroup, depth: usize) {
@@ -124,6 +129,14 @@ async fn handle(
         .unwrap_or("http");
     if uri.path() == "/health" {
         return HttpResponse::new(Body::from("ok"));
+    }
+    if uri.path() == "/ready" {
+        let ready = server.is_ready();
+        let mut out = HttpResponse::new(Body::from(if ready { "ok" } else { "warming up" }));
+        if !ready {
+            *out.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        }
+        return out;
     }
     if method == Method::OPTIONS {
         let mut out = HttpResponse::new(Body::empty());
@@ -218,6 +231,16 @@ async fn main() -> anyhow::Result<()> {
         projects_dir,
     };
     let server = Arc::new(Server::new(settings));
+    let warm: Vec<String> = std::env::var("RGIS_WARM_PROJECTS")
+        .unwrap_or_default()
+        .split([',', ' ', '\n'])
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !warm.is_empty() {
+        let s = server.clone();
+        tokio::task::spawn_blocking(move || s.warm(&warm));
+    }
     let app = axum::Router::new().fallback(handle).with_state(server);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("rGIS listening on http://{addr}");

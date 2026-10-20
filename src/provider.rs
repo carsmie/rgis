@@ -459,12 +459,26 @@ fn gcs_get(client: &reqwest::Client, url: &str, resource: Option<&str>) -> reqwe
     req.header("Date", date).header("Authorization", format!("GOOG1 {key}:{signature}"))
 }
 
-/// The whole object at a /vsigs/ path (projects).
-pub fn fetch_vsigs(path: &str) -> Result<Vec<u8>> {
+/// A /vsigs/ object only if its ETag differs from `etag` (If-None-Match; GCS answers 304
+/// when unchanged → Ok(None)). Returns the content and its ETag.
+pub fn fetch_vsigs_if_changed(path: &str, etag: Option<&str>) -> Result<Option<(Vec<u8>, Option<String>)>> {
     let (url, resource) = gcs_location(path)?;
     let client = reqwest::Client::builder().user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION"))).build()?;
-    run(async move { Ok(gcs_get(&client, &url, Some(&resource)).send().await?.error_for_status()?.bytes().await?.to_vec()) })
-        .with_context(|| format!("cannot read /vsigs/{path}"))
+    let etag = etag.map(str::to_string);
+    run(async move {
+        let mut req = gcs_get(&client, &url, Some(&resource));
+        if let Some(e) = &etag {
+            req = req.header("If-None-Match", e);
+        }
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string);
+        Ok(Some((resp.bytes().await?.to_vec(), etag)))
+    })
+    .with_context(|| format!("cannot read /vsigs/{path}"))
 }
 
 /// Run async HTTP work from synchronous provider code on a dedicated runtime.

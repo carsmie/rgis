@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::params::Params;
 use crate::project::Project;
@@ -160,13 +160,16 @@ fn version_key(v: &str) -> Vec<u32> {
     v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
+/// A /vsigs/ project in the config cache: (last checked, ETag, project).
+type RemoteProject = (Instant, Option<String>, Arc<Project>);
+
 /// QgsConfigCache with the 'filesystem' strategy, done by comparing modification times.
 #[derive(Default)]
 pub struct ConfigCache {
     projects: Mutex<HashMap<PathBuf, Arc<Project>>>,
-    /// Projects on GCS (`MAP=/vsigs/…`): fetched to a local copy, refetched after
-    /// RGIS_REMOTE_PROJECT_TTL seconds (default 300).
-    remote: Mutex<HashMap<String, (Instant, Arc<Project>)>>,
+    /// Projects on GCS (`MAP=/vsigs/…`): fetched to a local copy and revalidated by ETag
+    /// after RGIS_REMOTE_PROJECT_TTL seconds (default 300): (checked at, ETag, project).
+    remote: Mutex<HashMap<String, RemoteProject>>,
 }
 
 impl ConfigCache {
@@ -193,19 +196,39 @@ impl ConfigCache {
 impl ConfigCache {
     fn remote_project(&self, obj: &str) -> anyhow::Result<Arc<Project>> {
         let ttl = std::env::var("RGIS_REMOTE_PROJECT_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
-        if let Some((at, p)) = self.remote.lock().get(obj)
+        let cached = self.remote.lock().get(obj).cloned();
+        if let Some((at, _, p)) = &cached
             && at.elapsed().as_secs() < ttl
         {
             return Ok(p.clone());
         }
-        let bytes = crate::provider::fetch_vsigs(obj)?;
+        // An unchanged project keeps its layers, and with them their open files and cached
+        // blocks; a reload would start every layer cold again.
+        let etag = cached.as_ref().and_then(|c| c.1.as_deref());
+        let (bytes, etag) = match crate::provider::fetch_vsigs_if_changed(obj, etag) {
+            Ok(Some(fetched)) => fetched,
+            Ok(None) => {
+                let (_, etag, p) = cached.expect("304 only with an ETag");
+                self.remote.lock().insert(obj.to_string(), (Instant::now(), etag, p.clone()));
+                return Ok(p);
+            }
+            // GCS unreachable: keep serving the project we have.
+            Err(e) => match cached {
+                Some((_, etag, p)) => {
+                    warn!("revalidating /vsigs/{obj} failed, keeping the cached project: {e:#}");
+                    self.remote.lock().insert(obj.to_string(), (Instant::now(), etag, p.clone()));
+                    return Ok(p);
+                }
+                None => return Err(e),
+            },
+        };
         // Project::read works on files (.qgs or .qgz); keep the object's file name.
         let local = std::env::temp_dir().join("rgis-projects").join(obj.replace('/', "__"));
         std::fs::create_dir_all(local.parent().expect("has parent"))?;
         std::fs::write(&local, bytes)?;
         let p = Arc::new(Project::read(&local)?);
         info!("loaded project /vsigs/{obj}");
-        self.remote.lock().insert(obj.to_string(), (Instant::now(), p.clone()));
+        self.remote.lock().insert(obj.to_string(), (Instant::now(), etag, p.clone()));
         Ok(p)
     }
 }
@@ -223,6 +246,8 @@ pub struct Settings {
 
 pub struct Server {
     settings: Settings,
+    /// False while RGIS_WARM_PROJECTS are loading (GET /ready answers 503).
+    ready: std::sync::atomic::AtomicBool,
     cache: ConfigCache,
     registry: ServiceRegistry,
     apis: Vec<(&'static str, ApiHandler)>,
@@ -236,10 +261,75 @@ impl Server {
         crate::services::wfs::register(&mut registry);
         Server {
             settings,
+            ready: std::sync::atomic::AtomicBool::new(true),
             cache: ConfigCache::default(),
             registry,
             apis: vec![("/wfs3", crate::services::oapif::handle)],
         }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Load projects and open their vector data before taking traffic, so a new pod
+    /// doesn't serve its first requests cold (tnt-qgis `warmProjects`). Names are project
+    /// names under --projects-dir; `*` lists a local projects directory.
+    pub fn warm(&self, names: &[String]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(dir) = &self.settings.projects_dir else {
+            warn!("RGIS_WARM_PROJECTS needs --projects-dir");
+            return;
+        };
+        self.ready.store(false, Relaxed);
+        let started = Instant::now();
+        let dir_s = dir.to_string_lossy().to_string();
+        let sep = if dir_s.ends_with('/') { "" } else { "/" };
+        let mut paths: Vec<PathBuf> = vec![];
+        for n in names {
+            if n == "*" {
+                match std::fs::read_dir(dir) {
+                    Ok(rd) => paths.extend(
+                        rd.filter_map(|e| e.ok().map(|e| e.path()))
+                            .filter(|p| p.extension().is_some_and(|x| x == "qgs" || x == "qgz")),
+                    ),
+                    Err(e) => warn!("cannot list {dir_s} for RGIS_WARM_PROJECTS=*: {e}"),
+                }
+            } else {
+                paths.push(PathBuf::from(format!("{dir_s}{sep}{}.qgs", n.trim_end_matches(".qgs"))));
+            }
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (projects, layers) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+        // A few at a time: opening a remote file is one small range request each.
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while let Some(path) = paths.get(next.fetch_add(1, Relaxed)) {
+                        match self.cache.project(path) {
+                            Ok(p) => {
+                                projects.fetch_add(1, Relaxed);
+                                for l in p.layers.values().filter(|l| l.kind == "vector") {
+                                    match l.provider() {
+                                        Ok(_) => _ = layers.fetch_add(1, Relaxed),
+                                        Err(e) => debug!("warm-up: layer {} of {}: {e:#}", l.name, path.display()),
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("warm-up: {}: {e:#}", path.display()),
+                        }
+                    }
+                });
+            }
+        });
+        info!(
+            "warm-up: {} of {} project(s), {} layer(s) opened in {:?}",
+            projects.into_inner(),
+            paths.len(),
+            layers.into_inner(),
+            started.elapsed()
+        );
+        self.ready.store(true, Relaxed);
     }
 
     /// QgsServer::configPath, plus the tnt-qgis URL scheme: with a projects directory,
