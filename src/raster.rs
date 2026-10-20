@@ -332,7 +332,8 @@ mod imp {
                 let b = unsafe { g::GDALGetRasterBand(ds, i) };
                 let mut ok = 0;
                 let nd = unsafe { g::GDALGetRasterNoDataValue(b, &mut ok) };
-                let byte = unsafe { g::GDALGetRasterDataType(b) } == g::GDALDataType::GDT_UInt8;
+                // 1 = GDT_Byte, renamed GDT_UInt8 in GDAL 3.13; numeric so both GDALs build.
+                let byte = unsafe { g::GDALGetRasterDataType(b) } == 1;
                 bands.push(Band {
                     byte,
                     nodata: (ok != 0).then_some(nd),

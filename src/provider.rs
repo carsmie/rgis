@@ -83,6 +83,8 @@ pub struct Provider {
     pub description: String,
     /// Data extent in the layer CRS (QgsVectorDataProvider::extent).
     pub extent: Option<Rect>,
+    /// The datasource's `subset=` (OGR attribute filter) for sources without SQL.
+    filter: Option<crate::expression::Expr>,
 }
 
 /// Parsed OGR datasource string: `path|layername=x|subset=…` or `GPKG:path:layer`.
@@ -125,10 +127,38 @@ impl Provider {
             bail!("provider '{provider_key}' is not supported (only 'ogr')");
         }
         let uri = parse_uri(datasource);
+        let mut p = Self::open_uri(base_dir, &uri)?;
+        // QgsOgrProvider::setSubsetString → OGR_L_SetAttributeFilter. GeoPackage applies it
+        // in SQL; the other sources filter here.
+        if !matches!(p.kind, Kind::Gpkg(_)) {
+            p.filter = uri.subset.as_deref().and_then(|s| match crate::expression::Expr::parse(s) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("subset '{s}' not supported ({e}); ignored");
+                    None
+                }
+            });
+        }
+        Ok(p)
+    }
+
+    fn open_uri(base_dir: &Path, uri: &Uri) -> Result<Provider> {
+        if let Some(obj) = uri.path.strip_prefix("/vsigs/") {
+            let file = Arc::new(HttpFile::open_vsigs(obj)?);
+            let (fields, extent) = fgb_header(&mut HttpReader::new(file.clone()))?;
+            return Ok(Provider {
+                filter: None,
+                kind: Kind::Fgb(FgbSource::Http(file)),
+                fields,
+                extent,
+                description: format!("FlatGeobuf on GCS /vsigs/{obj}"),
+            });
+        }
         if let Some(url) = uri.path.strip_prefix("/vsicurl/") {
             let file = Arc::new(HttpFile::open(url)?);
             let (fields, extent) = fgb_header(&mut HttpReader::new(file.clone()))?;
             return Ok(Provider {
+                filter: None,
                 kind: Kind::Fgb(FgbSource::Http(file)),
                 fields,
                 extent,
@@ -151,13 +181,14 @@ impl Provider {
                 let (fields, extent) =
                     fgb_header(&mut BufReader::new(std::fs::File::open(&path)?))?;
                 Ok(Provider {
+                    filter: None,
                     kind: Kind::Fgb(FgbSource::File(path.clone())),
                     fields,
                     extent,
                     description: format!("FlatGeobuf {}", path.display()),
                 })
             }
-            "gpkg" => open_gpkg(path, uri.layer, uri.subset),
+            "gpkg" => open_gpkg(path, uri.layer.clone(), uri.subset.clone()),
             "shp" => open_shapefile(&path),
             "geojson" | "json" => open_geojson(&path),
             "csv" => open_csv(&path),
@@ -184,6 +215,22 @@ impl Provider {
                 .map(|(_, f)| f.clone())
                 .collect()),
         }?;
+        let out: Vec<Feature> = match &self.filter {
+            Some(e) => out.into_iter().filter(|f| e.matches(&f.attrs)).collect(),
+            None => out,
+        };
+        // OGR's rectangle spatial filter is exact (OGRLayer::FilterGeometry): a feature whose
+        // bbox touches the rectangle but whose geometry does not is not returned.
+        let out = match bbox_filter {
+            Some(b) => out
+                .into_iter()
+                .filter(|f| match &f.geometry {
+                    Some(g) => b.contains_rect(&crate::geom::bbox(g)) || crate::geom::clip_to_rect(g, &b).is_some(),
+                    None => true,
+                })
+                .collect(),
+            None => out,
+        };
         debug!(
             "{}: {} features in {:?}",
             self.description,
@@ -348,6 +395,52 @@ pub struct HttpFile {
     len: u64,
     client: reqwest::Client,
     blocks: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+    /// GCS canonical resource (`/bucket/object`) when requests are HMAC-signed (/vsigs/).
+    gcs_resource: Option<String>,
+}
+
+/// GDAL's /vsigs/ HMAC credentials (GS_ACCESS_KEY_ID / GS_SECRET_ACCESS_KEY), if set.
+static GCS_HMAC: LazyLock<Option<(String, String)>> =
+    LazyLock::new(|| Some((std::env::var("GS_ACCESS_KEY_ID").ok()?, std::env::var("GS_SECRET_ACCESS_KEY").ok()?)));
+
+/// URL and canonical resource of a /vsigs/ path (`bucket/object`), at CPL_GS_ENDPOINT.
+fn gcs_location(path: &str) -> Result<(String, String)> {
+    let (bucket, object) = path.split_once('/').ok_or_else(|| anyhow!("/vsigs/{path}: no object key"))?;
+    let object: Vec<String> = object.split('/').map(|s| urlencoding::encode(s).into_owned()).collect();
+    let resource = format!("/{bucket}/{}", object.join("/"));
+    let endpoint = std::env::var("CPL_GS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com/".into());
+    Ok((format!("{}{}", endpoint.trim_end_matches('/'), resource), resource))
+}
+
+/// A GET, signed like GDAL's /vsigs/ with HMAC keys (legacy GOOG1 scheme: HMAC-SHA1 over
+/// "GET\n\n\n<Date>\n<resource>"); unsigned without keys or resource.
+fn gcs_get(client: &reqwest::Client, url: &str, resource: Option<&str>) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    let Some(resource) = resource else { return req };
+    let Some((key, secret)) = GCS_HMAC.as_ref() else {
+        // GDAL_HTTP_HEADERS ("Name: value", one per line), e.g. a Bearer token.
+        for line in std::env::var("GDAL_HTTP_HEADERS").unwrap_or_default().split(['\r', '\n']) {
+            if let Some((k, v)) = line.split_once(':') {
+                req = req.header(k.trim(), v.trim());
+            }
+        }
+        return req;
+    };
+    use base64::Engine;
+    use hmac::{KeyInit, Mac};
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+    mac.update(format!("GET\n\n\n{date}\n{resource}").as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    req.header("Date", date).header("Authorization", format!("GOOG1 {key}:{signature}"))
+}
+
+/// The whole object at a /vsigs/ path (projects).
+pub fn fetch_vsigs(path: &str) -> Result<Vec<u8>> {
+    let (url, resource) = gcs_location(path)?;
+    let client = reqwest::Client::builder().user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION"))).build()?;
+    run(async move { Ok(gcs_get(&client, &url, Some(&resource)).send().await?.error_for_status()?.bytes().await?.to_vec()) })
+        .with_context(|| format!("cannot read /vsigs/{path}"))
 }
 
 /// Run async HTTP work from synchronous provider code on a dedicated runtime.
@@ -363,13 +456,22 @@ fn run<T: Send + 'static>(
 
 impl HttpFile {
     fn open(url: &str) -> Result<HttpFile> {
+        Self::open_with(url, None)
+    }
+
+    /// GCS object `bucket/object` (GDAL /vsigs/).
+    fn open_vsigs(path: &str) -> Result<HttpFile> {
+        let (url, resource) = gcs_location(path)?;
+        Self::open_with(&url, Some(resource))
+    }
+
+    fn open_with(url: &str, gcs_resource: Option<String>) -> Result<HttpFile> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        let (c, u) = (client.clone(), url.to_string());
+        let (c, u, r) = (client.clone(), url.to_string(), gcs_resource.clone());
         let len = run(async move {
-            let resp = c
-                .get(&u)
+            let resp = gcs_get(&c, &u, r.as_deref())
                 .header("Range", "bytes=0-0")
                 .send()
                 .await?
@@ -383,13 +485,14 @@ impl HttpFile {
                 .ok_or_else(|| anyhow!("{u} does not support HTTP range requests"))?;
             Ok(total)
         })
-        .with_context(|| format!("cannot open /vsicurl/{url}"))?;
-        info!("opened /vsicurl/{url} ({len} bytes)");
+        .with_context(|| format!("cannot open {url}"))?;
+        info!("opened {url} ({len} bytes)");
         Ok(HttpFile {
             url: url.to_string(),
             len,
             client,
             blocks: Mutex::new(HashMap::new()),
+            gcs_resource,
         })
     }
 
@@ -399,10 +502,9 @@ impl HttpFile {
         }
         let start = n * BLOCK;
         let end = (start + BLOCK).min(self.len) - 1;
-        let (c, u) = (self.client.clone(), self.url.clone());
+        let (c, u, r) = (self.client.clone(), self.url.clone(), self.gcs_resource.clone());
         let data = run(async move {
-            let resp = c
-                .get(&u)
+            let resp = gcs_get(&c, &u, r.as_deref())
                 .header("Range", format!("bytes={start}-{end}"))
                 .send()
                 .await?
@@ -541,6 +643,7 @@ fn open_gpkg(path: PathBuf, layer: Option<String>, subset: Option<String>) -> Re
         .ok()
         .filter(|r| !r.is_empty());
     Ok(Provider {
+        filter: None,
         extent,
         description: format!("GeoPackage {}|layername={table}", path.display()),
         kind: Kind::Gpkg(GpkgSource {
@@ -695,6 +798,7 @@ fn open_shapefile(path: &Path) -> Result<Provider> {
     }
     info!("loaded {} features from {}", all.len(), path.display());
     Ok(Provider {
+        filter: None,
         extent: memory_extent(&all),
         kind: Kind::Memory(all),
         fields,
@@ -814,6 +918,7 @@ fn open_csv(path: &Path) -> Result<Provider> {
         ));
     }
     Ok(Provider {
+        filter: None,
         extent: memory_extent(&all),
         kind: Kind::Memory(all),
         fields,
@@ -912,6 +1017,7 @@ fn open_geojson(path: &Path) -> Result<Provider> {
         }
     }
     Ok(Provider {
+        filter: None,
         extent: memory_extent(&all),
         kind: Kind::Memory(all),
         fields,

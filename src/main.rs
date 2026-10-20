@@ -37,11 +37,20 @@ USAGE:
 OPTIONS:
     -p, --project <FILE>       default project when no MAP parameter is given
         --projects-dir <DIR>   only allow MAP to point inside this directory
+                               (or under a /vsigs/bucket/prefix/ on GCS)
     -h, --help                 show this help
 
 ENVIRONMENT:
     QGIS_PROJECT_FILE          fixed project, overrides MAP (as in QGIS Server)
     RUST_LOG                   log filter, e.g. info or rgis=debug
+    GS_ACCESS_KEY_ID, GS_SECRET_ACCESS_KEY
+                               HMAC keys for /vsigs/ data and projects (as GDAL)
+    GDAL_HTTP_HEADERS          extra headers for /vsigs/ without HMAC keys,
+                               e.g. \"Authorization: Bearer <token>\"
+    CPL_GS_ENDPOINT            GCS endpoint (default https://storage.googleapis.com/)
+    RGIS_REMOTE_PROJECT_TTL    seconds a /vsigs/ project is cached (default 300)
+
+    GET /health answers 200 (liveness/readiness probes).
 ";
 
 fn print_tree(p: &Project, g: &TreeGroup, depth: usize) {
@@ -113,6 +122,15 @@ async fn handle(
         .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("http");
+    if uri.path() == "/health" {
+        return HttpResponse::new(Body::from("ok"));
+    }
+    if method == Method::OPTIONS {
+        let mut out = HttpResponse::new(Body::empty());
+        *out.status_mut() = StatusCode::NO_CONTENT;
+        cors(out.headers_mut());
+        return out;
+    }
     let req = Request {
         method: method.to_string(),
         path: uri.path().to_string(),
@@ -131,6 +149,7 @@ async fn handle(
             }
             out.headers_mut()
                 .insert(header::SERVER, HeaderValue::from_static("rGIS"));
+            cors(out.headers_mut());
             out
         }
         Err(e) => {
@@ -139,6 +158,14 @@ async fn handle(
             out
         }
     }
+}
+
+/// CORS as the Caddy front of the tnt-qgis image sets it: web maps fetch() legends and
+/// GetFeatureInfo cross-origin, and QGIS Server sends no CORS headers itself.
+fn cors(h: &mut HeaderMap) {
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, OPTIONS"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
 }
 
 #[tokio::main]

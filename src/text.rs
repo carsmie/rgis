@@ -217,6 +217,23 @@ fn trak_units(font: &FontRef, ptem: f32) -> f64 {
     values.last().map(|v| v.get() as f64).unwrap_or(0.0)
 }
 
+/// FreeType's FT_MulDiv: (a · b) / c rounded half away from zero.
+fn ft_mul_div(a: i64, b: i64, c: i64) -> i64 {
+    let s = a.signum() * b.signum() * c.signum();
+    let (a, b, c) = (a.abs(), b.abs(), c.abs());
+    s * ((a * b + c / 2) / c)
+}
+
+/// FreeType's FT_DivFix: (a << 16) / b rounded.
+fn ft_div_fix(a: i64, b: i64) -> i64 {
+    ft_mul_div(a, 0x10000, b)
+}
+
+/// FreeType's FT_MulFix: (a · b) >> 16 rounded.
+fn ft_mul_fix(a: i64, b: i64) -> i64 {
+    ft_mul_div(a, b, 0x10000)
+}
+
 /// Qt's QFixed::fromReal: truncation to 1/64.
 fn q64(v: f64) -> f64 {
     (v * 64.0).trunc() / 64.0
@@ -277,7 +294,8 @@ pub struct SizedFont {
     glyphs: Mutex<HashMap<u32, Arc<Vec<Seg>>>>,
     /// Stroked glyph outlines (buffers), keyed by glyph, pen width bits and join.
     strokes: Mutex<HashMap<(u32, u32, u8), Option<Arc<tiny_skia::Path>>>>,
-    runs: Mutex<HashMap<String, Arc<Run>>>,
+    /// Shaped lines keyed by text and letter spacing (1/64 px).
+    runs: Mutex<HashMap<(String, i64), Arc<Run>>>,
 }
 
 /// The font for a request at `px` pixels (cached).
@@ -325,9 +343,24 @@ impl SizedFont {
             face: face.clone(),
         };
         if *ENGINE == Engine::FreeType {
-            // QFontEngineFT reports FreeType's size metrics, which round to whole pixels.
-            f.ascent = (m.ascent as f64).ceil();
-            f.descent = (-m.descent as f64).ceil();
+            // Qt 6 takes ascent/descent from OS/2 (typo metrics if USE_TYPO_METRICS, else win
+            // metrics) via QFixed::fromReal; cap height is FreeType's FT_MulFix(sCapHeight).
+            use skrifa::raw::TableProvider;
+            if let Ok(os2) = font.os2() {
+                let upem = face.upem;
+                let (a, d) = if os2.fs_selection().bits() & 0x80 != 0 {
+                    (os2.s_typo_ascender() as f64, -(os2.s_typo_descender() as f64))
+                } else {
+                    (os2.us_win_ascent() as f64, os2.us_win_descent() as f64)
+                };
+                if a != 0.0 || d != 0.0 {
+                    f.ascent = q64(a * px as f64 / upem);
+                    f.descent = q64(d * px as f64 / upem);
+                }
+                if let Some(cap) = os2.s_cap_height() {
+                    f.cap_height = ft_mul_fix(cap as i64, ft_div_fix(px as i64 * 64, upem as i64)) as f64 / 64.0;
+                }
+            }
         }
         if *ENGINE == Engine::CoreText {
             // CoreText adds the `trak` table's tracking at its size to every advance, unrounded.
@@ -343,8 +376,9 @@ impl SizedFont {
     /// Shape on the default instance (as Qt's HarfBuzz font does): glyph ids and 26.6 advances.
     /// Shape on the default instance at 26.6 scale. With `engine`, glyph advances come from
     /// the font engine (Qt's HarfBuzz font functions), else from the font's tables.
-    /// Returns (glyph, x advance, x offset).
-    fn hb_shape(&self, text: &str, ptem: f64, engine: bool) -> Vec<(u32, f64, f64)> {
+    /// Returns (glyph, x advance, x offset, cluster). `no_ligatures` as Qt shapes letter-spaced
+    /// text (liga/clig/dlig/hlig off).
+    fn hb_shape(&self, text: &str, ptem: f64, engine: bool, no_ligatures: bool) -> Vec<(u32, f64, f64, u32)> {
         struct EngineAdvances<'a>(&'a SizedFont);
         impl harfrust::font::FontFuncs for EngineAdvances<'_> {
             fn advance_width(&mut self, _: &harfrust::font::BuiltinFontFuncs, glyph: GlyphId) -> i32 {
@@ -357,7 +391,12 @@ impl SizedFont {
         buf.push_str(text);
         buf.guess_segment_properties();
         let mut funcs = EngineAdvances(self);
+        static NO_LIGATURES: LazyLock<Vec<harfrust::Feature>> =
+            LazyLock::new(|| ["-liga", "-clig", "-dlig", "-hlig"].iter().filter_map(|f| f.parse().ok()).collect());
         let mut opts = ShapeOptions::new().point_size(Some(ptem as f32)).scale(Some(self.px * 64));
+        if no_ligatures {
+            opts = opts.features(&NO_LIGATURES);
+        }
         if engine {
             opts = opts.font_funcs(Some(&mut funcs));
         }
@@ -365,7 +404,7 @@ impl SizedFont {
         out.glyph_infos()
             .iter()
             .zip(out.glyph_positions())
-            .map(|(i, p)| (i.glyph_id, p.x_advance as f64, p.x_offset as f64))
+            .map(|(i, p)| (i.glyph_id, p.x_advance as f64, p.x_offset as f64, i.cluster))
             .collect()
     }
 
@@ -391,26 +430,46 @@ impl SizedFont {
                 (units * self.scale64() + self.ct_trak64).trunc()
             }
             Engine::FreeType => {
-                let adv = font
-                    .glyph_metrics(Size::new(self.px as f32), &self.location)
+                // QFontEngineFT (design metrics): linearHoriAdvance >> 10, where FreeType scales
+                // the font-unit advance with FT_MulDiv(units, x_scale, 64) in 16.16.
+                let units = font
+                    .glyph_metrics(Size::unscaled(), &self.location)
                     .advance_width(GlyphId::new(gid))
-                    .unwrap_or(0.0) as f64;
-                (adv * 64.0).round()
+                    .unwrap_or(0.0)
+                    .round() as i64;
+                let x_scale = ft_div_fix(self.px as i64 * 64, self.face.upem as i64);
+                (ft_mul_div(units, x_scale, 64) >> 10) as f64
             }
         }
     }
 
     /// Lay out one line like QTextLayout (cached per string).
     pub fn shape(&self, text: &str) -> Arc<Run> {
-        if let Some(r) = self.runs.lock().get(text) {
+        self.shape_spaced(text, 0.0)
+    }
+
+    /// Lay out one line with QFont::AbsoluteSpacing letter spacing `spacing` (pixels).
+    pub fn shape_spaced(&self, text: &str, spacing: f64) -> Arc<Run> {
+        // QFont::setLetterSpacing stores QFixed::fromReal (truncated 26.6).
+        let ls64 = (spacing * 64.0).trunc() as i64;
+        let key = (text.to_string(), ls64);
+        if let Some(r) = self.runs.lock().get(&key) {
             return r.clone();
         }
         // Qt shapes with HarfBuzz using the font engine's advances; HarfBuzz adds kerning and
         // `trak` tracking (at ptem = pixel size · 72/96).
-        let shaped = self.hb_shape(text, self.px as f64 * 72.0 / 96.0, true);
+        let mut shaped = self.hb_shape(text, self.px as f64 * 72.0 / 96.0, true, ls64 != 0);
+        if ls64 != 0 {
+            // QTextEngine::shapeText: spacing after every cluster's last glyph, the last one too.
+            for i in 0..shaped.len() {
+                if shaped.get(i + 1).is_none_or(|n| n.3 != shaped[i].3) {
+                    shaped[i].1 += ls64 as f64;
+                }
+            }
+        }
         let mut x64 = 0.0;
         let mut glyphs = Vec::with_capacity(shaped.len());
-        for (gid, adv64, off64) in shaped {
+        for (gid, adv64, off64, _) in shaped {
             glyphs.push((gid, (x64 + off64) / 64.0, 0.0));
             x64 += adv64;
         }
@@ -419,12 +478,12 @@ impl SizedFont {
         if runs.len() > 20_000 {
             runs.clear();
         }
-        runs.insert(text.to_string(), run.clone());
+        runs.insert(key, run.clone());
         run
     }
 
     /// QFontMetricsF::horizontalAdvance.
-    #[allow(dead_code)] // used by tests and upcoming curved-label metrics
+    #[allow(dead_code)] // used by tests
     pub fn horizontal_advance(&self, text: &str) -> f64 {
         self.shape(text).width
     }
@@ -548,11 +607,12 @@ pub struct LabelDocument {
 }
 
 impl LabelDocument {
-    /// `line_height` is QgsTextFormat::lineHeight as a fraction (multilineHeight).
-    pub fn new(font: Arc<SizedFont>, lines: &[&str], line_height: f64) -> LabelDocument {
+    /// `line_height` is QgsTextFormat::lineHeight as a fraction (multilineHeight);
+    /// `letter_spacing` is the font's absolute letter spacing in pixels.
+    pub fn new(font: Arc<SizedFont>, lines: &[&str], line_height: f64, letter_spacing: f64) -> LabelDocument {
         let n = lines.len().max(1);
         let line = font.ascent + font.descent;
-        let runs: Vec<Arc<Run>> = lines.iter().map(|l| font.shape(l)).collect();
+        let runs: Vec<Arc<Run>> = lines.iter().map(|l| font.shape_spaced(l, letter_spacing)).collect();
         let width = runs.iter().map(|r| r.width).fold(0.0, f64::max);
         // First block: ascent + descent; following blocks: lineHeight · (ascent + descent).
         let height = line + (n - 1) as f64 * line_height * line;
@@ -674,6 +734,22 @@ mod tests {
         let f = font(&req, p[2].parse().unwrap()).unwrap();
         for t in std::fs::read_to_string(p[3]).unwrap().lines() {
             println!("{t}\t{:.6}", f.horizontal_advance(t));
+        }
+    }
+
+    /// Print metrics for comparison with Qt's QFontMetricsF: RGIS_PROBE="family;style;px|…".
+    #[test]
+    #[ignore]
+    fn print_metrics() {
+        for spec in std::env::var("RGIS_PROBE").unwrap().split('|') {
+            let p: Vec<&str> = spec.split(';').collect();
+            let req = FontRequest { family: p[0].into(), weight: 400, italic: false, style: p[1].into() };
+            let f = font(&req, p[2].parse().unwrap()).unwrap();
+            let adv: Vec<String> = "OSLOabcVika".chars().map(|c| format!("{:.4}", f.horizontal_advance(&c.to_string()))).collect();
+            println!("{spec}: ascent {} descent {} cap {}", f.ascent, f.descent, f.cap_height);
+            println!("  adv [{}] Vika {} AVATAR {}", adv.join(", "), f.horizontal_advance("Vika"), f.horizontal_advance("AVATAR"));
+            let ls: Vec<String> = "OSL".chars().map(|c| format!("{:.4}", f.shape_spaced(&c.to_string(), 1.3).width)).collect();
+            println!("  LS1.3 [{}] Vika {} fi {}", ls.join(", "), f.shape_spaced("Vika", 1.3).width, f.shape_spaced("fi", 1.3).width);
         }
     }
 

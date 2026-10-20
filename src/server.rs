@@ -164,10 +164,16 @@ fn version_key(v: &str) -> Vec<u32> {
 #[derive(Default)]
 pub struct ConfigCache {
     projects: Mutex<HashMap<PathBuf, Arc<Project>>>,
+    /// Projects on GCS (`MAP=/vsigs/…`): fetched to a local copy, refetched after
+    /// RGIS_REMOTE_PROJECT_TTL seconds (default 300).
+    remote: Mutex<HashMap<String, (Instant, Arc<Project>)>>,
 }
 
 impl ConfigCache {
     pub fn project(&self, path: &Path) -> anyhow::Result<Arc<Project>> {
+        if let Some(obj) = path.to_str().and_then(|p| p.strip_prefix("/vsigs/")) {
+            return self.remote_project(obj);
+        }
         let canonical = path
             .canonicalize()
             .map_err(|e| anyhow::anyhow!("cannot open project {}: {e}", path.display()))?;
@@ -180,6 +186,26 @@ impl ConfigCache {
         }
         let p = Arc::new(Project::read(&canonical)?);
         self.projects.lock().insert(canonical, p.clone());
+        Ok(p)
+    }
+}
+
+impl ConfigCache {
+    fn remote_project(&self, obj: &str) -> anyhow::Result<Arc<Project>> {
+        let ttl = std::env::var("RGIS_REMOTE_PROJECT_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
+        if let Some((at, p)) = self.remote.lock().get(obj)
+            && at.elapsed().as_secs() < ttl
+        {
+            return Ok(p.clone());
+        }
+        let bytes = crate::provider::fetch_vsigs(obj)?;
+        // Project::read works on files (.qgs or .qgz); keep the object's file name.
+        let local = std::env::temp_dir().join("rgis-projects").join(obj.replace('/', "__"));
+        std::fs::create_dir_all(local.parent().expect("has parent"))?;
+        std::fs::write(&local, bytes)?;
+        let p = Arc::new(Project::read(&local)?);
+        info!("loaded project /vsigs/{obj}");
+        self.remote.lock().insert(obj.to_string(), (Instant::now(), p.clone()));
         Ok(p)
     }
 }
@@ -216,19 +242,32 @@ impl Server {
         }
     }
 
-    /// QgsServer::configPath
-    fn config_path(&self, params: &Params) -> Result<Option<PathBuf>, OwsError> {
+    /// QgsServer::configPath, plus the tnt-qgis URL scheme: with a projects directory,
+    /// `/qgis/QLR/<name>` serves `<projects-dir><name>.qgs` (its Caddy front rewrites that
+    /// path to MAP), so clients only need a base URL.
+    fn config_path(&self, req: &Request, params: &Params) -> Result<Option<PathBuf>, OwsError> {
         if let Some(p) = &self.settings.fixed_project {
             return Ok(Some(p.clone()));
+        }
+        if let (None, Some(dir), Some(name)) = (params.get("MAP"), &self.settings.projects_dir, req.path.strip_prefix("/qgis/QLR/")) {
+            let name = name.trim_end_matches('/').trim_end_matches(".qgs");
+            if name.is_empty() || name.contains('/') || name.contains("..") {
+                return Err(OwsError::new("ProjectFileError", format!("no project for path '{}'", req.path), 404));
+            }
+            let dir = dir.to_string_lossy();
+            let sep = if dir.ends_with('/') { "" } else { "/" };
+            return Ok(Some(PathBuf::from(format!("{dir}{sep}{name}.qgs"))));
         }
         if let Some(map) = params.get("MAP") {
             let p = PathBuf::from(map);
             if let Some(dir) = &self.settings.projects_dir {
-                let ok = p
-                    .canonicalize()
-                    .ok()
-                    .zip(dir.canonicalize().ok())
-                    .is_some_and(|(p, d)| p.starts_with(d));
+                // A /vsigs/ projects "directory" is a prefix of the object key.
+                let dir_str = dir.to_string_lossy();
+                let ok = if map.starts_with("/vsigs/") || dir_str.starts_with("/vsigs/") {
+                    dir_str.starts_with("/vsigs/") && map.starts_with(dir_str.as_ref()) && !map.contains("..")
+                } else {
+                    p.canonicalize().ok().zip(dir.canonicalize().ok()).is_some_and(|(p, d)| p.starts_with(d))
+                };
                 if !ok {
                     return Err(OwsError::new(
                         "Forbidden",
@@ -274,7 +313,7 @@ impl Server {
         params: &Params,
         service: &str,
     ) -> Result<Response, OwsError> {
-        let project = match self.config_path(params)? {
+        let project = match self.config_path(req, params)? {
             Some(path) => Some(
                 self.cache
                     .project(&path)
