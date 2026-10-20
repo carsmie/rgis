@@ -1,0 +1,31 @@
+# QGIS Server (prod tnt-qgis image) on :8099 and rGIS on :8098 over the same prepared
+# projects. OUT must be the absolute path given to prepare.py; both containers mount it at
+# that same path so MAP= URLs work for both.
+#
+#   OUT=$PWD/out/topo docker compose -f tools/topo/compose.yml up -d
+# IGNORE_RENDERING_ERRORS=1 renders what is there when some data files are missing (prod
+# does not set it, so both servers otherwise answer 500 for a layer with a bad source).
+services:
+  qgis:
+    image: ${QGIS_IMAGE:-tnt-qgis:fork-test}
+    # Plain dev server instead of Caddy + start-server; the prod QGIS_SERVER_* settings
+    # are image ENV and still apply.
+    entrypoint: ["qgis_mapserver", "0.0.0.0:8099"]
+    environment:
+      HOME: /tmp
+      QGIS_SERVER_IGNORE_RENDERING_ERRORS: ${IGNORE_RENDERING_ERRORS:-0}
+    ports: ["8099:8099"]
+    volumes: ["${OUT:?set OUT}:${OUT}:ro"]
+  rgis:
+    image: ${RGIS_IMAGE:-rgis}
+    command: ["--projects-dir", "${OUT}", "0.0.0.0:8000"]
+    environment:
+      # Qt falls back to fontconfig's sans (Noto Sans in the QGIS image); match it.
+      RGIS_LABEL_FONT: Noto Sans
+      RUST_LOG: rgis=info
+      QGIS_SERVER_IGNORE_RENDERING_ERRORS: ${IGNORE_RENDERING_ERRORS:-0}
+    ports: ["8098:8000"]
+    volumes:
+      - "${OUT}:${OUT}:ro"
+      - "${OUT}/fonts/share:/usr/share/fonts:ro"
+      - "${OUT}/fonts/local:/usr/local/share/fonts:ro"
