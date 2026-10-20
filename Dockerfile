@@ -27,12 +27,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM ghcr.io/osgeo/gdal:ubuntu-small-${GDAL_VERSION}
 # The font packages of the tnt-qgis QGIS Server image (CJK left out), so labels resolve to
 # the same faces; Kartverket's own fonts are not redistributed here. Qt falls back to
-# fontconfig's sans-serif there (Noto Sans), rgis to RGIS_LABEL_FONT.
+# fontconfig's sans-serif there (Noto Sans), rgis to RGIS_LABEL_FONT. The upgrade picks up
+# OS security fixes released after the GDAL base image was built (Pharos/Trivy findings).
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends fonts-dejavu fonts-dejavu-core fonts-dejavu-extra \
       fonts-liberation fonts-liberation2 fonts-open-sans fonts-noto-core fonts-noto-extra \
       fonts-noto-mono fonts-noto-ui-core fonts-noto-ui-extra fonts-roboto fonts-vollkorn fonts-ebgaramond \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ # Canonical's Pebble service manager ships in the Ubuntu base image (not a package, unused
+ # here: the entrypoint is rgis) and carries Go stdlib CVEs.
+ && rm -rf /usr/bin/pebble /var/lib/pebble
 ENV RGIS_LABEL_FONT="Noto Sans"
 COPY --from=build /usr/local/bin/rgis /usr/local/bin/rgis
 COPY demo /opt/rgis/demo
