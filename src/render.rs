@@ -164,13 +164,15 @@ fn features_for_drawing(
             .then(|| to_map.point(b.xmin, b.ymin).ok())
             .flatten()
             .map(|(x, y)| Coord { x, y });
-        let g = if to_map.is_identity() {
-            g
+        let (g, map_bbox) = if to_map.is_identity() {
+            (g, b)
         } else {
-            geom::transform(&g, &to_map)
+            let g = geom::transform(&g, &to_map);
+            let b = geom::bbox(&g);
+            (g, b)
         };
         let full = keep_full.then(|| g.clone());
-        if let Some(g) = geom::clip_to_rect(&g, &clip) {
+        if let Some(g) = geom::clip_owned(g, &map_bbox, &clip) {
             f.geometry = Some(g);
             prepared.push((f, origin, full));
         } else if let Some(full) = full {
@@ -354,7 +356,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
 
 /// Expression context scopes as QGIS stacks them: project < map settings < layer.
 fn layer_vars(l: &MapLayer, ms: &MapSettings, scale: f64) -> Attrs {
-    let mut vars = Attrs::new();
+    let mut vars = Attrs::default();
     for (k, v) in &ms.project_variables {
         vars.insert(format!("@{k}"), json!(v));
     }
@@ -394,7 +396,7 @@ fn draw_features(
         (x as f32, y as f32)
     };
     let vars = layer_vars(l, ms, scale);
-    let empty = Attrs::new();
+    let empty = Attrs::default();
     for (f, origin, _) in features {
         let Some(g) = &f.geometry else { continue };
         let origin = origin.as_ref().map(to_px);
@@ -1164,7 +1166,7 @@ pub fn symbol_patch(sym: &Symbol, w: u32, h: u32, dpi: f64) -> Pixmap {
         &g,
         &|c| (c.x as f32, c.y as f32),
         &u,
-        &Attrs::new(),
+        &Attrs::default(),
         Some((1.0, h as f32 - 1.0)),
     );
     pm
@@ -1216,7 +1218,7 @@ pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
             _ => {
                 for c in [p.red(), p.green(), p.blue()] {
                     let twice = c as u32 * 510; // 2 * c * 255
-                    let v = if twice % a == 0 && (twice / a) % 2 == 1 {
+                    let v = if twice.is_multiple_of(a) && (twice / a) % 2 == 1 {
                         twice / a / 2
                     } else {
                         (twice + a) / (2 * a)
@@ -1235,6 +1237,9 @@ pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
     let mut enc = png::Encoder::new(&mut out, pm.width(), pm.height());
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
+    // fdeflate: ~zlib level 1 speed (the QGIS fork serves PNG level 1); Balanced spent ~14%
+    // of a dense lag21 render compressing.
+    enc.set_compression(png::Compression::Fast);
     let mut w = enc.write_header().map_err(fail)?;
     w.write_image_data(&rgba).map_err(fail)?;
     w.finish().map_err(fail)?;

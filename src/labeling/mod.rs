@@ -550,7 +550,7 @@ impl Engine {
         let poly = Geometry::Polygon(geo_types::Polygon::new(geo_types::LineString(ring), vec![]));
         let mut sym = bg.fill.clone();
         sym.opacity *= bg.opacity;
-        let attrs = Attrs::new();
+        let attrs = Attrs::default();
         crate::render::draw_symbol(pm, &sym, &poly, &|c| (c.x as f32, c.y as f32), &self.units, &attrs, None);
     }
 

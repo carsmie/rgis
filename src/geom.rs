@@ -530,6 +530,18 @@ fn clip_line(l: &LineString<f64>, r: &Rect, out: &mut Vec<LineString<f64>>) {
 /// Clip a geometry to a rectangle for drawing (QGIS `clip_to_extent`). Polygon rings are
 /// clipped independently, so `r` should be larger than the visible area to keep the
 /// artificial edges along the clip boundary out of view.
+/// clip_to_rect for an owned geometry whose bbox `b` is already known: a geometry inside
+/// `r` (most features of a dense tile) is returned as is instead of re-scanned and cloned.
+pub fn clip_owned(g: Geometry<f64>, b: &Rect, r: &Rect) -> Option<Geometry<f64>> {
+    if !b.intersects(r) {
+        return None;
+    }
+    if b.xmin >= r.xmin && b.xmax <= r.xmax && b.ymin >= r.ymin && b.ymax <= r.ymax {
+        return Some(g);
+    }
+    clip_to_rect(&g, r)
+}
+
 pub fn clip_to_rect(g: &Geometry<f64>, r: &Rect) -> Option<Geometry<f64>> {
     let b = bbox(g);
     if !b.intersects(r) {

@@ -318,7 +318,7 @@ fn fgb_features<R: Read + Seek>(
     };
     let mut out = vec![];
     let mut push = |fid: usize, f: &flatgeobuf::FgbFeature| -> Result<()> {
-        let mut attrs = Attrs::new();
+        let mut attrs = Attrs::default();
         for fl in fields {
             attrs.insert(fl.name.clone(), Value::Null);
         }
@@ -752,7 +752,7 @@ fn gpkg_features(g: &GpkgSource, fields: &[Field], filter: Option<Rect>) -> Resu
         {
             continue;
         }
-        let mut attrs = Attrs::new();
+        let mut attrs = Attrs::default();
         for (i, f) in fields.iter().enumerate() {
             use rusqlite::types::ValueRef::*;
             let v = match row.get_ref(i + 2)? {
@@ -815,7 +815,7 @@ fn open_shapefile(path: &Path) -> Result<Provider> {
         let geometry = Geometry::<f64>::try_from(shape).ok();
         let mut values: HashMap<String, shapefile::dbase::FieldValue> =
             record.into_iter().collect();
-        let mut attrs = Attrs::new();
+        let mut attrs = Attrs::default();
         for f in &fields {
             use shapefile::dbase::FieldValue as F;
             let v = match values.remove(&f.name) {
@@ -933,7 +933,7 @@ fn open_csv(path: &Path) -> Result<Provider> {
         if rec.len() == 1 && rec[0].is_empty() {
             continue;
         }
-        let mut attrs = Attrs::new();
+        let mut attrs = Attrs::default();
         for (j, f) in fields.iter().enumerate() {
             let raw = rec.get(j).map(|s| s.as_str()).unwrap_or("");
             let v = match f.kind {
@@ -1030,7 +1030,7 @@ fn open_geojson(path: &Path) -> Result<Provider> {
     let mut fields: Vec<Field> = vec![];
     let mut all = vec![];
     for (i, f) in features.iter().enumerate() {
-        let mut attrs = Attrs::new();
+        let mut attrs = Attrs::default();
         if let Some(props) = f.get("properties").and_then(|p| p.as_object()) {
             for (k, v) in props {
                 if !fields.iter().any(|f| f.name == *k) {

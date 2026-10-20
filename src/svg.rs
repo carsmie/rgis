@@ -77,11 +77,44 @@ fn search_paths() -> Vec<PathBuf> {
     v
 }
 
-/// QgsSymbolLayerUtils::svgSymbolNameToPath: an existing path, then the SVG search paths,
-/// then relative to the project.
+/// SVGs embedded in projects, under the synthetic paths `resolve` hands out for them.
+static EMBEDDED: LazyLock<Mutex<HashMap<PathBuf, Arc<str>>>> = LazyLock::new(Default::default);
+
+/// QgsAbstractContentCache::parseBase64DataUrl: `base64:<data>` or
+/// `data:image/svg+xml;base64,<data>`, registered under a path derived from its content.
+fn embedded(name: &str) -> Option<PathBuf> {
+    use base64::Engine;
+    use std::hash::{Hash, Hasher};
+    let data = name.strip_prefix("base64:").or_else(|| {
+        let rest = name.strip_prefix("data:")?;
+        let (meta, data) = rest.split_once(',')?;
+        meta.ends_with(";base64").then_some(data)
+    })?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
+    let svg = String::from_utf8(bytes).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    svg.hash(&mut h);
+    let path = PathBuf::from(format!("embedded:{:016x}.svg", h.finish()));
+    EMBEDDED.lock().entry(path.clone()).or_insert_with(|| svg.into());
+    Some(path)
+}
+
+/// SVG source by resolved path (a file, or an embedded SVG).
+fn read_svg(path: &Path) -> std::io::Result<String> {
+    if let Some(s) = EMBEDDED.lock().get(path) {
+        return Ok(s.to_string());
+    }
+    std::fs::read_to_string(path)
+}
+
+/// QgsSymbolLayerUtils::svgSymbolNameToPath: an embedded SVG, an existing path, then the
+/// SVG search paths, then relative to the project.
 pub fn resolve(name: &str, project_dir: &Path) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
+    }
+    if name.starts_with("base64:") || name.starts_with("data:") {
+        return embedded(name);
     }
     let name = name.strip_prefix("file://").unwrap_or(name);
     let direct = Path::new(name);
@@ -109,7 +142,7 @@ fn leading_number(s: &str) -> Option<f64> {
 /// viewBox size, else width/height (QgsSvgCache::calcSizeScaleFactor).
 /// Height / width of an SVG file's view box (QgsSvgCache::svgViewboxSize).
 pub fn aspect(path: &Path) -> Option<f64> {
-    let (w, h) = viewbox_size(&std::fs::read_to_string(path).ok()?)?;
+    let (w, h) = viewbox_size(&read_svg(path).ok()?)?;
     (w > 0.0).then(|| h / w)
 }
 
@@ -206,7 +239,7 @@ fn load(
     stroke: Rgba,
     stroke_px: f64,
 ) -> Option<(usvg::Tree, (f64, f64))> {
-    let content = match path.map(std::fs::read_to_string) {
+    let content = match path.map(read_svg) {
         Some(Ok(c)) => c,
         Some(Err(e)) => {
             warn!("cannot read SVG {}: {e}", path.unwrap().display());

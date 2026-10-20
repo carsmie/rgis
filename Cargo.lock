@@ -1648,6 +1648,7 @@ dependencies = [
  "resvg",
  "roxmltree 0.21.1",
  "rusqlite",
+ "rustc-hash",
  "serde_json",
  "sha1",
  "shapefile",

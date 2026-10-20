@@ -3,6 +3,8 @@
 //! `"field" = 'x' AND "pop" >= 1e6 OR "name" IN ('a','b') OR "x" IS NULL OR "n" LIKE 'No%'`
 //! plus arithmetic, `||` and a handful of functions.
 
+use std::borrow::Cow;
+
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use serde_json::Value;
@@ -311,7 +313,9 @@ impl Parser {
     }
 }
 
-pub type Attrs = IndexMap<String, Value>;
+/// Feature attributes by field name. FxHash: rule filters look fields up per feature and
+/// SipHash took ~10% of a dense lag21 render; keys are schema names, not untrusted input.
+pub type Attrs = IndexMap<String, Value, rustc_hash::FxBuildHasher>;
 
 impl Expr {
     /// A constant (data-defined "static value"); numbers are kept numeric.
@@ -337,21 +341,22 @@ impl Expr {
     }
 
     pub fn matches(&self, attrs: &Attrs) -> bool {
-        truthy(&self.eval(attrs))
+        truthy(&self.eval_cow(attrs))
+    }
+
+    /// Literals and fields borrowed rather than cloned: rule filters run per feature.
+    fn eval_cow<'a>(&'a self, a: &'a Attrs) -> Cow<'a, Value> {
+        match self {
+            Expr::Lit(v) => Cow::Borrowed(v),
+            Expr::Field(f) => Cow::Borrowed(field_value(a, f)),
+            _ => Cow::Owned(self.eval(a)),
+        }
     }
 
     pub fn eval(&self, a: &Attrs) -> Value {
         match self {
             Expr::Lit(v) => v.clone(),
-            Expr::Field(f) => a
-                .get(f)
-                .or_else(|| {
-                    a.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(f))
-                        .map(|(_, v)| v)
-                })
-                .cloned()
-                .unwrap_or(Value::Null),
+            Expr::Field(f) => field_value(a, f).clone(),
             Expr::Unary("NOT", e) => match e.eval(a) {
                 Value::Null => Value::Null,
                 v => Value::Bool(!truthy(&v)),
@@ -359,19 +364,19 @@ impl Expr {
             Expr::Unary(_, e) => num(&e.eval(a))
                 .map(|n| serde_json::json!(-n))
                 .unwrap_or(Value::Null),
-            Expr::IsNull(e, neg) => Value::Bool(e.eval(a).is_null() != *neg),
+            Expr::IsNull(e, neg) => Value::Bool(e.eval_cow(a).is_null() != *neg),
             Expr::In(e, list, neg) => {
-                let v = e.eval(a);
+                let v = e.eval_cow(a);
                 if v.is_null() {
                     return Value::Null;
                 }
                 let found = list
                     .iter()
-                    .any(|x| compare(&v, &x.eval(a)) == Some(std::cmp::Ordering::Equal));
+                    .any(|x| compare(&v, &x.eval_cow(a)) == Some(std::cmp::Ordering::Equal));
                 Value::Bool(found != *neg)
             }
             Expr::Binary(op, l, r) => {
-                let (lv, rv) = (l.eval(a), r.eval(a));
+                let (lv, rv) = (l.eval_cow(a), r.eval_cow(a));
                 match *op {
                     "AND" => match (truthy_opt(&lv), truthy_opt(&rv)) {
                         (Some(false), _) | (_, Some(false)) => Value::Bool(false),
@@ -513,6 +518,15 @@ pub fn num(v: &Value) -> Option<f64> {
     }
 }
 
+static NULL: Value = Value::Null;
+
+/// A field by name, falling back to a case-insensitive match (QGIS field names are).
+fn field_value<'a>(a: &'a Attrs, f: &str) -> &'a Value {
+    a.get(f)
+        .or_else(|| a.iter().find(|(k, _)| k.eq_ignore_ascii_case(f)).map(|(_, v)| v))
+        .unwrap_or(&NULL)
+}
+
 pub fn to_str(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -528,6 +542,9 @@ pub fn to_str(v: &Value) -> String {
 
 /// Numeric comparison when both sides are numeric, string comparison otherwise.
 pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    if let (Value::String(x), Value::String(y)) = (a, b) {
+        return Some(x.cmp(y));
+    }
     let numeric = |v: &Value| matches!(v, Value::Number(_) | Value::Bool(_));
     if (numeric(a) || numeric(b))
         && let (Some(x), Some(y)) = (num(a), num(b))
@@ -563,7 +580,7 @@ mod tests {
     use serde_json::json;
 
     fn attrs() -> Attrs {
-        let mut a = Attrs::new();
+        let mut a = Attrs::default();
         a.insert("NAME".into(), json!("Norway"));
         a.insert("pop".into(), json!(5_400_000));
         a.insert("note".into(), Value::Null);
