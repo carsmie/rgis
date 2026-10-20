@@ -18,6 +18,7 @@ hmac = "0.13.0"
 httpdate = "1.0.3"
 indexmap = "2.14.2"
 parking_lot = "0.12.5"
+png = "0.18.1"
 proj4rs = "0.2.1"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls"] }
 resvg = "0.48.1"

@@ -84,9 +84,9 @@ pub struct MapLayer {
     pub identifiable: bool,
     pub hidden_wms: Vec<String>,
     pub hidden_wfs: Vec<String>,
-    /// Raster layers: the `<pipe><rasterrenderer>`.
+    /// Raster layers: the `<pipe>` (renderer, resampling, filters) and blend mode.
     #[cfg_attr(not(feature = "raster"), allow(dead_code))]
-    pub raster_renderer: Option<crate::raster::RasterRenderer>,
+    pub raster_style: Option<crate::raster::RasterStyle>,
     /// Labeling rules (one for simple labeling), empty when labels are disabled.
     pub labeling: Vec<crate::labeling::settings::LabelingRule>,
     pub base_dir: PathBuf,
@@ -342,7 +342,7 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
             .is_none_or(|v| v != "0"),
         hidden_wms: hidden_fields(ml, "HideFromWms", "excludeAttributesWMS"),
         hidden_wfs: hidden_fields(ml, "HideFromWfs", "excludeAttributesWFS"),
-        raster_renderer: child(ml, "pipe").map(crate::raster::parse_renderer),
+        raster_style: crate::raster::parse_style(ml),
         labeling: crate::labeling::settings::parse_labeling(ml),
         base_dir: base_dir.to_path_buf(),
         provider: OnceLock::new(),

@@ -93,7 +93,145 @@ pub enum RasterRenderer {
         opacity: f64,
         nodata_color: Option<Rgba>,
     },
+    PseudoColor {
+        band: i32,
+        alpha_band: i32,
+        opacity: f64,
+        transparency: Vec<(f64, f64, f64)>,
+        nodata_color: Option<Rgba>,
+        ramp: ColorRamp,
+    },
     Unsupported(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RampKind {
+    Interpolated,
+    Discrete,
+    Exact,
+}
+
+/// QgsColorRampShader: items in project order (QGIS does not sort them) plus the
+/// 256-entry index LUT QGIS builds on first use, here at parse time.
+#[derive(Debug, Clone)]
+pub struct ColorRamp {
+    items: Vec<(f64, [i32; 4])>,
+    kind: RampKind,
+    clip: bool,
+    lut: Vec<usize>,
+    lut_factor: f64,
+}
+
+impl ColorRamp {
+    fn new(items: Vec<(f64, [i32; 4])>, kind: RampKind, clip: bool) -> ColorRamp {
+        // DOUBLE_DIFF_THRESHOLD is 0 in QGIS, so it is left out below.
+        let mut lut = vec![];
+        let mut lut_factor = 1.0;
+        let n = items.len();
+        if n >= 3 {
+            let range = items[n - 2].0 - items[0].0;
+            if range > 0.0 {
+                lut_factor = (256.0 - 0.0000001) / range;
+                let mut idx = 0;
+                for i in 0..256 {
+                    let v = i as f64 / lut_factor + items[0].0;
+                    while idx < n && items[idx].0 < v {
+                        idx += 1;
+                    }
+                    lut.push(idx);
+                }
+            }
+        }
+        ColorRamp {
+            items,
+            kind,
+            clip,
+            lut,
+            lut_factor,
+        }
+    }
+
+    /// QgsColorRampShader::shade: RGBA (not premultiplied), None = render as no-data.
+    fn shade(&self, v: f64) -> Option<[i32; 4]> {
+        let items = &self.items;
+        let n = items.len();
+        if n == 0 || !v.is_finite() {
+            return None;
+        }
+        let offset = items[0].0;
+        let lut_index = ((v - offset) * self.lut_factor) as i32;
+        let mut overflow = false;
+        let idx = if v <= offset {
+            0
+        } else if lut_index as usize >= self.lut.len() {
+            if items[n - 1].0 < v {
+                overflow = true;
+            }
+            n - 1
+        } else if lut_index < 0 {
+            return None;
+        } else {
+            let mut idx = self.lut[lut_index as usize];
+            while idx < n && items[idx].0 < v {
+                idx += 1;
+            }
+            if idx >= n {
+                overflow = true;
+                n - 1
+            } else {
+                idx
+            }
+        };
+        let (cur_v, cur) = items[idx];
+        match self.kind {
+            RampKind::Interpolated => {
+                if idx < 1 || overflow || cur_v <= v {
+                    if self.clip && (overflow || cur_v > v) {
+                        return None;
+                    }
+                    return Some(cur);
+                }
+                let (prev_v, prev) = items[idx - 1];
+                // float arithmetic as in QGIS, truncated per channel
+                let scale = (v - prev_v) as f32 / (cur_v - prev_v) as f32;
+                Some(std::array::from_fn(|k| {
+                    prev[k] + ((cur[k] - prev[k]) as f32 * scale) as i32
+                }))
+            }
+            RampKind::Discrete => (!overflow).then_some(cur),
+            RampKind::Exact => (!overflow && cur_v <= v).then_some(cur),
+        }
+    }
+}
+
+/// Provider-stage resampling (`<provider><resampling>` with `resamplingStage` provider):
+/// GDALRIOResampleAlg codes, 0 = nearest neighbour.
+#[derive(Debug, Clone, Copy)]
+pub struct Resampling {
+    pub zoomed_in: u32,
+    pub zoomed_out: u32,
+    pub max_oversampling: f64,
+}
+
+/// QgsHueSaturationFilter settings (colorize is not ported).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HueSaturation {
+    pub saturation: i32,
+    /// 0 off, 1 lightness, 2 luminosity, 3 average.
+    pub grayscale: i32,
+    pub invert: bool,
+}
+
+/// A raster layer's pipe: provider resampling, renderer, then the image filters.
+#[derive(Debug, Clone)]
+pub struct RasterStyle {
+    pub renderer: RasterRenderer,
+    pub resampling: Option<Resampling>,
+    /// QgsBrightnessContrastFilter: brightness, contrast, gamma.
+    pub brightness: (i32, i32, f64),
+    pub hue_saturation: HueSaturation,
+    /// QgsPainting::BlendMode of the layer (`<blendMode>`).
+    pub blend_mode: i32,
 }
 
 fn child<'a, 'i>(n: Node<'a, 'i>, tag: &str) -> Option<Node<'a, 'i>> {
@@ -119,8 +257,136 @@ fn parse_contrast(n: Option<Node>) -> Option<Contrast> {
     })
 }
 
+/// QgsRasterTransparency singleValuePixelList: (min, max, percent transparent).
+fn parse_transparency(r: Node) -> Vec<(f64, f64, f64)> {
+    child(r, "rasterTransparency")
+        .and_then(|t| child(t, "singleValuePixelList"))
+        .map(|l| {
+            l.children()
+                .filter(|e| e.has_tag_name("pixelListEntry"))
+                .filter_map(|e| {
+                    Some((
+                        e.attribute("min")?.parse().ok()?,
+                        e.attribute("max")?.parse().ok()?,
+                        e.attribute("percentTransparent")?.parse().ok()?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// QColor::setNamedColor for `#rgb`, `#rrggbb` and `#aarrggbb`.
+fn hex_color(s: &str) -> Option<[i32; 4]> {
+    let h = s.strip_prefix('#')?;
+    let v = u32::from_str_radix(h, 16).ok()?;
+    let c = |shift: u32| ((v >> shift) & 0xff) as i32;
+    match h.len() {
+        3 => {
+            let d = |shift: u32| ((v >> shift) & 0xf) as i32 * 17;
+            Some([d(8), d(4), d(0), 255])
+        }
+        6 => Some([c(16), c(8), c(0), 255]),
+        8 => Some([c(16), c(8), c(0), c(24)]),
+        _ => None,
+    }
+}
+
+fn parse_ramp(r: Node) -> Option<ColorRamp> {
+    let s = r
+        .descendants()
+        .find(|n| n.has_tag_name("colorrampshader"))?;
+    let kind = match s.attribute("colorRampType").unwrap_or("INTERPOLATED") {
+        "DISCRETE" => RampKind::Discrete,
+        "EXACT" => RampKind::Exact,
+        _ => RampKind::Interpolated,
+    };
+    let items = s
+        .children()
+        .filter(|n| n.has_tag_name("item"))
+        .map(|n| {
+            let v = n
+                .attribute("value")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            let mut c = n
+                .attribute("color")
+                .and_then(hex_color)
+                .unwrap_or([0, 0, 0, 255]);
+            c[3] = n
+                .attribute("alpha")
+                .and_then(|a| a.parse().ok())
+                .unwrap_or(255);
+            (v, c)
+        })
+        .collect();
+    Some(ColorRamp::new(
+        items,
+        kind,
+        s.attribute("clip") == Some("1"),
+    ))
+}
+
+/// QgsRasterDataProvider::resamplingMethodFromString as GDALRIOResampleAlg.
+fn resampling_alg(s: Option<&str>) -> u32 {
+    match s.unwrap_or("") {
+        "bilinear" => 1,
+        "cubic" => 2,
+        "cubicSpline" => 3,
+        "lanczos" => 4,
+        "average" => 5,
+        "mode" => 6,
+        "gauss" => 7,
+        _ => 0,
+    }
+}
+
+/// The pipe of a raster `<maplayer>`; None for layers without one.
+pub fn parse_style(ml: Node) -> Option<RasterStyle> {
+    let pipe = child(ml, "pipe")?;
+    let attr = |n: Option<Node>, k: &str| n.and_then(|n| n.attribute(k).map(str::to_string));
+    let bc = child(pipe, "brightnesscontrast");
+    let hs = child(pipe, "huesaturation");
+    let int = |n, k, d: i32| attr(n, k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    // QgsRasterPipe::setResamplingStage: the provider resamples only in the provider stage.
+    let resampling = (text(pipe, "resamplingStage") == Some("provider"))
+        .then(|| child(pipe, "provider").and_then(|p| child(p, "resampling")))
+        .flatten()
+        .map(|r| Resampling {
+            zoomed_in: resampling_alg(r.attribute("zoomedInResamplingMethod")),
+            zoomed_out: resampling_alg(r.attribute("zoomedOutResamplingMethod")),
+            max_oversampling: r
+                .attribute("maxOversampling")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.0),
+        });
+    if hs.is_some_and(|h| h.attribute("colorizeOn") == Some("1")) {
+        tracing::warn!("raster huesaturation colorize is not supported; ignored");
+    }
+    Some(RasterStyle {
+        renderer: parse_renderer(pipe),
+        resampling,
+        brightness: (
+            int(bc, "brightness", 0).clamp(-255, 255),
+            int(bc, "contrast", 0).clamp(-100, 100),
+            attr(bc, "gamma")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0f64)
+                .clamp(0.1, 10.0),
+        ),
+        hue_saturation: HueSaturation {
+            saturation: int(hs, "saturation", 0).clamp(-100, 100),
+            grayscale: int(hs, "grayscaleMode", 0),
+            invert: int(hs, "invertColors", 0) != 0,
+        },
+        blend_mode: text(ml, "blendMode")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    })
+}
+
 /// The `<pipe><rasterrenderer>` of a raster layer.
-pub fn parse_renderer(pipe: Node) -> RasterRenderer {
+fn parse_renderer(pipe: Node) -> RasterRenderer {
     let Some(r) = child(pipe, "rasterrenderer") else {
         return RasterRenderer::Unsupported("none".into());
     };
@@ -140,22 +406,19 @@ pub fn parse_renderer(pipe: Node) -> RasterRenderer {
             contrast: parse_contrast(child(r, "contrastEnhancement")),
             alpha_band: int("alphaBand", -1),
             opacity,
-            transparency: child(r, "rasterTransparency")
-                .and_then(|t| child(t, "singleValuePixelList"))
-                .map(|l| {
-                    l.children()
-                        .filter(|e| e.has_tag_name("pixelListEntry"))
-                        .filter_map(|e| {
-                            Some((
-                                e.attribute("min")?.parse().ok()?,
-                                e.attribute("max")?.parse().ok()?,
-                                e.attribute("percentTransparent")?.parse().ok()?,
-                            ))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            transparency: parse_transparency(r),
             nodata_color,
+        },
+        "singlebandpseudocolor" => match parse_ramp(r) {
+            Some(ramp) => RasterRenderer::PseudoColor {
+                band: int("band", -1),
+                alpha_band: int("alphaBand", -1),
+                opacity,
+                transparency: parse_transparency(r),
+                nodata_color,
+                ramp,
+            },
+            None => RasterRenderer::Unsupported("singlebandpseudocolor without shader".into()),
         },
         "multibandcolor" => RasterRenderer::MultiBand {
             bands: [
@@ -192,7 +455,7 @@ mod imp {
     use tiny_skia::{Pixmap, PixmapPaint, PremultipliedColorU8, Transform as SkTransform};
     use tracing::{debug, warn};
 
-    use super::{Contrast, RasterRenderer};
+    use super::{Contrast, HueSaturation, RasterRenderer, RasterStyle, Resampling};
     use crate::crs::{Crs, Transform};
     use crate::geom::Rect;
     use crate::render::MapSettings;
@@ -215,6 +478,12 @@ mod imp {
     struct Band {
         byte: bool,
         nodata: Option<f64>,
+        dtype: g::GDALDataType::Type,
+        /// Bytes per value of `dtype`.
+        size: usize,
+        color_table: bool,
+        /// Overview widths, for QgsGdalProvider::canDoResampling.
+        overviews: Vec<usize>,
     }
 
     /// An opened GDAL raster (QgsGdalProvider), north-up (via a warped VRT if needed).
@@ -332,11 +601,21 @@ mod imp {
                 let b = unsafe { g::GDALGetRasterBand(ds, i) };
                 let mut ok = 0;
                 let nd = unsafe { g::GDALGetRasterNoDataValue(b, &mut ok) };
+                let dtype = unsafe { g::GDALGetRasterDataType(b) };
                 // 1 = GDT_Byte, renamed GDT_UInt8 in GDAL 3.13; numeric so both GDALs build.
-                let byte = unsafe { g::GDALGetRasterDataType(b) } == 1;
+                let byte = dtype == 1;
+                let overviews = (0..unsafe { g::GDALGetOverviewCount(b) })
+                    .map(
+                        |i| unsafe { g::GDALGetRasterBandXSize(g::GDALGetOverview(b, i)) } as usize,
+                    )
+                    .collect();
                 bands.push(Band {
                     byte,
                     nodata: (ok != 0).then_some(nd),
+                    dtype,
+                    size: unsafe { g::GDALGetDataTypeSizeBytes(dtype) } as usize,
+                    color_table: unsafe { !g::GDALGetRasterColorTable(b).is_null() },
+                    overviews,
                 });
             }
             let extent = Rect::new(
@@ -394,6 +673,49 @@ mod imp {
                 bail!("GDALRasterIO failed");
             }
             Ok(buf)
+        }
+
+        /// GDALRasterIOEx of a window into `buf` in the band's own data type, as
+        /// QgsGdalProvider::readBlock reads (resampled values are rounded to that type).
+        /// `buf` holds `bh` rows of `line` values.
+        #[allow(clippy::too_many_arguments)] // mirrors GDALRasterIOEx
+        fn read_native(
+            &self,
+            band: i32,
+            (x, y, w, h): (i32, i32, i32, i32),
+            buf: &mut [u8],
+            (bw, bh): (i32, i32),
+            line: usize,
+            extra: Option<&mut g::GDALRasterIOExtraArg>,
+        ) -> Result<()> {
+            let info = self.band(band)?;
+            let need = ((bh.max(1) as usize - 1) * line + bw as usize) * info.size;
+            if buf.len() < need {
+                bail!("raster buffer too small");
+            }
+            let guard = self.ds.lock();
+            let ds = guard.1.as_ref().map(|h| h.0).unwrap_or(guard.0.0);
+            let err = unsafe {
+                g::GDALRasterIOEx(
+                    g::GDALGetRasterBand(ds, band),
+                    g::GDALRWFlag::GF_Read,
+                    x,
+                    y,
+                    w,
+                    h,
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    bw,
+                    bh,
+                    info.dtype,
+                    info.size as g::GSpacing,
+                    (info.size * line) as g::GSpacing,
+                    extra.map_or(std::ptr::null_mut(), |e| e as *mut _),
+                )
+            };
+            if err != g::CPLErr::CE_None {
+                bail!("GDALRasterIOEx failed");
+            }
+            Ok(())
         }
 
         fn band(&self, band: i32) -> Result<&Band> {
@@ -611,6 +933,313 @@ mod imp {
         Ok(Block { data, nodata })
     }
 
+    /// INIT_RASTERIO_EXTRA_ARG with a resampling algorithm.
+    fn extra_arg(alg: u32) -> g::GDALRasterIOExtraArg {
+        // SAFETY: plain C struct; null progress callback/data are valid.
+        let mut e: g::GDALRasterIOExtraArg = unsafe { std::mem::zeroed() };
+        e.nVersion = 1;
+        e.eResampleAlg = alg as g::GDALRIOResampleAlg::Type;
+        e
+    }
+
+    /// QgsGdalProvider::canDoResampling.
+    fn can_do_resampling(
+        src: &RasterSource,
+        info: &Band,
+        rs: &Resampling,
+        req: &Rect,
+        w: usize,
+        h: usize,
+    ) -> bool {
+        if info.color_table {
+            return false;
+        }
+        let factor =
+            (req.width() / w as f64 / src.gt[1]).max(req.height() / h as f64 / src.gt[5].abs());
+        if factor < 1.0 {
+            return rs.zoomed_in != 0;
+        }
+        if factor < 1.1 {
+            return rs.zoomed_in != 0 || rs.zoomed_out != 0;
+        }
+        if rs.zoomed_out == 0 {
+            return false;
+        }
+        let limit = rs.max_oversampling + 0.1;
+        factor <= limit
+            || info
+                .overviews
+                .iter()
+                .any(|ow| factor <= limit * (src.width as f64 / *ow as f64))
+    }
+
+    /// QgsGdalProvider::block with provider resampling: readBlock's GDAL-resampled read
+    /// (floating-point source window, 1-pixel edge reads where the request overhangs the
+    /// raster), or its two-step fallback when zoomed out beyond maxOversampling.
+    /// None when readBlock would take its nearest-neighbour path.
+    fn resampled_block(
+        src: &RasterSource,
+        band: i32,
+        rs: &Resampling,
+        req: &Rect,
+        w: usize,
+        h: usize,
+    ) -> Result<Option<Block>> {
+        let info = src.band(band)?;
+        let n = w * h;
+        let (req_xres, req_yres) = (req.width() / w as f64, req.height() / h as f64);
+        let (src_xres, src_yres) = (src.gt[1], src.gt[5]); // src_yres negative
+        // As in readBlock: the y term is negative, so this is the x ratio.
+        let factor = (req_xres / src_xres).max(req_yres / src_yres);
+        let can = can_do_resampling(src, info, rs, req, w, h);
+        if !can && !(rs.zoomed_out != 0 && factor > 1.0) {
+            return Ok(None);
+        }
+        let e = &src.extent;
+        let inter = intersect(req, e);
+        if inter.is_empty() || inter.width() <= 0.0 || inter.height() <= 0.0 {
+            return Ok(Some(Block {
+                data: vec![0.0; n],
+                nodata: vec![true; n],
+            }));
+        }
+        let mut nodata = vec![false; n];
+        if !(e.xmin <= req.xmin && req.xmax <= e.xmax && e.ymin <= req.ymin && req.ymax <= e.ymax) {
+            // QgsRasterBlock::setIsNoDataExcept
+            let (l, t, r, b) = sub_rect(req, w, h, e);
+            for row in 0..h as i64 {
+                for col in 0..w as i64 {
+                    if row < t || row > b || col < l || col > r {
+                        nodata[row as usize * w + col as usize] = true;
+                    }
+                }
+            }
+        }
+        let (tgt_left, tgt_top, tgt_right, tgt_bottom) = sub_rect(req, w, h, &inter);
+        let mut src_left = 0i64;
+        let mut src_top = 0i64;
+        let mut src_bottom = src.height as i64 - 1;
+        let mut src_right = src.width as i64 - 1;
+        if e.xmin < inter.xmin {
+            src_left = ((inter.xmin - e.xmin) / src_xres).floor() as i64;
+        }
+        if e.xmax > inter.xmax {
+            src_right =
+                (src.width as i64 - 1).min(((inter.xmax - e.xmin) / src_xres).floor() as i64);
+        }
+        if e.ymax > inter.ymax {
+            src_top = (-(e.ymax - inter.ymax) / src_yres).floor() as i64;
+        }
+        if e.ymin < inter.ymin {
+            src_bottom =
+                (src.height as i64 - 1).min((-(e.ymax - inter.ymin) / src_yres).floor() as i64);
+        }
+        let (src_w, src_h) = (
+            (src_right - src_left + 1) as i32,
+            (src_bottom - src_top + 1) as i32,
+        );
+        let (src_l, src_t) = (src_left as i32, src_top as i32);
+        let ds = info.size;
+        let mut buf = vec![0u8; n * ds];
+        let at = |row: i64, col: i64| (row as usize * w + col as usize) * ds;
+        let read = if can {
+            let rows = (tgt_bottom - tgt_top + 1) as i32;
+            let cols = (tgt_right - tgt_left + 1) as i32;
+            let (mut tl, mut tt, mut tr, mut tb) = (tgt_left, tgt_top, tgt_right, tgt_bottom);
+            // GDAL rejects windows outside the raster: overhanging edges read 1 pixel.
+            let mut edges = || -> Result<()> {
+                if req.xmin + tl as f64 * req_xres < e.xmin {
+                    src.read_native(
+                        band,
+                        (0, src_t, 1, src_h),
+                        &mut buf[at(tgt_top, tgt_left)..],
+                        (1, rows),
+                        w,
+                        None,
+                    )?;
+                    tl += 1;
+                }
+                if req.ymax - tt as f64 * req_yres > e.ymax {
+                    src.read_native(
+                        band,
+                        (src_l, 0, src_w, 1),
+                        &mut buf[at(tgt_top, tgt_left)..],
+                        (cols, 1),
+                        w,
+                        None,
+                    )?;
+                    tt += 1;
+                }
+                if req.xmin + (tr + 1) as f64 * req_xres > e.xmax {
+                    let x = src.width as i32 - 1;
+                    src.read_native(
+                        band,
+                        (x, src_t, 1, src_h),
+                        &mut buf[at(tgt_top, tgt_right)..],
+                        (1, rows),
+                        w,
+                        None,
+                    )?;
+                    tr -= 1;
+                }
+                if req.ymax - (tb + 1) as f64 * req_yres < e.ymin {
+                    let y = src.height as i32 - 1;
+                    src.read_native(
+                        band,
+                        (src_l, y, src_w, 1),
+                        &mut buf[at(tgt_bottom, tgt_left)..],
+                        (cols, 1),
+                        w,
+                        None,
+                    )?;
+                    tb -= 1;
+                }
+                let (tw, th) = (tr - tl + 1, tb - tt + 1);
+                if tw > 0 && th > 0 {
+                    // near nominal resolution the zoomed-out method wins unless nearest
+                    let method = if factor < 1.0 || (factor < 1.1 && rs.zoomed_out == 0) {
+                        rs.zoomed_in
+                    } else {
+                        rs.zoomed_out
+                    };
+                    let mut x = extra_arg(method);
+                    x.bFloatingPointWindowValidity = 1;
+                    x.dfXOff = (req.xmin + tl as f64 * req_xres - e.xmin) / src_xres;
+                    x.dfYOff = (e.ymax - (req.ymax - tt as f64 * req_yres)) / -src_yres;
+                    x.dfXSize = tw as f64 * req_xres / src_xres;
+                    x.dfYSize = th as f64 * req_yres / -src_yres;
+                    let win = (
+                        x.dfXOff.floor() as i32,
+                        x.dfYOff.floor() as i32,
+                        (x.dfXSize.floor() as i32).max(1),
+                        (x.dfYSize.floor() as i32).max(1),
+                    );
+                    src.read_native(
+                        band,
+                        win,
+                        &mut buf[at(tt, tl)..],
+                        (tw as i32, th as i32),
+                        w,
+                        Some(&mut x),
+                    )?;
+                }
+                Ok(())
+            };
+            edges()
+        } else {
+            // Nearest read at maxOversampling × the target size, then the zoomed-out
+            // resampler down to the target size through a MEM dataset.
+            let tw = (tgt_right - tgt_left + 1) as usize;
+            let th = (tgt_bottom - tgt_top + 1) as usize;
+            let tmp_w = (tw as f64 * rs.max_oversampling + 0.5) as usize;
+            let tmp_h = (th as f64 * rs.max_oversampling + 0.5) as usize;
+            let mut tmp = vec![0u8; tmp_w * tmp_h * ds];
+            src.read_native(
+                band,
+                (src_l, src_t, src_w, src_h),
+                &mut tmp,
+                (tmp_w as i32, tmp_h as i32),
+                tmp_w,
+                None,
+            )
+            .and_then(|_| {
+                let opts: Vec<CString> = [
+                    format!("PIXELOFFSET={ds}"),
+                    format!("LINEOFFSET={}", ds * tmp_w),
+                    format!("DATAPOINTER={}", tmp.as_mut_ptr() as usize),
+                ]
+                .into_iter()
+                .map(|o| CString::new(o).expect("no NUL"))
+                .collect();
+                let mut ptrs: Vec<*const std::ffi::c_char> =
+                    opts.iter().map(|o| o.as_ptr()).collect();
+                ptrs.push(std::ptr::null());
+                let mut x = extra_arg(rs.zoomed_out);
+                // SAFETY: the MEM band aliases `tmp`, which outlives the dataset.
+                let err = unsafe {
+                    let mem = Handle(g::GDALCreate(
+                        g::GDALGetDriverByName(c"MEM".as_ptr()),
+                        c"".as_ptr(),
+                        tmp_w as i32,
+                        tmp_h as i32,
+                        0,
+                        info.dtype,
+                        std::ptr::null_mut(),
+                    ));
+                    if mem.0.is_null() {
+                        bail!("cannot create MEM dataset");
+                    }
+                    g::GDALAddBand(mem.0, info.dtype, ptrs.as_ptr() as _);
+                    g::GDALRasterIOEx(
+                        g::GDALGetRasterBand(mem.0, 1),
+                        g::GDALRWFlag::GF_Read,
+                        0,
+                        0,
+                        tmp_w as i32,
+                        tmp_h as i32,
+                        buf[at(tgt_top, tgt_left)..].as_mut_ptr() as *mut std::ffi::c_void,
+                        tw as i32,
+                        th as i32,
+                        info.dtype,
+                        ds as g::GSpacing,
+                        (ds * w) as g::GSpacing,
+                        &mut x,
+                    )
+                };
+                if err != g::CPLErr::CE_None {
+                    bail!("GDALRasterIOEx failed");
+                }
+                Ok(())
+            })
+        };
+        if let Err(err) = read {
+            // QgsGdalProvider::block: a failed read leaves the whole block no-data.
+            debug!("raster read failed: {err:#}");
+            return Ok(Some(Block {
+                data: vec![0.0; n],
+                nodata: vec![true; n],
+            }));
+        }
+        let mut data = vec![0f64; n];
+        // SAFETY: `buf` holds n values of info.dtype, `data` n doubles.
+        unsafe {
+            g::GDALCopyWords(
+                buf.as_ptr() as *const std::ffi::c_void,
+                info.dtype,
+                ds as i32,
+                data.as_mut_ptr() as *mut std::ffi::c_void,
+                g::GDALDataType::GDT_Float64,
+                8,
+                n as i32,
+            )
+        };
+        if let Some(nd) = info.nodata {
+            for (v, no) in data.iter().zip(nodata.iter_mut()) {
+                if *v == nd || (nd.is_nan() && v.is_nan()) {
+                    *no = true;
+                }
+            }
+        }
+        Ok(Some(Block { data, nodata }))
+    }
+
+    /// A band block as the renderer requests it from the provider.
+    fn input_block(
+        src: &RasterSource,
+        rs: Option<&Resampling>,
+        band: i32,
+        bbox: &Rect,
+        w: usize,
+        h: usize,
+    ) -> Result<Block> {
+        if let Some(rs) = rs
+            && let Some(b) = resampled_block(src, band, rs, bbox, w, h)?
+        {
+            return Ok(b);
+        }
+        provider_block(src, band, bbox, w, h)
+    }
+
     /// Premultiplied RGBA pixels (QgsRasterBlock of type ARGB32_Premultiplied).
     type Image = Vec<PremultipliedColorU8>;
 
@@ -637,6 +1266,7 @@ mod imp {
     #[allow(clippy::needless_range_loop)]
     fn renderer_block(
         r: &RasterRenderer,
+        rs: Option<&Resampling>,
         src: &RasterSource,
         bbox: &Rect,
         w: usize,
@@ -653,10 +1283,10 @@ mod imp {
                 transparency,
                 nodata_color,
             } => {
-                let input = provider_block(src, *band, bbox, w, h)?;
+                let input = input_block(src, rs, *band, bbox, w, h)?;
                 let byte = src.band(*band)?.byte;
                 let alpha = if *alpha_band > 0 && alpha_band != band {
-                    Some(provider_block(src, *alpha_band, bbox, w, h)?)
+                    Some(input_block(src, rs, *alpha_band, bbox, w, h)?)
                 } else {
                     None
                 };
@@ -716,13 +1346,13 @@ mod imp {
                 let mut blocks: Vec<Option<Block>> = vec![];
                 for b in bands {
                     blocks.push(if *b > 0 {
-                        Some(provider_block(src, *b, bbox, w, h)?)
+                        Some(input_block(src, rs, *b, bbox, w, h)?)
                     } else {
                         None
                     });
                 }
                 let alpha = if *alpha_band > 0 {
-                    Some(provider_block(src, *alpha_band, bbox, w, h)?)
+                    Some(input_block(src, rs, *alpha_band, bbox, w, h)?)
                 } else {
                     None
                 };
@@ -795,7 +1425,287 @@ mod imp {
                 }
                 Ok(out)
             }
+            RasterRenderer::PseudoColor {
+                band,
+                alpha_band,
+                opacity,
+                transparency,
+                nodata_color,
+                ramp,
+            } => {
+                let input = input_block(src, rs, *band, bbox, w, h)?;
+                let alpha = if *alpha_band > 0 && alpha_band != band {
+                    Some(input_block(src, rs, *alpha_band, bbox, w, h)?)
+                } else {
+                    None
+                };
+                // QgsRasterRenderer::usesTransparency
+                let has_transparency =
+                    *alpha_band > 0 || !transparency.is_empty() || (*opacity - 1.0).abs() > 1e-9;
+                let nd = nodata_pixel(*nodata_color);
+                let mut out = vec![PremultipliedColorU8::TRANSPARENT; n];
+                for i in 0..n {
+                    if input.nodata[i] {
+                        out[i] = nd;
+                        continue;
+                    }
+                    let v = input.data[i];
+                    let Some([mut r, mut g, mut b, a]) = ramp.shade(v) else {
+                        out[i] = nd;
+                        continue;
+                    };
+                    if a < 255 {
+                        // premultiply; int *= double truncates as in C++
+                        let f = a as f64 / 255.0;
+                        r = (r as f64 * f) as i32;
+                        g = (g as f64 * f) as i32;
+                        b = (b as f64 * f) as i32;
+                    }
+                    if !has_transparency {
+                        out[i] = rgba(r, g, b, a);
+                        continue;
+                    }
+                    let mut o = *opacity;
+                    if let Some(&(_, _, pct)) =
+                        transparency.iter().find(|(mn, mx, _)| v >= *mn && v <= *mx)
+                    {
+                        o *= 1.0 - pct / 100.0;
+                    }
+                    if *alpha_band > 0 {
+                        let av = alpha.as_ref().map(|b| b.data[i]).unwrap_or(v);
+                        if av == 0.0 {
+                            out[i] = nd;
+                            continue;
+                        }
+                        o *= av / 255.0;
+                    }
+                    out[i] = rgba(
+                        (o * r as f64) as i32,
+                        (o * g as f64) as i32,
+                        (o * b as f64) as i32,
+                        (o * a as f64) as i32,
+                    );
+                }
+                Ok(out)
+            }
             RasterRenderer::Unsupported(t) => bail!("raster renderer '{t}' is not supported"),
+        }
+    }
+
+    /// QgsBrightnessContrastFilter::block, on premultiplied pixels.
+    fn brightness_contrast(img: &mut Image, (brightness, contrast, gamma): (i32, i32, f64)) {
+        if brightness == 0 && contrast == 0 && gamma == 1.0 {
+            return;
+        }
+        let f = ((contrast + 100) as f64 / 100.0).powi(2);
+        let gc = 1.0 / gamma;
+        let curve = |c: f64| {
+            255.0 * ((((c / 255.0 - 0.5) * f + 0.5) * 255.0 + brightness as f64) / 255.0).powf(gc)
+        };
+        // adjustColorComponent
+        let adjust = |c: u8, a: u8| -> i32 {
+            match a {
+                255 => (curve(c as f64) as i32).clamp(0, 255),
+                0 => 0,
+                _ => {
+                    let af = a as f64 / 255.0;
+                    (af * curve(c as f64 / af).clamp(0.0, 255.0)) as i32
+                }
+            }
+        };
+        for p in img.iter_mut() {
+            if *p == PremultipliedColorU8::TRANSPARENT {
+                continue;
+            }
+            let a = p.alpha();
+            *p = rgba(
+                adjust(p.red(), a),
+                adjust(p.green(), a),
+                adjust(p.blue(), a),
+                a as i32,
+            );
+        }
+    }
+
+    /// Qt's qRound(float).
+    fn qround(f: f32) -> i32 {
+        f.round() as i32
+    }
+
+    /// qt_div_257: 16-bit QColor channel to 8 bits.
+    fn div257(x: i32) -> i32 {
+        let x = x as u32 + 128;
+        ((x - (x >> 8)) >> 8) as i32
+    }
+
+    fn fuzzy_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() * 100000.0 <= a.abs().min(b.abs())
+    }
+
+    /// QColor::fromRgb(r, g, b).getHsl(): Qt's 16-bit HSL in float math.
+    fn qt_rgb_to_hsl(r: i32, g: i32, b: i32) -> (i32, i32, i32) {
+        let [r, g, b] = [r, g, b].map(|c| (c * 0x101) as f32 / 65535.0);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let (delta, delta2) = (max - min, max + min);
+        let l = 0.5 * delta2;
+        let lightness = qround(l * 65535.0);
+        if delta.abs() <= 0.00001 {
+            return (-1, 0, div257(lightness));
+        }
+        let sat = if l < 0.5 {
+            qround(delta / delta2 * 65535.0)
+        } else {
+            qround(delta / (2.0 - delta2) * 65535.0)
+        };
+        let mut hue = if fuzzy_eq(r, max) {
+            (g - b) / delta
+        } else if fuzzy_eq(g, max) {
+            2.0 + (b - r) / delta
+        } else {
+            4.0 + (r - g) / delta
+        };
+        hue *= 60.0;
+        if hue < 0.0 {
+            hue += 360.0;
+        }
+        (qround(hue * 100.0) / 100, div257(sat), div257(lightness))
+    }
+
+    /// QColor::fromHsl(h, s, l).getRgb().
+    fn qt_hsl_to_rgb(h: i32, s: i32, l: i32) -> (i32, i32, i32) {
+        let hue = if h == -1 { 65535 } else { (h % 360) * 100 };
+        let (sat, light) = (s * 0x101, l * 0x101);
+        if sat == 0 || hue == 65535 {
+            let v = div257(light);
+            return (v, v, v);
+        }
+        if light == 0 {
+            return (0, 0, 0);
+        }
+        let h = if hue == 36000 {
+            0.0
+        } else {
+            hue as f32 / 36000.0
+        };
+        let s = sat as f32 / 65535.0;
+        let l = light as f32 / 65535.0;
+        let temp2 = if l < 0.5 {
+            l * (1.0 + s)
+        } else {
+            l + s - l * s
+        };
+        let temp1 = 2.0 * l - temp2;
+        let mut out = [h + 1.0 / 3.0, h, h - 1.0 / 3.0].map(|mut t| {
+            if t < 0.0 {
+                t += 1.0;
+            } else if t > 1.0 {
+                t -= 1.0;
+            }
+            let v = if t * 6.0 < 1.0 {
+                temp1 + (temp2 - temp1) * (t * 6.0)
+            } else if t * 2.0 < 1.0 {
+                temp2
+            } else if t * 3.0 < 2.0 {
+                temp1 + (temp2 - temp1) * (2.0 / 3.0 - t) * 6.0
+            } else {
+                temp1
+            };
+            // stored as quint16; 1 is snapped to 0
+            let c = qround(v * 65535.0) & 0xffff;
+            if c == 1 { 0 } else { c }
+        });
+        out = out.map(div257);
+        (out[0], out[1], out[2])
+    }
+
+    /// QgsHueSaturationFilter::block without colorize, on premultiplied pixels.
+    fn hue_saturation(img: &mut Image, hs: HueSaturation) {
+        if !hs.invert && hs.saturation == 0 && hs.grayscale == 0 {
+            return;
+        }
+        let scale = hs.saturation as f64 / 100.0 + 1.0;
+        for p in img.iter_mut() {
+            let a = p.alpha();
+            if a == 0 {
+                continue;
+            }
+            let (mut r, mut g, mut b) = (p.red() as i32, p.green() as i32, p.blue() as i32);
+            let af = a as f64 / 255.0;
+            if a != 255 {
+                // un-premultiply; int /= double truncates
+                r = (r as f64 / af) as i32;
+                g = (g as f64 / af) as i32;
+                b = (b as f64 / af) as i32;
+            }
+            if hs.invert {
+                (r, g, b) = (255 - r, 255 - g, 255 - b);
+            }
+            let (h, mut s, l) = qt_rgb_to_hsl(r, g, b);
+            // processSaturation
+            if hs.grayscale != 0 || scale != 1.0 {
+                match hs.grayscale {
+                    1 => (r, g, b) = qt_hsl_to_rgb(h, 0, l),
+                    2 => {
+                        let v = (0.21 * r as f64 + 0.72 * g as f64 + 0.07 * b as f64) as i32;
+                        (r, g, b) = (v, v, v);
+                    }
+                    3 => {
+                        let v = (r + g + b) / 3;
+                        (r, g, b) = (v, v, v);
+                    }
+                    _ => {
+                        s = if scale < 1.0 {
+                            ((s as f64 * scale) as i32).min(255)
+                        } else {
+                            ((255.0 * (1.0 - (1.0 - s as f64 / 255.0).powf(scale * scale))) as i32)
+                                .min(255)
+                        };
+                        (r, g, b) = qt_hsl_to_rgb(h, s, l);
+                    }
+                }
+            }
+            if a != 255 {
+                r = (r as f64 * af) as i32;
+                g = (g as f64 * af) as i32;
+                b = (b as f64 * af) as i32;
+            }
+            *p = rgba(r, g, b, a as i32);
+        }
+    }
+
+    /// The raster pipe below the projector: provider, renderer, brightness/contrast,
+    /// hue/saturation (QgsRasterPipe order).
+    fn pipe_block(
+        style: &RasterStyle,
+        src: &RasterSource,
+        bbox: &Rect,
+        w: usize,
+        h: usize,
+    ) -> Result<Image> {
+        let mut img = renderer_block(&style.renderer, style.resampling.as_ref(), src, bbox, w, h)?;
+        brightness_contrast(&mut img, style.brightness);
+        hue_saturation(&mut img, style.hue_saturation);
+        Ok(img)
+    }
+
+    /// QgsPainting::getCompositionMode.
+    fn blend_mode(m: i32) -> tiny_skia::BlendMode {
+        use tiny_skia::BlendMode as B;
+        match m {
+            1 => B::Lighten,
+            2 => B::Screen,
+            3 => B::ColorDodge,
+            4 => B::Plus,
+            5 => B::Darken,
+            6 => B::Multiply,
+            7 => B::ColorBurn,
+            8 => B::Overlay,
+            9 => B::SoftLight,
+            10 => B::HardLight,
+            11 => B::Difference,
+            12 => B::Exclusion,
+            _ => B::SourceOver,
         }
     }
 
@@ -1133,7 +2043,7 @@ mod imp {
     pub fn render(
         pm: &mut Pixmap,
         src: &RasterSource,
-        renderer: &RasterRenderer,
+        style: &RasterStyle,
         layer_crs: &Crs,
         ms: &MapSettings,
     ) -> Result<()> {
@@ -1187,14 +2097,13 @@ mod imp {
                 let ymax = e.ymax - row0 as f64 / vh as f64 * e.height();
                 let part = Rect::new(xmin, ymin, xmax, ymax);
                 let img = if same_crs {
-                    Some(renderer_block(renderer, src, &part, cols, rows)?)
+                    Some(pipe_block(style, src, &part, cols, rows)?)
                 } else {
                     let p = Projector::new(part, cols, rows, src.extent, &ms.crs, layer_crs);
                     if p.src_rows == 0 || p.src_cols == 0 {
                         None
                     } else {
-                        let input =
-                            renderer_block(renderer, src, &p.src_extent, p.src_cols, p.src_rows)?;
+                        let input = pipe_block(style, src, &p.src_extent, p.src_cols, p.src_rows)?;
                         Some(p.project(&input))
                     }
                 };
@@ -1205,7 +2114,10 @@ mod imp {
                         (tlx + col0 as f64).floor() as i32,
                         (tly + row0 as f64).floor() as i32,
                         part_pm.as_ref(),
-                        &PixmapPaint::default(),
+                        &PixmapPaint {
+                            blend_mode: blend_mode(style.blend_mode),
+                            ..Default::default()
+                        },
                         SkTransform::identity(),
                         None,
                     );

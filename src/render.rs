@@ -115,7 +115,12 @@ fn features_for_drawing(
     let to_map = Transform::new(&layer_crs, &ms.crs);
     // QgsMapRendererJob renders the extent grown by the extent buffer.
     let b = ms.extent_buffer;
-    let render_extent = Rect::new(ms.extent.xmin - b, ms.extent.ymin - b, ms.extent.xmax + b, ms.extent.ymax + b);
+    let render_extent = Rect::new(
+        ms.extent.xmin - b,
+        ms.extent.ymin - b,
+        ms.extent.xmax + b,
+        ms.extent.ymax + b,
+    );
     let mut out = provider.features(to_layer.rect(&render_extent).ok())?;
     out.retain(|f| filter.is_none_or(|e| e.matches(&f.attrs)));
 
@@ -186,11 +191,11 @@ fn render_raster(pm: &mut Pixmap, l: &MapLayer, ms: &MapSettings) -> Result<()> 
         );
         return Ok(());
     }
-    let Some(renderer) = &l.raster_renderer else {
+    let Some(style) = &l.raster_style else {
         return Ok(());
     };
     let src = crate::raster::RasterSource::open(&l.datasource, &l.base_dir)?;
-    crate::raster::render(pm, &src, renderer, &l.crs(), ms)
+    crate::raster::render(pm, &src, style, &l.crs(), ms)
 }
 
 #[cfg(not(feature = "raster"))]
@@ -280,7 +285,8 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
                 .iter()
                 .filter_map(|(f, _, full)| {
                     let symbols = l.renderer.symbols_for(&f.attrs, scale);
-                    let rendered = !symbols.is_empty() || matches!(l.renderer, crate::symbology::Renderer::Null);
+                    let rendered = !symbols.is_empty()
+                        || matches!(l.renderer, crate::symbology::Renderer::Null);
                     Some(crate::labeling::LabelSource {
                         fid: f.fid,
                         attrs: &f.attrs,
@@ -1151,9 +1157,40 @@ pub fn scale(pm: &Pixmap, width: u32, height: u32) -> Pixmap {
     out
 }
 
+/// RGBA PNG of a premultiplied pixmap, un-premultiplied like Qt's ARGB32_Premultiplied ->
+/// ARGB32 conversion: round to nearest, but exact halves round down (Qt's SSE4 path
+/// multiplies by an approximate 255/alpha that lands just below).
 pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
-    pm.encode_png().map_err(|e| {
+    let mut rgba = Vec::with_capacity(pm.pixels().len() * 4);
+    for p in pm.pixels() {
+        let a = p.alpha() as u32;
+        match a {
+            0 => rgba.extend([0; 4]),
+            255 => rgba.extend([p.red(), p.green(), p.blue(), 255]),
+            _ => {
+                for c in [p.red(), p.green(), p.blue()] {
+                    let twice = c as u32 * 510; // 2 * c * 255
+                    let v = if twice % a == 0 && (twice / a) % 2 == 1 {
+                        twice / a / 2
+                    } else {
+                        (twice + a) / (2 * a)
+                    };
+                    rgba.push(v.min(255) as u8);
+                }
+                rgba.push(a as u8);
+            }
+        }
+    }
+    let mut out = vec![];
+    let fail = |e: png::EncodingError| {
         warn!("png encoding failed: {e}");
         anyhow::anyhow!("png encoding failed: {e}")
-    })
+    };
+    let mut enc = png::Encoder::new(&mut out, pm.width(), pm.height());
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().map_err(fail)?;
+    w.write_image_data(&rgba).map_err(fail)?;
+    w.finish().map_err(fail)?;
+    Ok(out)
 }
