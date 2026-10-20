@@ -8,27 +8,42 @@ Written 2026-10-18 when moving development from macOS to Windows. Read README.md
 * Vector rendering, rasters (GDAL), WMS/WFS/OGC API: done; 123 of 126 layers of the QGIS
   server test projects within 0.5 % of QGIS Server (`tools/parity.py`).
 * Labels (`src/labeling/`, `src/text.rs`): point placements (over point, around point,
-  ordered positions), data-defined position/rotation, buffers, obstacles, the full PAL
-  solver incl. QGIS's own R-tree (`labeling/rtree.rs`) so ties resolve like QGIS. All label
-  layers of the test projects are 0.00 % on macOS. 7× faster than QGIS with 3 000 labels.
+  ordered positions), line placements (curved, parallel, horizontal; `labeling/line.rs`),
+  merged lines, repeats, duplicate removal, backgrounds, data-defined position/rotation/letter
+  spacing, buffers, obstacles, the full PAL solver incl. QGIS's own R-tree
+  (`labeling/rtree.rs`) and std::sort (`labeling/stdsort.rs`) so ties resolve like QGIS. All
+  label layers of the test projects are 0.00 % on macOS. 7× faster than QGIS with 3 000 labels.
+* Linux font metrics match Qt (FreeType) exactly for the topo fonts (2026-10-19, PyQGIS in the
+  tnt-qgis image); `RGIS_FONT_DIRS` points rGIS at another font set, e.g. that image's.
+* Deployment: the source stays here (carsmie/rgis); kartverket/tnt-rgis builds one pinned
+  commit (its `RGIS_COMMIT`) with this repo's Dockerfile (GDAL 3.13 base, tnt-qgis font
+  packages) → ghcr.io/kartverket/tnt-rgis:sha-<commit>, bumps tnt-apps
+  `env/atkv3-dev/topo-main/tnt-rgis-version` and runs Pharos. tnt-apps
+  `applications/tnt-rgis.libsonnet` serves projects from `gs://…/QGS/<variant>/` via
+  `/qgis/QLR/<name>` like tnt-qgis, at tnt-rgis.atkv3-dev.kartverket-intern.cloud; Norgeskart
+  shows it as the "Topo rGIS" theme.
 
 ## Next steps (in order)
 
-1. **Line labels** — port `FeaturePart::createCandidatesAlongLine*` (parallel / line
-   placement, `placementFlags` above/below/on line), then `createHorizontalCandidatesAlongLine`
-   and curved labels (`createCurvedCandidatesAlongLine`, `curvedPlacementAtOffset`,
-   needs per-character metrics). Source: `QGIS/src/core/pal/feature.cpp` 871–2147.
-   Line parts need `PointSet` helpers (`pointset.cpp`: `getPointByDistance`,
-   `extendLineByDistance`, `edgeDistances`) and `addSizePenalty` (already ported).
+1. **Topo (tnt-topo-qlr) parity** — `tools/topo/` compares rGIS with the tnt-qgis image on the
+   Kartverket topo projects (README there). 2026-10-19, Oslo z11–15: place names and road
+   numbers 0.0–0.3 %, street names 0.1–2.6 % (all 23 streets on the same features as QGIS at
+   z14; two still at another candidate — solver, equal-cost neighbours), house numbers 1.4 %.
+   Open: legacy font family names (`Noto Sans Condensed` → index fontconfig-style family
+   names, name ID 1, in `text::resolve_face`), the hint-only near-straight-segments pass
+   (`createCandidatesAlongLineNearStraightSegments`), GetStyles, raster renderers (hillshade,
+   paletted), MarkerLine/HashLine/ShapeburstFill, inline `base64:` SVGs.
+   `tools/topo/qgis_labels.py` dumps QGIS's placed labels (PyQGIS), rGIS logs its own with
+   `RUST_LOG=rgis::labels=debug`; diff those instead of pixels.
 2. **Polygon labels** — `createCandidatesForPolygon` (free/horizontal, `splitPolygons`,
    oriented bbox via `computeConvexHullOrientedBoundingBox`), ring/centroid distance costs
    (TODO in `labeling/pal.rs::finalize_costs`), `createCandidatesOutsidePolygon`,
    `GeomFunction::reorderPolygon` (convex hull order), proper `GEOSPointOnSurface`.
-3. Test projects to verify with: find layers with `placement="2|3|4|5|7|8"` in
-   `QGIS/tests/testdata/qgis_server/*.qgs`; if none, make copies of a line/polygon project
+3. Test projects to verify with: find layers with `placement="5|7|8"` in
+   `QGIS/tests/testdata/qgis_server/*.qgs`; if none, make copies of a polygon project
    with labels enabled (see `make_rect_project.py` idea below).
-4. Label extras: line wrapping (`autoWrapLength`, `QgsStringUtils::wordWrap`), backgrounds,
-   shadows, callouts, `formatNumbers`, more data-defined properties (font, buffer).
+4. Label extras: line wrapping (`autoWrapLength`, `QgsStringUtils::wordWrap`), shadows,
+   callouts, `formatNumbers`, more data-defined properties (font, buffer).
 5. Stretched GetMap (BBOX aspect ≠ WIDTH/HEIGHT): Qt `SmoothTransformation` area averaging
    instead of bilinear (`render::scale`); explains the remaining 0.77 % / 0.87 % layers.
 6. Housekeeping: add a LICENSE (should be GPL-2.0-or-later — PAL/QGIS code is ported);

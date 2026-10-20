@@ -68,8 +68,14 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
   layer variables; opaque layer-tree groups; several layers sharing one WMS name.
   The XML is parsed once at load into typed structures; requests never touch XML (QGIS
   Server, by contrast, keeps a parsed DOM per project in `QgsConfigCache`).
-* Vector data: OGR provider with FlatGeobuf (local or `/vsicurl/` HTTP range requests, spatial
-  index used), GeoPackage (R-tree used, `subset=` filters), Shapefile, GeoJSON, CSV (WKT).
+* Vector data: OGR provider with FlatGeobuf (local, `/vsicurl/` HTTP range requests, or
+  `/vsigs/` on Google Cloud Storage signed with GDAL's `GS_ACCESS_KEY_ID`/`GS_SECRET_ACCESS_KEY`
+  HMAC keys; spatial index used), GeoPackage (R-tree used), Shapefile, GeoJSON, CSV (WKT);
+  `subset=` filters on all of them; OGR's exact rectangle filter.
+* Projects can live on GCS too: `MAP=/vsigs/bucket/key.qgs` (cached for
+  `RGIS_REMOTE_PROJECT_TTL` seconds), and with `--projects-dir` the tnt-qgis URL scheme
+  `/qgis/QLR/<name>` serves `<projects-dir><name>.qgs`. `GET /health` for probes; CORS headers
+  as the tnt-qgis front sets them.
 * Raster data (feature `raster`, on by default): GDAL provider — single-band gray and multiband
   colour renderers with contrast enhancement, transparency, alpha bands, reprojection and
   warped VRTs, ported from QGIS's raster pipeline.
@@ -78,12 +84,18 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
   EllipseMarker, SvgMarker (QGIS SVG search paths, `param()` substitution), LinePatternFill;
   data-defined properties (static, field, expression); render-time simplification and
   clipping exactly as QGIS does; layer opacity; scale-based layer visibility.
-* Labels: simple and rule-based labeling for point layers (and polygon centroids) with
-  over-point, around-point and ordered-position placement; fixed (data-defined) positions and
-  rotation; text buffers; obstacles; PAL's candidate costs, conflict graph and FALP + chain
-  search, ported from QGIS so the same labels win. Text is laid out with Qt's numbers: font
-  metrics in 26.6 fixed point, HarfBuzz kerning and `trak` tracking as Qt applies them, Qt 6
-  weight semantics. QGIS Server's bundled "QGIS Vera Sans" fonts are built in.
+* Labels: simple and rule-based labeling for points (and polygon centroids) with over-point,
+  around-point and ordered-position placement, and for lines with curved, parallel and
+  horizontal placement (strict and hint-only line anchors, above/below/on line, map
+  orientation, overrun, upside-down flipping, per-grapheme curved layout); merged connected
+  lines and repeat distances; duplicate removal (minimum distance between same-text labels);
+  rectangle/square/ellipse/circle backgrounds; data-defined letter spacing; fixed positions
+  and rotation; text buffers; obstacles; PAL's candidate costs, conflict graph and FALP + chain
+  search (with libstdc++'s std::sort so equal costs tie the same way), ported from QGIS so the
+  same labels win. Text is laid out with Qt's numbers: font metrics in 26.6 fixed point (Linux:
+  FreeType's linear advances and Qt 6's OS/2 ascent/descent, verified against a Linux QGIS
+  Server), HarfBuzz kerning and `trak` tracking as Qt applies them, Qt 6 weight semantics.
+  QGIS Server's bundled "QGIS Vera Sans" fonts are built in.
 * Expressions: comparisons, `AND/OR/NOT`, `IN`, `IS [NOT] NULL`, `LIKE/ILIKE`, arithmetic, `||`,
   `lower/upper/length/coalesce/to_int/to_real/round/concat/…`.
 * WMS: GetCapabilities (1.3.0 & 1.1.1), GetMap (PNG; `LAYERS` with groups, `CRS`/`SRS`,
@@ -156,10 +168,12 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 
 ## Limitations
 
-* Labels: line and curved placements, free/horizontal polygon placement, outside-polygon
-  placement, callouts, backgrounds, shadows, HTML text, line wrapping and label masks are not
-  ported yet. Text metrics follow Qt's CoreText engine on macOS (verified glyph by glyph) and
-  its FreeType engine elsewhere (not yet verified against a Linux QGIS Server). When a
+* Labels: free/horizontal polygon placement, outside-polygon placement, the near-straight-
+  segment pass of hint-only parallel line labels, curved stretch/vertex modes, word spacing,
+  SVG/marker backgrounds, callouts, shadows, HTML text, line wrapping and label masks are not
+  ported yet. Fonts are matched by fontdb's (typographic) family names, so legacy families such
+  as "Noto Sans Condensed" fall back instead of resolving like fontconfig. Text metrics follow
+  Qt's CoreText engine on macOS (verified glyph by glyph) and its FreeType engine on Linux. When a
   project's font is missing on macOS, Qt falls back to the variable system font, whose
   CoreText advances rGIS reproduces to within 1/64 px but not always exactly; with thousands
   of touching labels this can change which of two equally good labels wins.
