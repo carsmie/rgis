@@ -294,15 +294,18 @@ impl Server {
                 e.to_response(version)
             }
         };
+        // One logfmt-style line per request (Loki: `| logfmt | unwrap ms` for percentiles).
         info!(
-            "{} {}?{} -> {} {} ({} bytes) in {:?}",
-            req.method,
-            req.path,
-            req.query,
-            resp.status,
-            resp.content_type,
-            resp.body.len(),
-            started.elapsed()
+            method = %req.method,
+            path = %req.path,
+            service = %service,
+            request = %params.get("REQUEST").unwrap_or(""),
+            status = resp.status,
+            r#type = %resp.content_type.split(';').next().unwrap_or(""),
+            bytes = resp.body.len(),
+            ms = (started.elapsed().as_secs_f64() * 1e4).round() / 10.0,
+            query = %req.query,
+            "request"
         );
         resp
     }
