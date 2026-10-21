@@ -2,3 +2,5 @@
 /.git
 /.claude
 /evidence
+# local test data (GBs): never part of the image
+/out
