@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -90,19 +90,35 @@ pub struct MapLayer {
     /// Labeling rules (one for simple labeling), empty when labels are disabled.
     pub labeling: Vec<crate::labeling::settings::LabelingRule>,
     pub base_dir: PathBuf,
-    provider: OnceLock<std::result::Result<Arc<Provider>, String>>,
+    /// The opened data provider, or why it failed and when (retried after PROVIDER_RETRY).
+    provider: parking_lot::Mutex<Option<OpenedProvider>>,
 }
+
+/// When a layer's provider was opened, and the provider or why opening failed.
+type OpenedProvider = (std::time::Instant, std::result::Result<Arc<Provider>, String>);
+
+/// A failed open (database or network briefly unreachable, an egress rule not active yet)
+/// is retried after this, instead of the layer staying invalid for the life of the process.
+const PROVIDER_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl MapLayer {
     pub fn provider(&self) -> Result<Arc<Provider>> {
-        self.provider
-            .get_or_init(|| {
-                Provider::open(&self.base_dir, &self.provider_key, &self.datasource)
-                    .map(Arc::new)
-                    .map_err(|e| format!("{e:#}"))
-            })
-            .clone()
-            .map_err(|e| anyhow!("layer '{}' is invalid: {e}", self.name))
+        // Held while opening: concurrent requests wait for one attempt instead of each
+        // opening (or failing to open) the same source.
+        let mut slot = self.provider.lock();
+        let stale = match slot.as_ref() {
+            Some((_, Ok(_))) => false,
+            Some((at, Err(_))) => at.elapsed() >= PROVIDER_RETRY,
+            None => true,
+        };
+        if stale {
+            let opened = Provider::open(&self.base_dir, &self.provider_key, &self.datasource)
+                .map(Arc::new)
+                .map_err(|e| format!("{e:#}"));
+            *slot = Some((std::time::Instant::now(), opened));
+        }
+        let (_, opened) = slot.as_ref().expect("set above");
+        opened.clone().map_err(|e| anyhow!("layer '{}' is invalid: {e}", self.name))
     }
 
     pub fn crs(&self) -> Crs {
@@ -345,7 +361,7 @@ fn parse_layer(ml: Node, base_dir: &Path) -> MapLayer {
         raster_style: crate::raster::parse_style(ml),
         labeling: crate::labeling::settings::parse_labeling(ml),
         base_dir: base_dir.to_path_buf(),
-        provider: OnceLock::new(),
+        provider: Default::default(),
     }
 }
 
