@@ -214,6 +214,36 @@ fn ignore_rendering_errors() -> bool {
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
+/// fill_path that skips zero-area paths (horizontal/vertical lines, collapsed slivers):
+/// tiny-skia refuses them with a warning per call (thousands per hour), QGIS paints
+/// nothing for them either.
+pub trait FillNonEmpty {
+    fn fill_nonempty(
+        &mut self,
+        path: &tiny_skia::Path,
+        paint: &tiny_skia::Paint,
+        rule: tiny_skia::FillRule,
+        t: tiny_skia::Transform,
+        mask: Option<&tiny_skia::Mask>,
+    );
+}
+
+impl FillNonEmpty for Pixmap {
+    fn fill_nonempty(
+        &mut self,
+        path: &tiny_skia::Path,
+        paint: &tiny_skia::Paint,
+        rule: tiny_skia::FillRule,
+        t: tiny_skia::Transform,
+        mask: Option<&tiny_skia::Mask>,
+    ) {
+        let b = path.bounds();
+        if b.width() > 0.0 && b.height() > 0.0 {
+            self.fill_path(path, paint, rule, t, mask);
+        }
+    }
+}
+
 /// Bounds the pixels being rendered at once. Each request's working set (output, per-layer
 /// scratch pixmaps, PNG buffer) scales with its pixel count, and spawn_blocking alone would
 /// run hundreds of renders in parallel (QGIS Server is bounded by its worker count instead).
@@ -260,6 +290,19 @@ pub fn render_permit(width: u32, height: u32) -> RenderPermit {
     RenderPermit(need)
 }
 
+/// An ignored rendering error, logged once per distinct message (an unsupported layer
+/// fails identically on every request), then only at debug level.
+fn warn_ignored(e: &anyhow::Error) {
+    static SEEN: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    let msg = format!("{e:#}");
+    if SEEN.lock().insert(msg.clone()) {
+        warn!("Rendering error: {msg} (ignored; repeats logged at debug level)");
+    } else {
+        debug!("Rendering error: {msg} (ignored)");
+    }
+}
+
 /// Render layers bottom-to-top into a new pixmap.
 pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
     let mut pm =
@@ -281,7 +324,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
         if l.kind == "raster" {
             if let Err(e) = render_raster(&mut pm, l, ms) {
                 if ignore_rendering_errors() {
-                    warn!("Rendering error: {e:#} (ignored)");
+                    warn_ignored(&e);
                 } else {
                     return Err(e);
                 }
@@ -298,7 +341,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             Ok(f) => f,
             // QgsServerSettings::ignoreRenderingErrors
             Err(e) if ignore_rendering_errors() => {
-                warn!("Rendering error: {e:#} (ignored)");
+                warn_ignored(&e);
                 continue;
             }
             Err(e) => return Err(e),
@@ -605,7 +648,7 @@ pub fn draw_symbol(
                             SkTransform::identity(),
                         );
                     }
-                    pm.fill_path(
+                    pm.fill_nonempty(
                         &path,
                         &fill,
                         FillRule::EvenOdd,
@@ -668,7 +711,7 @@ pub fn draw_symbol(
                             ),
                             ..Default::default()
                         };
-                        pm.fill_path(
+                        pm.fill_nonempty(
                             &path,
                             &fill,
                             FillRule::EvenOdd,
@@ -952,9 +995,12 @@ fn draw_pattern_lines(
     let Some(mut mask) = tiny_skia::Mask::new(pm.width(), pm.height()) else {
         return;
     };
+    let b = path.bounds();
+    if b.width() <= 0.0 || b.height() <= 0.0 {
+        return;
+    }
     mask.fill_path(path, FillRule::EvenOdd, true, SkTransform::identity());
     let mut layer = Pixmap::new(pm.width(), pm.height()).expect("same size");
-    let b = path.bounds();
     let (cx, cy) = (
         ((b.left() + b.right()) / 2.0) as f64,
         ((b.top() + b.bottom()) / 2.0) as f64,
@@ -1118,7 +1164,7 @@ fn draw_marker(
         );
         return;
     }
-    pm.fill_path(
+    pm.fill_nonempty(
         &path,
         &paint(color, opacity),
         FillRule::Winding,

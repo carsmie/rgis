@@ -15,6 +15,7 @@
 //! names on every tile) cost no shaping or outline decoding.
 
 use std::collections::HashMap;
+use crate::render::FillNonEmpty;
 use std::sync::{Arc, LazyLock};
 
 use harfrust::{ShapeOptions, ShaperData, UnicodeBuffer};
@@ -683,10 +684,10 @@ fn color_paint(c: Rgba, alpha: f64) -> Paint<'static> {
 pub fn draw_buffer(pm: &mut Pixmap, doc: &LabelDocument, path: &tiny_skia::Path, origin: (f64, f64), rotation: f64, align: HAlign, b: &Buffer) {
     let paint = color_paint(b.color, b.opacity);
     if b.fill_interior {
-        pm.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_nonempty(path, &paint, FillRule::Winding, Transform::identity(), None);
     }
     if let Some(outline) = doc.buffer_path(origin, rotation, align, &b.stroke()) {
-        pm.fill_path(&outline, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_nonempty(&outline, &paint, FillRule::Winding, Transform::identity(), None);
     }
 }
 
@@ -700,7 +701,7 @@ impl Buffer {
 /// Text pass: the outline filled (Qt::WindingFill) with the text colour at the format opacity.
 pub fn draw_text(pm: &mut Pixmap, path: &tiny_skia::Path, color: Rgba, opacity: f64) {
     let paint = color_paint(color, opacity);
-    pm.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+    pm.fill_nonempty(path, &paint, FillRule::Winding, Transform::identity(), None);
 }
 
 #[cfg(test)]

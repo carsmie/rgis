@@ -15,6 +15,7 @@ mod shape;
 mod stdsort;
 
 use std::f64::consts::PI;
+use crate::render::FillNonEmpty;
 use geo_types::{Coord, Geometry};
 use serde_json::{json, Value};
 use tiny_skia::Pixmap;
@@ -621,7 +622,7 @@ impl Engine {
                     };
                     let mut paint = tiny_skia::Paint::default();
                     paint.set_color_rgba8(fill.0, fill.1, fill.2, fill.3);
-                    pm.fill_path(&path, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                    pm.fill_nonempty(&path, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
                     paint.set_color_rgba8(stroke.0, stroke.1, stroke.2, stroke.3);
                     pm.stroke_path(&path, &paint, &tiny_skia::Stroke::default(), tiny_skia::Transform::identity(), None);
                 }
