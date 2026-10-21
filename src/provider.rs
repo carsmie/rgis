@@ -220,7 +220,7 @@ impl Provider {
                 None,
             ),
             Kind::Fgb(FgbSource::Http(f)) => {
-                let prefetch = |ranges: &[(u64, u64)]| f.prefetch(ranges);
+                let prefetch = |ranges: &[(u64, u64)], starts: &[u64]| f.prefetch_features(ranges, starts);
                 fgb_features(HttpReader::new(f.clone()), bbox_filter, &self.fields, keep, Some(&prefetch))
             }
             Kind::Gpkg(g) => gpkg_features(g, &self.fields, bbox_filter),
@@ -319,8 +319,86 @@ fn fgb_header<R: Read>(r: &mut R) -> Result<(Vec<Field>, Option<Rect>)> {
     Ok((fields, extent))
 }
 
-/// Fetches byte ranges of a remote file ahead of reading them.
-type Prefetch<'a> = dyn Fn(&[(u64, u64)]) + 'a;
+/// PackedRTree::stream_search (same breadth-first order, so the same hit list), except that
+/// each level's nodes are prefetched in one parallel round first: the crate reads node by
+/// node, one request per index block it reaches. `r` is at the start of the index.
+fn index_search<R: Read + Seek>(
+    r: &mut R,
+    num_items: usize,
+    node_size: u16,
+    b: &Rect,
+    prefetch: Option<&Prefetch>,
+) -> Result<Vec<flatgeobuf::packed_r_tree::SearchResultItem>> {
+    const ITEM: u64 = 40; // min_x, min_y, max_x, max_y: f64; offset: u64
+    let ns = node_size as usize;
+    // generate_level_bounds: node ranges per level, leaves first (stored root first); at
+    // least one level above the leaves, even for a single feature.
+    let mut sizes = vec![num_items];
+    loop {
+        let n = sizes.last().expect("non-empty").div_ceil(ns);
+        sizes.push(n);
+        if n == 1 {
+            break;
+        }
+    }
+    let num_nodes: usize = sizes.iter().sum();
+    let mut levels = Vec::with_capacity(sizes.len());
+    let mut end = num_nodes;
+    for n in &sizes {
+        levels.push(end - n..end);
+        end -= n;
+    }
+    let base = r.stream_position()?;
+    let leaf_start = levels[0].start;
+    let mut nodes = vec![0usize]; // first item of each node to visit on this level
+    let mut hits = vec![];
+    let mut buf = vec![];
+    for level in (0..levels.len()).rev() {
+        let span = |n: usize| (n, (n + ns).min(levels[level].end));
+        if let Some(prefetch) = prefetch {
+            let mut ranges: Vec<(u64, u64)> = vec![];
+            for &n in &nodes {
+                let (a, z) = span(n);
+                let (a, z) = (base + a as u64 * ITEM, base + z as u64 * ITEM - 1);
+                match ranges.last_mut() {
+                    Some(last) if a <= last.1 + 1 => last.1 = z,
+                    _ => ranges.push((a, z)),
+                }
+            }
+            prefetch(&ranges, &[]);
+        }
+        let mut next = vec![];
+        for &n in &nodes {
+            let (a, z) = span(n);
+            buf.resize((z - a) * ITEM as usize, 0);
+            r.seek(SeekFrom::Start(base + a as u64 * ITEM))?;
+            r.read_exact(&mut buf)?;
+            for (i, item) in buf.as_chunks::<{ ITEM as usize }>().0.iter().enumerate() {
+                let f = |k: usize| f64::from_le_bytes(item[k * 8..k * 8 + 8].try_into().expect("8 bytes"));
+                // NodeItem::intersects (inclusive)
+                if f(2) < b.xmin || f(3) < b.ymin || f(0) > b.xmax || f(1) > b.ymax {
+                    continue;
+                }
+                let offset = u64::from_le_bytes(item[32..40].try_into().expect("8 bytes")) as usize;
+                if level == 0 {
+                    hits.push(flatgeobuf::packed_r_tree::SearchResultItem { offset, index: a + i - leaf_start });
+                } else {
+                    next.push(offset);
+                }
+            }
+        }
+        nodes = next;
+        if nodes.is_empty() {
+            break;
+        }
+    }
+    r.seek(SeekFrom::Start(base + num_nodes as u64 * ITEM))?;
+    Ok(hits)
+}
+
+/// Fetches byte ranges (inclusive) of a remote file ahead of reading them, given the
+/// offsets where the selected features start.
+type Prefetch<'a> = dyn Fn(&[(u64, u64)], &[u64]) + 'a;
 
 fn memory_extent(all: &[(Rect, Feature)]) -> Option<Rect> {
     let mut e = Rect::empty();
@@ -365,15 +443,7 @@ fn fgb_features<R: Read + Seek>(
             // ourselves to learn feature numbers (= OGR FIDs), then stream the same
             // selection through FgbReader::select_bbox (identical, offset-ordered list).
             let header_end = r.stream_position()?;
-            let hits = PackedRTree::stream_search(
-                &mut r,
-                count,
-                PackedRTree::DEFAULT_NODE_SIZE,
-                b.xmin,
-                b.ymin,
-                b.xmax,
-                b.ymax,
-            )?;
+            let hits = index_search(&mut r, count, PackedRTree::DEFAULT_NODE_SIZE, &b, prefetch)?;
             // Remote files: the index says where every selected feature is, so fetch those
             // bytes in parallel up front instead of one range request at a time while decoding.
             if let Some(prefetch) = prefetch
@@ -383,7 +453,9 @@ fn fgb_features<R: Read + Seek>(
                 // A feature's size is only in its own prefix: allow 64 KB after the last one of
                 // a run; consecutive hits less than 256 KB apart share a run.
                 const TAIL: u64 = 64 * 1024;
-                let mut ranges: Vec<(u64, u64)> = vec![];
+                // select_bbox reads at the start of the feature data before seeking to the
+                // hits: fetch that block in the same round instead of one after.
+                let mut ranges: Vec<(u64, u64)> = vec![(data_start, data_start)];
                 for h in &hits {
                     let start = data_start + h.offset as u64;
                     match ranges.last_mut() {
@@ -391,7 +463,8 @@ fn fgb_features<R: Read + Seek>(
                         _ => ranges.push((start, start + TAIL)),
                     }
                 }
-                prefetch(&ranges);
+                let starts: Vec<u64> = hits.iter().map(|h| data_start + h.offset as u64).collect();
+                prefetch(&ranges, &starts);
             }
             r.seek(SeekFrom::Start(0))?;
             let mut it = FgbReader::open(&mut r)?.select_bbox(b.xmin, b.ymin, b.xmax, b.ymax)?;
@@ -429,13 +502,63 @@ const BLOCK: u64 = 256 * 1024;
 /// Largest read-ahead: 16 blocks = 4 MB per request.
 const MAX_READAHEAD_BLOCKS: u64 = 16;
 
-/// Blocks of all remote files, evicted oldest-first beyond RGIS_HTTP_CACHE_MB (default 256).
-/// One budget for the process: a per-file cap grows with the number of files opened.
+/// Blocks of all remote files beyond RGIS_HTTP_CACHE_MB (default 256) evicted least
+/// recently used first. One budget for the process: a per-file cap grows with the number
+/// of files opened.
 struct BlockCache {
-    blocks: HashMap<(u64, u64), Arc<Vec<u8>>>,
-    order: std::collections::VecDeque<(u64, u64)>,
+    /// Block → (data, stamp of its newest entry in `order`).
+    blocks: HashMap<(u64, u64), (Arc<Vec<u8>>, u64)>,
+    /// Eviction queue; entries whose stamp is no longer the block's are stale and skipped.
+    order: std::collections::VecDeque<((u64, u64), u64)>,
+    tick: u64,
     bytes: usize,
     budget: usize,
+}
+
+impl BlockCache {
+    /// A cached block. Hits re-queue it once it has aged a quarter of the cache (second
+    /// chance, without a queue push per read): FIFO evicted every file's FlatGeobuf root
+    /// index blocks first — they are read first — though every request reads them.
+    fn get(&mut self, key: (u64, u64)) -> Option<Arc<Vec<u8>>> {
+        let refresh_after = (self.budget as u64 / BLOCK / 4).max(1);
+        let tick = self.tick;
+        let (data, stamp) = self.blocks.get_mut(&key)?;
+        let data = data.clone();
+        if *stamp + refresh_after < tick {
+            *stamp = tick + 1;
+            self.tick += 1;
+            self.order.push_back((key, tick + 1));
+            // Below budget nothing pops stale entries: drop them once they dominate.
+            if self.order.len() > 2 * self.blocks.len() + 1024 {
+                let blocks = &self.blocks;
+                self.order.retain(|(k, st)| blocks.get(k).is_some_and(|(_, s)| s == st));
+            }
+        }
+        Some(data)
+    }
+
+    fn contains(&self, key: (u64, u64)) -> bool {
+        self.blocks.contains_key(&key)
+    }
+
+    /// Store a block (kept as is when already cached), then evict down to the budget.
+    fn insert(&mut self, key: (u64, u64), data: Arc<Vec<u8>>) {
+        if self.blocks.contains_key(&key) {
+            return;
+        }
+        self.tick += 1;
+        self.bytes += data.len();
+        self.blocks.insert(key, (data, self.tick));
+        self.order.push_back((key, self.tick));
+        while self.bytes > self.budget {
+            let Some((k, stamp)) = self.order.pop_front() else { break };
+            if self.blocks.get(&k).is_some_and(|(_, s)| *s == stamp)
+                && let Some((b, _)) = self.blocks.remove(&k)
+            {
+                self.bytes -= b.len();
+            }
+        }
+    }
 }
 
 static BLOCK_CACHE: LazyLock<Mutex<BlockCache>> = LazyLock::new(|| {
@@ -446,6 +569,7 @@ static BLOCK_CACHE: LazyLock<Mutex<BlockCache>> = LazyLock::new(|| {
     Mutex::new(BlockCache {
         blocks: HashMap::new(),
         order: Default::default(),
+        tick: 0,
         bytes: 0,
         budget: mb << 20,
     })
@@ -596,6 +720,29 @@ impl HttpFile {
     /// Fetch the blocks covering `ranges` that are not cached yet: consecutive missing
     /// blocks in one request (up to MAX_READAHEAD_BLOCKS), at most 8 requests at a time.
     /// Best effort — a failed run is left to the on-demand read.
+    /// Prefetch FlatGeobuf features at `starts` (byte offsets) through `ranges` that guess
+    /// their ends, then the rest of any feature longer than its guess — its size prefix is
+    /// cached by then — in one more parallel round instead of a miss each while decoding.
+    fn prefetch_features(&self, ranges: &[(u64, u64)], starts: &[u64]) {
+        self.prefetch(ranges);
+        let tails: Vec<(u64, u64)> = {
+            let mut c = BLOCK_CACHE.lock();
+            starts
+                .iter()
+                .filter_map(|&at| {
+                    let mut size = [0u8; 4];
+                    for (i, b) in size.iter_mut().enumerate() {
+                        let p = at + i as u64;
+                        *b = *c.get((self.id, p / BLOCK))?.get((p % BLOCK) as usize)?;
+                    }
+                    let end = at + 4 + u32::from_le_bytes(size) as u64 - 1;
+                    Some((at, end.min(self.len.max(1) - 1)))
+                })
+                .collect()
+        };
+        self.prefetch(&tails);
+    }
+
     fn prefetch(&self, ranges: &[(u64, u64)]) {
         let last_block = (self.len.max(1) - 1) / BLOCK;
         let mut runs: Vec<(u64, u64)> = vec![]; // (first block, count)
@@ -604,7 +751,7 @@ impl HttpFile {
             let mut wanted: Vec<u64> = ranges
                 .iter()
                 .flat_map(|&(a, b)| (a / BLOCK)..=(b.min(self.len.max(1) - 1) / BLOCK).min(last_block))
-                .filter(|n| !cache.blocks.contains_key(&(self.id, *n)))
+                .filter(|n| !cache.contains((self.id, *n)))
                 .collect();
             wanted.sort_unstable();
             wanted.dedup();
@@ -652,26 +799,15 @@ impl HttpFile {
         let mut c = BLOCK_CACHE.lock();
         for (first, data) in fetched {
             for (i, chunk) in data.chunks(BLOCK as usize).enumerate() {
-                let key = (self.id, first + i as u64);
-                let chunk = Arc::new(chunk.to_vec());
-                if c.blocks.insert(key, chunk.clone()).is_none() {
-                    c.bytes += chunk.len();
-                    c.order.push_back(key);
-                }
-            }
-        }
-        while c.bytes > c.budget {
-            let Some(k) = c.order.pop_front() else { break };
-            if let Some(b) = c.blocks.remove(&k) {
-                c.bytes -= b.len();
+                c.insert((self.id, first + i as u64), Arc::new(chunk.to_vec()));
             }
         }
         debug!("vsicurl: prefetched {n_runs} range(s) of {} in {:?}", self.url, started.elapsed());
     }
 
     fn block(&self, n: u64) -> Result<Arc<Vec<u8>>> {
-        if let Some(b) = BLOCK_CACHE.lock().blocks.get(&(self.id, n)) {
-            return Ok(b.clone());
+        if let Some(b) = BLOCK_CACHE.lock().get((self.id, n)) {
+            return Ok(b);
         }
         // A miss right after the previous fetch is a sequential scan (FlatGeobuf features
         // in a bbox are contiguous): double the blocks per request up to 4 MB, as GDAL's
@@ -686,7 +822,7 @@ impl HttpFile {
         let mut count = 1;
         {
             let cache = BLOCK_CACHE.lock();
-            while count < window && n + count <= last_block && !cache.blocks.contains_key(&(self.id, n + count)) {
+            while count < window && n + count <= last_block && !cache.contains((self.id, n + count)) {
                 count += 1;
             }
         }
@@ -710,17 +846,7 @@ impl HttpFile {
             if i == 0 {
                 first = Some(chunk.clone());
             }
-            let key = (self.id, n + i as u64);
-            if c.blocks.insert(key, chunk.clone()).is_none() {
-                c.bytes += chunk.len();
-                c.order.push_back(key);
-            }
-        }
-        while c.bytes > c.budget {
-            let Some(k) = c.order.pop_front() else { break };
-            if let Some(b) = c.blocks.remove(&k) {
-                c.bytes -= b.len();
-            }
+            c.insert((self.id, n + i as u64), chunk);
         }
         first.ok_or_else(|| anyhow!("empty range response for {}", self.url))
     }
@@ -732,9 +858,9 @@ impl Drop for HttpFile {
         let mut c = BLOCK_CACHE.lock();
         let c = &mut *c;
         let id = self.id;
-        c.order.retain(|k| k.0 != id);
+        c.order.retain(|(k, _)| k.0 != id);
         let mut freed = 0;
-        c.blocks.retain(|k, b| {
+        c.blocks.retain(|k, (b, _)| {
             let keep = k.0 != id;
             if !keep {
                 freed += b.len();
@@ -1251,6 +1377,30 @@ fn open_geojson(path: &Path) -> Result<Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_search_matches_stream_search() {
+        for name in ["countries", "boundaries", "lakes"] {
+            let path = format!("{}/demo/natural_earth/{name}.fgb", env!("CARGO_MANIFEST_DIR"));
+            let mut r = BufReader::new(std::fs::File::open(&path).unwrap());
+            let count = FgbReader::open(&mut r).unwrap().header().features_count() as usize;
+            let start = r.stream_position().unwrap();
+            for i in 0..12 {
+                for j in 0..6 {
+                    let (x, y, w) = (-180.0 + 30.0 * i as f64, -90.0 + 30.0 * j as f64, 7.0 + (i * j) as f64);
+                    let b = Rect::new(x, y, x + w, y + w);
+                    r.seek(SeekFrom::Start(start)).unwrap();
+                    let ours = index_search(&mut r, count, PackedRTree::DEFAULT_NODE_SIZE, &b, None).unwrap();
+                    let ours_end = r.stream_position().unwrap();
+                    r.seek(SeekFrom::Start(start)).unwrap();
+                    let theirs = PackedRTree::stream_search(&mut r, count, PackedRTree::DEFAULT_NODE_SIZE, b.xmin, b.ymin, b.xmax, b.ymax).unwrap();
+                    let pairs = |v: &[flatgeobuf::packed_r_tree::SearchResultItem]| v.iter().map(|h| (h.offset, h.index)).collect::<Vec<_>>();
+                    assert_eq!(pairs(&ours), pairs(&theirs), "{name} {b:?}");
+                    assert_eq!(ours_end, r.stream_position().unwrap());
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_csv_records() {

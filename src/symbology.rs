@@ -139,6 +139,16 @@ pub enum SymbolLayer {
     SimpleLine {
         stroke: Stroke,
     },
+    /// QgsShapeburstFillSymbolLayer with its two-colour gradient: colour by distance from the
+    /// polygon boundary (color1 at the edge, color2 at `max_distance` or the shape's centre).
+    ShapeburstFill {
+        color1: Rgba,
+        color2: Rgba,
+        /// None = use_whole_shape.
+        max_distance: Option<Size>,
+        ignore_rings: bool,
+        offset: (Size, Size),
+    },
     /// Parallel lines drawn with a line sub-symbol (QgsLinePatternFillSymbolLayer).
     LinePatternFill {
         /// Line angle in degrees, counter-clockwise from horizontal.
@@ -177,6 +187,8 @@ pub enum SymbolLayer {
         on_last: bool,
         /// place_on_every_part; false = first vertex of the first part, last of the last.
         every_part: bool,
+        /// Perpendicular offset of the line the symbols follow (positive = left).
+        offset: Size,
         interval: Size,
         offset_along: Size,
         /// average_angle_length (the angle is averaged over ± half of it).
@@ -185,6 +197,21 @@ pub enum SymbolLayer {
         /// Some((hash_length, hash_angle)) for HashLine.
         hash: Option<(Size, f64)>,
         sub: Box<Symbol>,
+    },
+    /// QgsFontMarkerSymbolLayer: one character of a font (Kartverket's map-symbol font
+    /// Skjermkartografi in the topo projects).
+    FontMarker {
+        font: String,
+        style: String,
+        chr: String,
+        size: Size,
+        color: Rgba,
+        stroke: Stroke,
+        /// Clockwise rotation in degrees.
+        angle: f64,
+        offset: (Size, Size),
+        /// (horizontal, vertical) anchor point: 0 left/top, 1 centre, 2 right/bottom.
+        anchor: (u8, u8),
     },
     /// SimpleMarker (width = height = size) and EllipseMarker (symbol_width × symbol_height).
     Marker {
@@ -209,6 +236,74 @@ pub enum SymbolLayer {
 pub struct Layer {
     pub kind: SymbolLayer,
     pub dd: HashMap<String, Expr>,
+    /// Enabled paint effects (QgsEffectStack) in stack order; empty draws the layer as is.
+    pub effects: Vec<Effect>,
+}
+
+/// One rendered entry of a symbol layer's QgsEffectStack.
+#[derive(Debug, Clone)]
+pub enum Effect {
+    /// QgsDrawSourceEffect: the layer itself.
+    DrawSource { opacity: f64 },
+    /// QgsDropShadowEffect (outer) / QgsInnerShadowEffect.
+    Shadow { inner: bool, color: Rgba, blur: Size, offset: Size, angle: f64, opacity: f64 },
+    /// QgsOuterGlowEffect with a single colour fading to transparent.
+    OuterGlow { color: Rgba, spread: Size, blur: Size, opacity: f64 },
+}
+
+/// The layer's `effectStack`, or empty when it only draws the source (the common case).
+/// Modifier-only entries (draw_mode 0) and inner glows are not drawn.
+fn parse_effects(layer: Node) -> Vec<Effect> {
+    let Some(stack) = layer.children().find(|c| {
+        c.has_tag_name("effect") && c.attribute("enabled") == Some("1") && c.attribute("type") == Some("effectStack")
+    }) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for e in stack.children().filter(|c| c.has_tag_name("effect")) {
+        let p = props(e);
+        let g = |k: &str| p.get(k).map(|s| s.as_str());
+        if g("enabled") == Some("0") {
+            continue;
+        }
+        let num = |k: &str, d: f64| g(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+        let opacity = num("opacity", 1.0);
+        let ty = e.attribute("type").unwrap_or("");
+        if g("draw_mode") == Some("0") {
+            warn!("paint effect '{ty}' as a modifier only is not supported; skipped");
+            continue;
+        }
+        out.push(match ty {
+            "drawSource" => Effect::DrawSource { opacity },
+            "dropShadow" | "innerShadow" => Effect::Shadow {
+                inner: ty == "innerShadow",
+                color: g("color").and_then(Rgba::parse).unwrap_or(Rgba(0, 0, 0, 255)),
+                blur: Size::new(g("blur_level"), g("blur_unit"), 2.645),
+                offset: Size::new(g("offset_distance"), g("offset_unit"), 2.0),
+                angle: num("offset_angle", 135.0),
+                opacity,
+            },
+            "outerGlow" => {
+                if g("color_type") == Some("1") {
+                    warn!("outer glow colour ramp drawn with its single colour");
+                }
+                Effect::OuterGlow {
+                    color: g("single_color").and_then(Rgba::parse).unwrap_or(Rgba(255, 255, 255, 255)),
+                    spread: Size::new(g("spread"), g("spread_unit"), 2.0),
+                    blur: Size::new(g("blur_level"), g("blur_unit"), 2.645),
+                    opacity,
+                }
+            }
+            other => {
+                warn!("paint effect '{other}' is not supported; skipped");
+                continue;
+            }
+        });
+    }
+    if out.iter().all(|e| matches!(e, Effect::DrawSource { opacity } if *opacity == 1.0)) && out.len() == 1 {
+        return vec![];
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +374,14 @@ impl Layer {
                 // Line layers use strokeColor / strokeWidth for their pen.
                 stroke_dd(stroke);
             }
+            SymbolLayer::ShapeburstFill { color1, color2, .. } => {
+                if let Some(c) = dd_color(dd, "fillColor", ctx) {
+                    *color1 = c;
+                }
+                if let Some(c) = dd_color(dd, "fillColor2", ctx) {
+                    *color2 = c;
+                }
+            }
             SymbolLayer::SvgMarker {
                 size,
                 fill,
@@ -302,6 +405,18 @@ impl Layer {
                 if let Some(w) = dd_num(dd, "strokeWidth", ctx) {
                     stroke_width.value = w;
                 }
+            }
+            SymbolLayer::FontMarker { size, angle, color, stroke, .. } => {
+                if let Some(s) = dd_num(dd, "size", ctx) {
+                    size.value = s;
+                }
+                if let Some(a) = dd_num(dd, "angle", ctx) {
+                    *angle = a;
+                }
+                if let Some(c) = dd_color(dd, "fillColor", ctx) {
+                    *color = c;
+                }
+                stroke_dd(stroke);
             }
             SymbolLayer::TemplatedLine { interval, offset_along, .. } => {
                 if let Some(i) = dd_num(dd, "interval", ctx) {
@@ -580,6 +695,23 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     ),
                 }
             }
+            "ShapeburstFill" => {
+                if g("color_type") == Some("1") {
+                    warn!("ShapeburstFill with a colour ramp drawn with its two colours");
+                }
+                let blur = g("blur_radius").and_then(|v| v.parse().ok()).unwrap_or(0);
+                if blur > 0 {
+                    warn!("ShapeburstFill blur is not supported; drawn without blur");
+                }
+                SymbolLayer::ShapeburstFill {
+                    color1: g("color").and_then(Rgba::parse).unwrap_or(Rgba(0, 0, 255, 255)),
+                    color2: g("gradient_color2").and_then(Rgba::parse).unwrap_or(Rgba(255, 255, 255, 255)),
+                    max_distance: (g("use_whole_shape") != Some("1"))
+                        .then(|| Size::new(g("max_distance"), g("distance_unit"), 5.0)),
+                    ignore_rings: g("ignore_rings") == Some("1"),
+                    offset: offset(),
+                }
+            }
             "SimpleLine" => SymbolLayer::SimpleLine {
                 stroke: stroke(
                     &p,
@@ -645,10 +777,18 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 offset: offset(),
                 anchor,
             },
-            "SimpleMarker" | "FontMarker" => {
-                if class != "SimpleMarker" {
-                    warn!("symbol layer {class} approximated as SimpleMarker");
-                }
+            "FontMarker" => SymbolLayer::FontMarker {
+                font: g("font").unwrap_or("").to_string(),
+                style: g("font_style").unwrap_or("").to_string(),
+                chr: g("chr").unwrap_or("A").to_string(),
+                size: Size::new(g("size"), g("size_unit"), 2.0),
+                color: g("color").and_then(Rgba::parse).unwrap_or(Rgba(255, 0, 0, 255)),
+                stroke: stroke(&p, "outline_color", "outline_width", "outline_width_unit", "outline_style", 0.0),
+                angle,
+                offset: offset(),
+                anchor,
+            },
+            "SimpleMarker" => {
                 let size = Size::new(g("size"), g("size_unit"), 2.0);
                 SymbolLayer::Marker {
                     shape: g("name").unwrap_or("circle").to_string(),
@@ -701,10 +841,10 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 if !unsupported.is_empty() {
                     warn!("{class}: placement {unsupported:?} not supported; those are left out");
                 }
-                // A perpendicular offset needs QGIS's GEOS offset curve; the vertex placements'
-                // offset along the line its renderOffsetVertexAlongLine — neither ported yet.
-                if offset != 0.0 || (along != 0.0 && (has("FirstVertex") || has("LastVertex"))) {
-                    warn!("{class} with an offset is not supported; ignored");
+                // The vertex placements' offset along the line is QGIS's
+                // renderOffsetVertexAlongLine, not ported yet.
+                if along != 0.0 && (has("FirstVertex") || has("LastVertex")) {
+                    warn!("{class} at first/last vertex with an offset along the line is not supported; ignored");
                     continue;
                 }
                 SymbolLayer::TemplatedLine {
@@ -712,6 +852,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     on_first: has("FirstVertex"),
                     on_last: has("LastVertex"),
                     every_part: g("place_on_every_part").is_none_or(|v| v == "true" || v == "1"),
+                    offset: Size::new(Some(&offset.to_string()), g("offset_unit"), 0.0),
                     interval: Size::new(g("interval"), g("interval_unit"), 3.0),
                     offset_along: Size::new(g("offset_along_line"), g("offset_along_line_unit"), 0.0),
                     average_over: Size::new(g("average_angle_length"), g("average_angle_unit"), 4.0),
@@ -733,6 +874,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
         layers.push(Layer {
             kind,
             dd: data_defined(l),
+            effects: parse_effects(l),
         });
     }
     Symbol {

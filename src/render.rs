@@ -15,7 +15,7 @@ use crate::expression::{Attrs, Expr};
 use crate::geom::{self, Rect};
 use crate::project::MapLayer;
 use crate::provider::Feature;
-use crate::symbology::{RenderUnits, Rgba, Stroke, Symbol, SymbolLayer};
+use crate::symbology::{Effect, RenderUnits, Rgba, Size, Stroke, Symbol, SymbolLayer};
 use serde_json::json;
 
 /// OGC reference pixel size (0.28 mm) as used by QgsWmsRenderContext::dotsPerMm.
@@ -322,6 +322,138 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
         .iter()
         .any(|j| !j.layer.labeling.is_empty())
         .then(|| crate::labeling::Engine::new(ms, ms.labeling.clone()));
+    // Vector layers whose features are read, decided up front so their (I/O-bound) reads
+    // can run ahead of drawing: cold remote FlatGeobufs cost a few index round trips each,
+    // which add up layer by layer otherwise (lag06 z11 cold: 4 layers, 3.9 s → ~1.5 s).
+    let reads: Vec<Option<bool>> = jobs
+        .iter()
+        .map(|job| {
+            let l = &job.layer;
+            if !l.visible_at(scale) || l.kind != "vector" {
+                return None;
+            }
+            let labeled = labels
+                .as_ref()
+                .is_some_and(|e| l.labeling.iter().any(|r| e.rule_active(r)));
+            (labeled || l.renderer.active_at(scale)).then_some(labeled)
+        })
+        .collect();
+    let order: Vec<usize> = (0..jobs.len()).filter(|&i| reads[i].is_some()).collect();
+    let ahead = Lookahead::new(order.len());
+    std::thread::scope(|s| {
+        // Loaders take layers in drawing order, at most LOOKAHEAD ahead of the one being
+        // drawn, so memory stays a few layers' features, not the whole map's.
+        for _ in 0..LOOKAHEAD.min(order.len().saturating_sub(1)) {
+            s.spawn(|| {
+                while let Some(k) = ahead.next_job() {
+                    let job = &jobs[order[k]];
+                    let labeled = reads[order[k]].unwrap_or(false);
+                    ahead.put(k, features_for_drawing(&job.layer, ms, job.filter.as_ref(), labeled));
+                }
+            });
+        }
+        // Cancel on every exit (errors, panics) so waiting loaders end and the scope joins.
+        struct Cancel<'a>(&'a Lookahead);
+        impl Drop for Cancel<'_> {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _cancel = Cancel(&ahead);
+        render_layers(&mut pm, jobs, ms, scale, &mut labels, &reads, &order, &ahead)
+    })?;
+    if let Some(engine) = labels.filter(|e| e.has_layers()) {
+        let started = std::time::Instant::now();
+        engine.draw(&mut pm);
+        debug!("labeling took {:?}", started.elapsed());
+    }
+    Ok(pm)
+}
+
+const LOOKAHEAD: usize = 4;
+
+/// Feature reads handed from loader threads to the drawing loop, in drawing order.
+struct Lookahead {
+    state: parking_lot::Mutex<LookaheadState>,
+    ready: parking_lot::Condvar,
+}
+
+struct LookaheadState {
+    slots: Vec<Option<Result<Vec<Prepared>>>>,
+    next: usize,
+    drawn: usize,
+    cancelled: bool,
+}
+
+impl Lookahead {
+    fn new(n: usize) -> Self {
+        Lookahead {
+            state: parking_lot::Mutex::new(LookaheadState {
+                slots: (0..n).map(|_| None).collect(),
+                next: 0,
+                drawn: 0,
+                cancelled: false,
+            }),
+            ready: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// The next read for a loader, waiting while it would run too far ahead.
+    fn next_job(&self) -> Option<usize> {
+        let mut st = self.state.lock();
+        loop {
+            if st.cancelled || st.next >= st.slots.len() {
+                return None;
+            }
+            if st.next < st.drawn + LOOKAHEAD + 1 {
+                st.next += 1;
+                return Some(st.next - 1);
+            }
+            self.ready.wait(&mut st);
+        }
+    }
+
+    fn put(&self, k: usize, r: Result<Vec<Prepared>>) {
+        self.state.lock().slots[k] = Some(r);
+        self.ready.notify_all();
+    }
+
+    /// Read `k` (in order): taken from a loader, or read here when none has claimed it.
+    fn take(&self, k: usize, read: impl FnOnce() -> Result<Vec<Prepared>>) -> Result<Vec<Prepared>> {
+        let mut st = self.state.lock();
+        st.drawn = k;
+        self.ready.notify_all();
+        if st.next <= k {
+            st.next = k + 1;
+            drop(st);
+            return read();
+        }
+        loop {
+            if let Some(r) = st.slots[k].take() {
+                return r;
+            }
+            self.ready.wait(&mut st);
+        }
+    }
+
+    fn cancel(&self) {
+        self.state.lock().cancelled = true;
+        self.ready.notify_all();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_layers(
+    pm: &mut Pixmap,
+    jobs: &[LayerJob],
+    ms: &MapSettings,
+    scale: f64,
+    labels: &mut Option<crate::labeling::Engine>,
+    reads: &[Option<bool>],
+    read_order: &[usize],
+    ahead: &Lookahead,
+) -> Result<()> {
+    let mut k = 0;
     for (order, job) in jobs.iter().enumerate() {
         let l = &job.layer;
         if !l.visible_at(scale) {
@@ -329,7 +461,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             continue;
         }
         if l.kind == "raster" {
-            if let Err(e) = render_raster(&mut pm, l, ms) {
+            if let Err(e) = render_raster(pm, l, ms) {
                 if ignore_rendering_errors() {
                     warn_ignored(&e);
                 } else {
@@ -343,17 +475,17 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             continue;
         }
         let started = std::time::Instant::now();
-        let labeled = labels
-            .as_ref()
-            .is_some_and(|e| l.labeling.iter().any(|r| e.rule_active(r)));
         // Nothing to draw or label at this scale: skip before reading any data (a layer
         // without a scale limit whose rules are all out of scale otherwise loads every
         // feature in the extent — 40 s and >1 GB for national N50 points at 1:2.4M).
-        if !labeled && !l.renderer.active_at(scale) {
+        let Some(labeled) = reads[order] else {
             debug!("layer {} has no active rule at 1:{scale:.0}", l.name);
             continue;
-        }
-        let features = match features_for_drawing(l, ms, job.filter.as_ref(), labeled) {
+        };
+        debug_assert_eq!(order, read_order[k]);
+        let read = ahead.take(k, || features_for_drawing(l, ms, job.filter.as_ref(), labeled));
+        k += 1;
+        let features = match read {
             Ok(f) => f,
             // QgsServerSettings::ignoreRenderingErrors
             Err(e) if ignore_rendering_errors() => {
@@ -378,7 +510,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
                 None,
             );
         } else {
-            draw_features(&mut pm, l, &features, ms, scale);
+            draw_features(pm, l, &features, ms, scale);
         }
         debug!(
             "rendered {} ({} features) in {:?}",
@@ -405,12 +537,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             engine.register_layer(l, &sources, &layer_vars(l, ms, scale), order);
         }
     }
-    if let Some(engine) = labels.filter(|e| e.has_layers()) {
-        let started = std::time::Instant::now();
-        engine.draw(&mut pm);
-        debug!("labeling took {:?}", started.elapsed());
-    }
-    Ok(pm)
+    Ok(())
 }
 
 /// Expression context scopes as QGIS stacks them: project < map settings < layer.
@@ -631,6 +758,10 @@ pub fn draw_symbol(
         let Some(kind) = layer.resolve(ctx) else {
             continue;
         };
+        if !layer.effects.is_empty() {
+            draw_with_effects(pm, sym, kind.into_owned(), &layer.effects, g, to_px, u, ctx, origin);
+            continue;
+        }
         match kind.as_ref() {
             SymbolLayer::SimpleFill {
                 color,
@@ -680,6 +811,16 @@ pub fn draw_symbol(
                         SkTransform::identity(),
                         None,
                     );
+                }
+            }
+            SymbolLayer::ShapeburstFill { color1, color2, max_distance, ignore_rings, offset, .. } => {
+                let off = (offset.0.px(u) as f32, offset.1.px(u) as f32);
+                for p in polygons(g) {
+                    let rings: Vec<Vec<(f32, f32)>> = geom::polygon_rings(p)
+                        .map(|r| r.0.iter().map(to_px).collect())
+                        .collect();
+                    let max_px = max_distance.as_ref().map(|d| d.px(u).round() as i32);
+                    draw_shapeburst(pm, &rings, *color1, *color2, max_px, *ignore_rings, off, sym.opacity);
                 }
             }
             SymbolLayer::LinePatternFill {
@@ -770,6 +911,7 @@ pub fn draw_symbol(
                 on_first,
                 on_last,
                 every_part,
+                offset,
                 interval,
                 offset_along,
                 average_over,
@@ -797,6 +939,9 @@ pub fn draw_symbol(
                     if pts.is_empty() {
                         continue;
                     }
+                    // QgsSymbolLayerUtils::offsetLine: symbols follow the offset curve.
+                    let off = offset.px(u);
+                    let pts = if off != 0.0 { geom::offset_polyline(&pts, off, 2.0) } else { pts };
                     // QgsTemplatedLineSymbolLayerBase::renderPolyline order: interval, first, last.
                     let mut placed = vec![];
                     if *on_interval {
@@ -824,7 +969,7 @@ pub fn draw_symbol(
                     }
                 }
             }
-            SymbolLayer::SvgMarker { .. } | SymbolLayer::Marker { .. } => {
+            SymbolLayer::SvgMarker { .. } | SymbolLayer::Marker { .. } | SymbolLayer::FontMarker { .. } => {
                 for c in points(g) {
                     draw_marker_layer(pm, kind.as_ref(), sym.opacity, to_px(&c), 0.0, u);
                 }
@@ -844,7 +989,7 @@ fn draw_point_symbol(pm: &mut Pixmap, sym: &Symbol, at: (f32, f32), line_angle: 
                 kind: sym.kind.clone(),
                 opacity: sym.opacity,
                 data_defined: false,
-                layers: vec![crate::symbology::Layer { kind: kind.into_owned(), dd: Default::default() }],
+                layers: vec![crate::symbology::Layer { kind: kind.into_owned(), dd: Default::default(), effects: vec![] }],
             };
             let g: Geometry<f64> = geo_types::Point::new(at.0 as f64, at.1 as f64).into();
             draw_symbol(pm, &one, &g, &|c| (c.x as f32, c.y as f32), u, ctx, None);
@@ -915,7 +1060,383 @@ fn draw_marker_layer(pm: &mut Pixmap, kind: &SymbolLayer, opacity: f64, (x, y): 
             draw_marker(pm, shape, place, *color, stroke, opacity, u);
             true
         }
+        SymbolLayer::FontMarker { font, style, chr, size, color, stroke, angle, offset, anchor } => {
+            // QgsFontMarkerSymbolLayer::startRender / renderPoint: the font at the rounded pixel
+            // size (at least 2), the character centred on half its advance and half the
+            // ascent (QPainterPath::addText(-w/2, ascent/2)), then rotated and placed.
+            let px = size.px(u);
+            if px.abs() < 1e-9 {
+                return true;
+            }
+            let req = crate::text::FontRequest { family: font.clone(), weight: 400, italic: false, style: style.clone() };
+            let Some(f) = crate::text::font(&req, (px.round() as i32).max(2)) else {
+                return true;
+            };
+            let total = angle + line_angle;
+            let (ox, oy) = marker_shift((offset.0.px(u) as f32, offset.1.px(u) as f32), *anchor, px, px, total);
+            let ts = SkTransform::from_translate(-(f.horizontal_advance(chr) / 2.0) as f32, (f.ascent / 2.0) as f32)
+                .post_rotate(total as f32)
+                .post_translate(x + ox, y + oy);
+            let mut pb = PathBuilder::new();
+            f.append_run(&mut pb, &f.shape(chr), ts);
+            let Some(path) = pb.finish() else {
+                return true;
+            };
+            pm.fill_nonempty(&path, &paint(*color, opacity), FillRule::Winding, SkTransform::identity(), None);
+            if stroke.visible && stroke.width.px(u) > 0.0 {
+                pm.stroke_path(&path, &paint(stroke.color, opacity), &sk_stroke(stroke, u), SkTransform::identity(), None);
+            }
+            true
+        }
         _ => false,
+    }
+}
+
+/// QgsEffectStack::draw for one feature's symbol layer: the layer alone in a scratch
+/// image reaching past the canvas (so blurs and shadows see the off-canvas shape, as the
+/// QPicture-based effects do), then each effect composited in stack order.
+#[allow(clippy::too_many_arguments)]
+fn draw_with_effects(
+    pm: &mut Pixmap,
+    sym: &Symbol,
+    kind: SymbolLayer,
+    effects: &[Effect],
+    g: &Geometry<f64>,
+    to_px: &dyn Fn(&Coord<f64>) -> (f32, f32),
+    u: &RenderUnits,
+    ctx: &Attrs,
+    origin: Option<(f32, f32)>,
+) {
+    // QgsShadowEffect/QgsGlowEffect::boundingRect: offset or spread + 2 × blur + 10.
+    let blur_px = |b: &Size| b.px(u).round().max(0.0) as i32;
+    let reach = effects
+        .iter()
+        .map(|e| match e {
+            Effect::Shadow { blur, offset, .. } => offset.px(u).abs().ceil() as i32 + 2 * blur_px(blur) + 10,
+            Effect::OuterGlow { spread, blur, .. } => spread.px(u).ceil() as i32 + 2 * blur_px(blur) + 10,
+            Effect::DrawSource { .. } => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    // The geometry's pixel extent, plus room for markers drawn around their point.
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    geom::for_each_coord(g, &mut |c| {
+        let (x, y) = to_px(&c);
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    });
+    if x0 > x1 {
+        return;
+    }
+    let pad = reach + 64;
+    let l = (x0.floor() as i32 - pad).max(-reach);
+    let t = (y0.floor() as i32 - pad).max(-reach);
+    let r = (x1.ceil() as i32 + pad).min(pm.width() as i32 + reach);
+    let b = (y1.ceil() as i32 + pad).min(pm.height() as i32 + reach);
+    if r <= l || b <= t {
+        return;
+    }
+    let (w, h) = ((r - l) as usize, (b - t) as usize);
+    let Some(mut src) = Pixmap::new(w as u32, h as u32) else { return };
+    let one = Symbol {
+        kind: sym.kind.clone(),
+        opacity: sym.opacity,
+        data_defined: false,
+        layers: vec![crate::symbology::Layer { kind, dd: Default::default(), effects: vec![] }],
+    };
+    let (lf, tf) = (l as f32, t as f32);
+    let shifted = |c: &Coord<f64>| {
+        let (x, y) = to_px(c);
+        (x - lf, y - tf)
+    };
+    draw_symbol(&mut src, &one, g, &shifted, u, ctx, origin.map(|(x, y)| (x - lf, y - tf)));
+    let src_a: Vec<u8> = src.pixels().iter().map(|p| p.alpha()).collect();
+    if src_a.iter().all(|&a| a == 0) {
+        return;
+    }
+    // QgsImageOperation::multiplyOpacity below 1: DestinationIn with QColor(0, 0, 0, 255 × f).
+    let opacity_u8 = |f: f64| if f >= 1.0 { 255 } else { (255.0 * f) as i32 };
+    for e in effects {
+        let out: Vec<[u8; 4]> = match e {
+            Effect::DrawSource { opacity } => {
+                let paint = PixmapPaint { opacity: *opacity as f32, ..Default::default() };
+                pm.draw_pixmap(l, t, src.as_ref(), &paint, SkTransform::identity(), None);
+                continue;
+            }
+            Effect::Shadow { inner, color, blur, offset, angle, opacity } => {
+                // invertPixels(InvertRgba) for the inner shadow, then overlayColor (opaque).
+                let mut im: Vec<[u8; 4]> = src_a
+                    .iter()
+                    .map(|&a| premul(*color, if *inner { 255 - a } else { a }))
+                    .collect();
+                stack_blur(&mut im, w, h, blur_px(blur));
+                scale_alpha(&mut im, opacity_u8(*opacity));
+                let d = offset.px(u);
+                let a = (angle + 90.0).to_radians();
+                let (dx, dy) = ((-d * a.cos()).round() as i32, (-d * a.sin()).round() as i32);
+                let mut moved = vec![[0u8; 4]; w * h];
+                for y in 0..h as i32 {
+                    let sy = y - dy;
+                    if sy < 0 || sy >= h as i32 {
+                        continue;
+                    }
+                    for x in 0..w as i32 {
+                        let sx = x - dx;
+                        if sx >= 0 && sx < w as i32 {
+                            moved[y as usize * w + x as usize] = im[sy as usize * w + sx as usize];
+                        }
+                    }
+                }
+                if *inner {
+                    // Restricted to the source's coverage (DestinationIn). Its blend mode
+                    // (Source in lag06) composites as source-over: measured against QGIS.
+                    for (p, &a) in moved.iter_mut().zip(&src_a) {
+                        *p = p.map(|v| mul255(v, a));
+                    }
+                }
+                moved
+            }
+            Effect::OuterGlow { color, spread, blur, opacity } => {
+                // QgsImageOperation::distanceTransform with shadeExterior: opaque pixels at
+                // 1 − alpha, the rest at infinity; shaded colour → transparent over `spread`.
+                let mut dt: Vec<f64> = src_a.iter().map(|&a| if a > 0 { 1.0 - a as f64 / 255.0 } else { 1e20 }).collect();
+                distance_transform_2d(&mut dt, w, h);
+                let s = spread.px(u);
+                let mut im: Vec<[u8; 4]> = dt
+                    .iter()
+                    .map(|&sq| {
+                        if s.abs() < 1e-8 {
+                            return premul(*color, color.3);
+                        }
+                        if sq > s * s {
+                            return [0; 4];
+                        }
+                        let dist = sq.sqrt();
+                        // QgsGradientColorRamp(colour, transparent colour): alpha interpolated.
+                        let mut a = lerp8(color.3, 0, dist / s) as f64;
+                        if dist > s - 1.0 {
+                            a = (a * (s - dist)).trunc(); // fade the last pixel (QColor::setAlpha)
+                        }
+                        premul(*color, a.clamp(0.0, 255.0) as u8)
+                    })
+                    .collect();
+                stack_blur(&mut im, w, h, blur_px(blur));
+                scale_alpha(&mut im, opacity_u8(*opacity));
+                im
+            }
+        };
+        let Some(mut layer) = Pixmap::new(w as u32, h as u32) else { return };
+        for (p, v) in layer.pixels_mut().iter_mut().zip(out) {
+            let a = v[3];
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(v[0].min(a), v[1].min(a), v[2].min(a), a)
+                .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        }
+        pm.draw_pixmap(l, t, layer.as_ref(), &PixmapPaint::default(), SkTransform::identity(), None);
+    }
+}
+
+/// x × a / 255, rounded (Qt's qt_div_255 of a premultiplying multiply).
+fn mul255(x: u8, a: u8) -> u8 {
+    let t = x as u32 * a as u32 + 128;
+    ((t + (t >> 8)) >> 8) as u8
+}
+
+/// A colour's RGB at alpha `a`, premultiplied (RGBA).
+fn premul(c: Rgba, a: u8) -> [u8; 4] {
+    [mul255(c.0, a), mul255(c.1, a), mul255(c.2, a), a]
+}
+
+/// multiplyOpacity's DestinationIn fill: every premultiplied channel × a / 255.
+fn scale_alpha(im: &mut [[u8; 4]], a: i32) {
+    if a < 255 {
+        let a = a.max(0) as u8;
+        for p in im.iter_mut() {
+            *p = p.map(|v| mul255(v, a));
+        }
+    }
+}
+
+/// QgsImageOperation::stackBlur (Qt's exponential blur from qpixmapfilter.cpp) on
+/// premultiplied pixels: down, right, up, left.
+fn stack_blur(im: &mut [[u8; 4]], w: usize, h: usize, radius: i32) {
+    const TAB: [i32; 17] = [14, 10, 8, 6, 5, 5, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2];
+    let alpha = if radius < 1 { 16 } else if radius > 17 { 1 } else { TAB[radius as usize - 1] };
+    let line = |im: &mut [[u8; 4]], idx: &mut dyn Iterator<Item = usize>| {
+        let Some(first) = idx.next() else { return };
+        let mut acc = im[first].map(|v| (v as i32) << 4);
+        for i in idx {
+            for c in 0..4 {
+                acc[c] += (((im[i][c] as i32) << 4) - acc[c]) * alpha / 16;
+                im[i][c] = (acc[c] >> 4) as u8;
+            }
+        }
+    };
+    for x in 0..w {
+        line(im, &mut (0..h).map(|y| y * w + x));
+    }
+    for y in 0..h {
+        line(im, &mut (0..w).map(|x| y * w + x));
+    }
+    for x in 0..w {
+        line(im, &mut (0..h).rev().map(|y| y * w + x));
+    }
+    for y in 0..h {
+        line(im, &mut (0..w).rev().map(|x| y * w + x));
+    }
+}
+
+/// QgsShapeburstFillSymbolLayer::renderPolygon (no blur): a squared-distance transform
+/// (Felzenszwalb & Huttenlocher, as QGIS) of the polygon drawn white with a black hairline
+/// on black, shaded with the two-colour gradient and clipped by the polygon's coverage.
+#[allow(clippy::too_many_arguments)]
+fn draw_shapeburst(
+    pm: &mut Pixmap,
+    rings: &[Vec<(f32, f32)>],
+    c1: Rgba,
+    c2: Rgba,
+    max_px: Option<i32>,
+    ignore_rings: bool,
+    offset: (f32, f32),
+    opacity: f64,
+) {
+    const INF: f64 = 1e20;
+    let Some(outer) = rings.first().filter(|r| r.len() >= 3) else { return };
+    let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in outer {
+        (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
+    }
+    let side = 4 + 2 * 4; // 4 + (blur + 2) * 4 with no blur
+    let (w, h) = ((r - l).round() as i32 + 2 * side, (b - t).round() as i32 + 2 * side);
+    if w <= 0 || h <= 0 || (w as i64) * (h as i64) > 40_000_000 {
+        return;
+    }
+    let shift = |x: f32, y: f32| (x - l + side as f32, y - t + side as f32);
+    let path_of = |rs: &[Vec<(f32, f32)>]| {
+        let mut pb = PathBuilder::new();
+        for ring in rs {
+            for (i, &(x, y)) in ring.iter().enumerate() {
+                let (x, y) = shift(x, y);
+                if i == 0 {
+                    pb.move_to(x, y);
+                } else {
+                    pb.line_to(x, y);
+                }
+            }
+            pb.close();
+        }
+        pb.finish()
+    };
+    let Some(path) = path_of(rings) else { return };
+    let Some(mut alpha) = Pixmap::new(w as u32, h as u32) else { return };
+    let white = paint(Rgba(255, 255, 255, 255), 1.0);
+    let black = paint(Rgba(0, 0, 0, 255), 1.0);
+    // _renderPolygon with a white brush and a cosmetic (1 px) black pen.
+    let hairline = tiny_skia::Stroke { width: 1.0, ..Default::default() };
+    alpha.fill_nonempty(&path, &white, FillRule::EvenOdd, SkTransform::identity(), None);
+    alpha.stroke_path(&path, &black, &hairline, SkTransform::identity(), None);
+    let mut fill = Pixmap::new(w as u32, h as u32).expect("same size");
+    fill.fill(tiny_skia::Color::BLACK);
+    if ignore_rings {
+        if let Some(outer_path) = path_of(&rings[..1]) {
+            fill.fill_nonempty(&outer_path, &white, FillRule::EvenOdd, SkTransform::identity(), None);
+            fill.stroke_path(&outer_path, &black, &hairline, SkTransform::identity(), None);
+        }
+    } else {
+        fill.draw_pixmap(0, 0, alpha.as_ref(), &PixmapPaint::default(), SkTransform::identity(), None);
+    }
+    // Black (red == 0) pixels are the boundary/outside: distance 0, the rest to be computed.
+    let (wu, hu) = (w as usize, h as usize);
+    let mut dt: Vec<f64> = fill.pixels().iter().map(|p| if p.red() == 0 { 0.0 } else { INF }).collect();
+    distance_transform_2d(&mut dt, wu, hu);
+    let max_dist = match max_px {
+        Some(m) if m != 0 => m as f64,
+        Some(_) => 0.0,
+        None => dt.iter().cloned().fold(0.0, f64::max).sqrt(),
+    };
+    let alpha_px = alpha.pixels().to_vec();
+    for (i, px) in fill.pixels_mut().iter_mut().enumerate() {
+        let sq = dt[i];
+        let v = if max_dist > 0.0 { if sq > 0.0 { (sq.sqrt() / max_dist).min(1.0) } else { 0.0 } } else { 1.0 };
+        let c = tiny_skia::ColorU8::from_rgba(
+            lerp8(c1.0, c2.0, v),
+            lerp8(c1.1, c2.1, v),
+            lerp8(c1.2, c2.2, v),
+            lerp8(c1.3, c2.3, v),
+        )
+        .premultiply();
+        // CompositionMode_DestinationIn with the polygon coverage (and the opacity).
+        let a = alpha_px[i].alpha() as f64 / 255.0 * opacity;
+        let m = |v: u8| (v as f64 * a).round() as u8;
+        *px = tiny_skia::PremultipliedColorU8::from_rgba(m(c.red()), m(c.green()), m(c.blue()), m(c.alpha())).unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+    }
+    pm.draw_pixmap(
+        (l + offset.0 - side as f32).round() as i32,
+        (t + offset.1 - side as f32).round() as i32,
+        fill.as_ref(),
+        &PixmapPaint::default(),
+        SkTransform::identity(),
+        None,
+    );
+}
+
+/// QgsGradientColorRamp::color for two colours: a channel interpolated as floats, stored
+/// in QColor's 16-bit channels (qRound), read back as 8 bits (qt_div_257).
+fn lerp8(a: u8, b: u8, v: f64) -> u8 {
+    let f = a as f64 / 255.0 + v * (b as f64 / 255.0 - a as f64 / 255.0);
+    let x = (f * 65535.0).round() as u32 + 128;
+    ((x - (x >> 8)) >> 8).min(255) as u8
+}
+
+/// QgsShapeburstFillSymbolLayer::distanceTransform1d (squared Euclidean distance).
+fn distance_transform_1d(f: &[f64], v: &mut [usize], z: &mut [f64], d: &mut [f64]) {
+    let n = f.len();
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    for q in 1..n {
+        let qf = q as f64;
+        let mut s;
+        loop {
+            let vk = v[k] as f64;
+            s = ((f[q] + qf * qf) - (f[v[k]] + vk * vk)) / (2.0 * qf - 2.0 * vk);
+            if s <= z[k] && k > 0 {
+                k -= 1;
+            } else {
+                break;
+            }
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f64::INFINITY;
+    }
+    k = 0;
+    for (q, dq) in d.iter_mut().enumerate().take(n) {
+        while z[k + 1] < q as f64 {
+            k += 1;
+        }
+        let diff = q as f64 - v[k] as f64;
+        *dq = diff * diff + f[v[k]];
+    }
+}
+
+/// QgsShapeburstFillSymbolLayer::distanceTransform2d: columns, then rows.
+fn distance_transform_2d(im: &mut [f64], width: usize, height: usize) {
+    let m = width.max(height);
+    let (mut f, mut v, mut z, mut d) = (vec![0.0; m], vec![0usize; m], vec![0.0; m + 1], vec![0.0; m]);
+    for x in 0..width {
+        for y in 0..height {
+            f[y] = im[x + y * width];
+        }
+        distance_transform_1d(&f[..height], &mut v, &mut z, &mut d[..height]);
+        for y in 0..height {
+            im[x + y * width] = d[y];
+        }
+    }
+    for y in 0..height {
+        f[..width].copy_from_slice(&im[y * width..(y + 1) * width]);
+        distance_transform_1d(&f[..width], &mut v, &mut z, &mut d[..width]);
+        im[y * width..(y + 1) * width].copy_from_slice(&d[..width]);
     }
 }
 

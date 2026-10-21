@@ -220,6 +220,33 @@ pub struct HueSaturation {
     /// 0 off, 1 lightness, 2 luminosity, 3 average.
     pub grayscale: i32,
     pub invert: bool,
+    /// Colorize: the colour's HSV hue and saturation (QColor::hue/saturation) and strength %.
+    pub colorize: Option<(i32, i32, i32)>,
+}
+
+/// QColor::fromRgb(r, g, b).hue() / .saturation(): Qt's HSV from 16-bit channels.
+fn qt_hsv_hue_saturation(r: i32, g: i32, b: i32) -> (i32, i32) {
+    let [r, g, b] = [r, g, b].map(|c| (c * 0x101) as f32);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    if max == min {
+        return (-1, 0);
+    }
+    let delta = max - min;
+    let sat = (delta / max * 65535.0).round() as u32;
+    let mut hue = if max == r {
+        (g - b) / delta
+    } else if max == g {
+        2.0 + (b - r) / delta
+    } else {
+        4.0 + (r - g) / delta
+    };
+    hue *= 60.0;
+    if hue < 0.0 {
+        hue += 360.0;
+    }
+    // qt_div_257 for the saturation
+    let x = sat + 128;
+    ((hue * 100.0).round() as i32 / 100, ((x - (x >> 8)) >> 8) as i32)
 }
 
 /// A raster layer's pipe: provider resampling, renderer, then the image filters.
@@ -360,9 +387,6 @@ pub fn parse_style(ml: Node) -> Option<RasterStyle> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2.0),
         });
-    if hs.is_some_and(|h| h.attribute("colorizeOn") == Some("1")) {
-        tracing::warn!("raster huesaturation colorize is not supported; ignored");
-    }
     Some(RasterStyle {
         renderer: parse_renderer(pipe),
         resampling,
@@ -378,6 +402,14 @@ pub fn parse_style(ml: Node) -> Option<RasterStyle> {
             saturation: int(hs, "saturation", 0).clamp(-100, 100),
             grayscale: int(hs, "grayscaleMode", 0),
             invert: int(hs, "invertColors", 0) != 0,
+            colorize: (int(hs, "colorizeOn", 0) != 0).then(|| {
+                let (h, s) = qt_hsv_hue_saturation(
+                    int(hs, "colorizeRed", 255),
+                    int(hs, "colorizeGreen", 128),
+                    int(hs, "colorizeBlue", 128),
+                );
+                (h, s, int(hs, "colorizeStrength", 100))
+            }),
         },
         blend_mode: text(ml, "blendMode")
             .and_then(|v| v.parse().ok())
@@ -1640,9 +1672,9 @@ mod imp {
         (out[0], out[1], out[2])
     }
 
-    /// QgsHueSaturationFilter::block without colorize, on premultiplied pixels.
+    /// QgsHueSaturationFilter::block, on premultiplied pixels.
     fn hue_saturation(img: &mut Image, hs: HueSaturation) {
-        if !hs.invert && hs.saturation == 0 && hs.grayscale == 0 {
+        if !hs.invert && hs.saturation == 0 && hs.grayscale == 0 && hs.colorize.is_none() {
             return;
         }
         let scale = hs.saturation as f64 / 100.0 + 1.0;
@@ -1662,7 +1694,7 @@ mod imp {
             if hs.invert {
                 (r, g, b) = (255 - r, 255 - g, 255 - b);
             }
-            let (h, mut s, l) = qt_rgb_to_hsl(r, g, b);
+            let (h, mut s, mut l) = qt_rgb_to_hsl(r, g, b);
             // processSaturation
             if hs.grayscale != 0 || scale != 1.0 {
                 match hs.grayscale {
@@ -1670,10 +1702,12 @@ mod imp {
                     2 => {
                         let v = (0.21 * r as f64 + 0.72 * g as f64 + 0.07 * b as f64) as i32;
                         (r, g, b) = (v, v, v);
+                        l = qt_rgb_to_hsl(r, g, b).2; // colorize reads the new lightness
                     }
                     3 => {
                         let v = (r + g + b) / 3;
                         (r, g, b) = (v, v, v);
+                        l = qt_rgb_to_hsl(r, g, b).2; // colorize reads the new lightness
                     }
                     _ => {
                         s = if scale < 1.0 {
@@ -1684,6 +1718,19 @@ mod imp {
                         };
                         (r, g, b) = qt_hsl_to_rgb(h, s, l);
                     }
+                }
+            }
+            // processColorization: the colorize hue and saturation at this lightness,
+            // blended linearly below 100 % strength.
+            if let Some((ch, cs, strength)) = hs.colorize {
+                let (cr, cg, cb) = qt_hsl_to_rgb(ch, cs, l);
+                if strength == 100 {
+                    (r, g, b) = (cr, cg, cb);
+                } else {
+                    let p = strength as f64 / 100.0;
+                    r = (p * cr as f64 + (1.0 - p) * r as f64) as i32;
+                    g = (p * cg as f64 + (1.0 - p) * g as f64) as i32;
+                    b = (p * cb as f64 + (1.0 - p) * b as f64) as i32;
                 }
             }
             if a != 255 {

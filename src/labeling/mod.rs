@@ -739,6 +739,20 @@ fn marker_bounds(l: &SymbolLayer, px: f64, py: f64, u: &RenderUnits) -> Option<(
         }
         (l, t, r, b)
     };
+    // QgsMarkerSymbolLayer::markerOffset: half the size towards the anchor point.
+    let anchored = |off: (f64, f64), anchor: (u8, u8), w: f64, h: f64| {
+        let dx = match anchor.0 {
+            0 => w / 2.0,
+            2 => -w / 2.0,
+            _ => 0.0,
+        };
+        let dy = match anchor.1 {
+            0 => h / 2.0,
+            2 => -h / 2.0,
+            _ => 0.0,
+        };
+        (off.0 + dx, off.1 + dy)
+    };
     let rotated = |off: (f64, f64), angle: f64| {
         if angle == 0.0 {
             off
@@ -748,14 +762,14 @@ fn marker_bounds(l: &SymbolLayer, px: f64, py: f64, u: &RenderUnits) -> Option<(
         }
     };
     match l {
-        SymbolLayer::Marker { width, height, stroke, angle, offset, .. } => {
+        SymbolLayer::Marker { width, height, stroke, angle, offset, anchor, .. } => {
             let (w, h) = (width.px(u), height.px(u));
-            let off = rotated((offset.0.px(u), offset.1.px(u)), *angle);
+            let off = rotated(anchored((offset.0.px(u), offset.1.px(u)), *anchor, w, h), *angle);
             let (l, t, r, b) = rect(w, h, off, *angle);
             let pen = if stroke.visible { stroke.width.px(u) } else { 0.0 } + 1.0;
             Some((l - pen / 2.0, t - pen / 2.0, r + pen / 2.0, b + pen / 2.0))
         }
-        SymbolLayer::SvgMarker { size, fixed_aspect, path, stroke_width, angle, offset, .. } => {
+        SymbolLayer::SvgMarker { size, fixed_aspect, path, stroke_width, angle, offset, anchor, .. } => {
             let w = size.px(u);
             if (w as i64) < 1 || w > 10_000.0 {
                 return None;
@@ -766,10 +780,18 @@ fn marker_bounds(l: &SymbolLayer, px: f64, py: f64, u: &RenderUnits) -> Option<(
                 path.as_deref().and_then(crate::svg::aspect).unwrap_or(1.0)
             };
             let h = w * aspect;
-            let off = rotated((offset.0.px(u), offset.1.px(u)), *angle);
+            let off = rotated(anchored((offset.0.px(u), offset.1.px(u)), *anchor, w, h), *angle);
             let (l, t, r, b) = rect(w, h, off, *angle);
             let sw = stroke_width.px(u) + 0.5;
             Some((l - sw / 2.0, t - sw / 2.0, r + sw / 2.0, b + sw / 2.0))
+        }
+        // QgsFontMarkerSymbolLayer::bounds: character advance × symbol size.
+        SymbolLayer::FontMarker { font, style, chr, size, angle, offset, anchor, .. } => {
+            let px = size.px(u);
+            let req = crate::text::FontRequest { family: font.clone(), weight: 400, italic: false, style: style.clone() };
+            let w = crate::text::font(&req, (px.round() as i32).max(2))?.horizontal_advance(chr);
+            let off = rotated(anchored((offset.0.px(u), offset.1.px(u)), *anchor, px, px), *angle);
+            Some(rect(w, px, off, *angle))
         }
         _ => None,
     }

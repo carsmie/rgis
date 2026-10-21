@@ -740,8 +740,80 @@ pub fn to_gml3(g: &Geometry<f64>, srs: &str, precision: usize, swap: bool) -> St
     format!("<gml:{0} srsName=\"{srs}\">{1}</gml:{0}>", body.0, body.1)
 }
 
+/// A polyline (pixel coordinates) moved `dist` to its left, like GEOS offsetCurve with
+/// mitre joins and mitre limit 2 as QgsSymbolLayerUtils::offsetLine asks for: each
+/// segment shifted along its normal, neighbours joined at their mitre point, cut to a
+/// bevel where the mitre would reach beyond `limit * |dist|`. Closed lines stay closed.
+pub fn offset_polyline(pts: &[(f64, f64)], dist: f64, limit: f64) -> Vec<(f64, f64)> {
+    let mut p: Vec<(f64, f64)> = pts.to_vec();
+    p.dedup();
+    if p.len() < 2 || dist == 0.0 {
+        return p;
+    }
+    let closed = p.len() > 2 && p.first() == p.last();
+    // Segment normals (to the left of the direction of travel) and shifted endpoints.
+    let segs: Vec<((f64, f64), (f64, f64))> = p
+        .windows(2)
+        .map(|w| {
+            let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+            let len = (dx * dx + dy * dy).sqrt();
+            let n = (-dy / len * dist, dx / len * dist);
+            ((w[0].0 + n.0, w[0].1 + n.1), (w[1].0 + n.0, w[1].1 + n.1))
+        })
+        .collect();
+    let join = |a: &((f64, f64), (f64, f64)), b: &((f64, f64), (f64, f64)), v: (f64, f64), out: &mut Vec<(f64, f64)>| {
+        // Intersection of the two shifted segment lines.
+        let (p1, p2, p3, p4) = (a.0, a.1, b.0, b.1);
+        let d1 = (p2.0 - p1.0, p2.1 - p1.1);
+        let d2 = (p4.0 - p3.0, p4.1 - p3.1);
+        let den = d1.0 * d2.1 - d1.1 * d2.0;
+        if den.abs() < 1e-12 {
+            out.push(p2); // collinear
+            return;
+        }
+        let t = ((p3.0 - p1.0) * d2.1 - (p3.1 - p1.1) * d2.0) / den;
+        let m = (p1.0 + t * d1.0, p1.1 + t * d1.1);
+        // Mitre length from the original vertex `v`.
+        let mitre = ((m.0 - v.0).powi(2) + (m.1 - v.1).powi(2)).sqrt();
+        if mitre <= limit * dist.abs() {
+            out.push(m);
+        } else {
+            out.push(p2);
+            out.push(p3);
+        }
+    };
+    let mut out = vec![];
+    if closed {
+        let last = segs.last().expect("non-empty");
+        join(last, &segs[0], p[0], &mut out);
+    } else {
+        out.push(segs[0].0);
+    }
+    for (i, w) in segs.windows(2).enumerate() {
+        join(&w[0], &w[1], p[i + 1], &mut out);
+    }
+    if closed {
+        out.push(out[0]);
+    } else {
+        out.push(segs.last().expect("non-empty").1);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn offset_polyline_mitres_and_bevels() {
+        use super::offset_polyline;
+        // GEOS's left normal (-dy, dx) applied in pixel space (y down), as QGIS does: +dist
+        // moves a rightward line down the screen.
+        let o = offset_polyline(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)], 2.0, 2.0);
+        assert_eq!(o, vec![(0.0, 2.0), (8.0, 2.0), (8.0, 10.0)]);
+        // A sharp turn (mitre beyond 2x the distance) is bevelled: two points.
+        let o = offset_polyline(&[(0.0, 0.0), (10.0, 0.0), (0.0, 1.0)], 1.0, 2.0);
+        assert_eq!(o.len(), 4, "{o:?}");
+    }
+
     use super::*;
     use geo_types::polygon;
 

@@ -29,9 +29,14 @@ RUN touch src/main.rs \
  && cp target/release/rgis /usr/local/bin/rgis \
  && rm -rf target
 
+# Extra fonts for the runtime image, empty unless a build supplies them as a named build
+# context, e.g. `docker build --build-context extra-fonts=<dir> .` (tnt-rgis passes
+# Kartverket's map fonts this way; they are not part of this repository).
+FROM scratch AS extra-fonts
+
 FROM ghcr.io/osgeo/gdal:ubuntu-small-${GDAL_VERSION}
 # The font packages of the tnt-qgis QGIS Server image (CJK left out), so labels resolve to
-# the same faces; Kartverket's own fonts are not redistributed here. Qt falls back to
+# the same faces; Kartverket's own fonts come only through extra-fonts above. Qt falls back to
 # fontconfig's sans-serif there (Noto Sans), rgis to RGIS_LABEL_FONT. The upgrade picks up
 # OS security fixes released after the GDAL base image was built (Pharos/Trivy findings).
 RUN apt-get update \
@@ -56,6 +61,7 @@ ENV GDAL_CACHEMAX=256 \
     GDAL_HTTP_MAX_RETRY=3 \
     GDAL_HTTP_RETRY_DELAY=1 \
     GDAL_PAM_ENABLED=NO
+COPY --from=extra-fonts / /usr/local/share/fonts/rgis/
 COPY --from=build /usr/local/bin/rgis /usr/local/bin/rgis
 COPY demo /opt/rgis/demo
 RUN useradd --uid 10001 --no-create-home rgis
