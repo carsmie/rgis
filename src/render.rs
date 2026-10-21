@@ -336,7 +336,16 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             continue;
         }
         let started = std::time::Instant::now();
-        let labeled = labels.is_some() && !l.labeling.is_empty();
+        let labeled = labels
+            .as_ref()
+            .is_some_and(|e| l.labeling.iter().any(|r| e.rule_active(r)));
+        // Nothing to draw or label at this scale: skip before reading any data (a layer
+        // without a scale limit whose rules are all out of scale otherwise loads every
+        // feature in the extent — 40 s and >1 GB for national N50 points at 1:2.4M).
+        if !labeled && !l.renderer.active_at(scale) {
+            debug!("layer {} has no active rule at 1:{scale:.0}", l.name);
+            continue;
+        }
         let features = match features_for_drawing(l, ms, job.filter.as_ref(), labeled) {
             Ok(f) => f,
             // QgsServerSettings::ignoreRenderingErrors
@@ -749,59 +758,356 @@ pub fn draw_symbol(
                     );
                 }
             }
-            SymbolLayer::SvgMarker {
-                path,
-                size,
-                fixed_aspect,
-                fill,
-                stroke_color,
-                stroke_width,
-                angle,
-                offset,
-                ..
+            SymbolLayer::TemplatedLine {
+                on_interval,
+                on_first,
+                on_last,
+                every_part,
+                interval,
+                offset_along,
+                average_over,
+                rotate,
+                hash,
+                sub,
             } => {
-                let marker = crate::svg::Marker {
-                    path: path.as_deref(),
-                    width: size.px(u),
-                    fixed_aspect: *fixed_aspect,
-                    fill: *fill,
-                    stroke: *stroke_color,
-                    stroke_width: stroke_width.px(u),
-                    angle: *angle,
-                    opacity: sym.opacity,
-                };
-                let (ox, oy) = (offset.0.px(u) as f32, offset.1.px(u) as f32);
-                for c in points(g) {
-                    let (x, y) = to_px(&c);
-                    crate::svg::draw(pm, &marker, x + ox, y + oy);
+                // QgsMarkerLineSymbolLayer::renderPolyline: the sub-symbol at the parent's opacity.
+                let mut sub = (**sub).clone();
+                sub.opacity *= sym.opacity;
+                let iv = interval.px(u);
+                let along = offset_along.px(u);
+                let avg = average_over.px(u) / 2.0;
+                let parts = lines(g);
+                let n_parts = parts.len();
+                for (part, l) in parts.into_iter().enumerate() {
+                    let pts: Vec<(f64, f64)> = l
+                        .0
+                        .iter()
+                        .map(|c| {
+                            let (x, y) = to_px(c);
+                            (x as f64, y as f64)
+                        })
+                        .collect();
+                    if pts.is_empty() {
+                        continue;
+                    }
+                    // QgsTemplatedLineSymbolLayerBase::renderPolyline order: interval, first, last.
+                    let mut placed = vec![];
+                    if *on_interval {
+                        placed.extend(interval_points(&pts, iv, along, avg));
+                    }
+                    if *on_first && (*every_part || part == 0) {
+                        placed.push((pts[0], end_angle(&pts, true)));
+                    }
+                    // Not on every part: QGIS defers it to the end of the feature (last part).
+                    if *on_last && (*every_part || part + 1 == n_parts) {
+                        placed.push((pts[pts.len() - 1], end_angle(&pts, false)));
+                    }
+                    for ((x, y), line_angle) in placed {
+                        let a = if *rotate { line_angle } else { 0.0 };
+                        match hash {
+                            // QgsHashedLineSymbolLayer::renderSymbol (QgsPointXY::project)
+                            Some((len, hash_angle)) => {
+                                let w = len.px(u) / 2.0;
+                                let b = (180.0 - (a + hash_angle)).to_radians();
+                                let (dx, dy) = (w * b.sin(), w * b.cos());
+                                draw_line_px(pm, &sub, (x + dx, y + dy), (x - dx, y - dy), u, ctx);
+                            }
+                            None => draw_point_symbol(pm, &sub, (x as f32, y as f32), a, u, ctx),
+                        }
+                    }
                 }
             }
-            SymbolLayer::Marker {
-                shape,
-                width,
-                height,
-                color,
-                stroke,
-                angle,
-                offset,
-                ..
-            } => {
-                let (rx, ry) = ((width.px(u) / 2.0) as f32, (height.px(u) / 2.0) as f32);
-                // Zero-size markers are a common way to make label-only layers.
-                if rx <= 0.0 || ry <= 0.0 {
-                    continue;
-                }
-                let (ox, oy) = (offset.0.px(u) as f32, offset.1.px(u) as f32);
+            SymbolLayer::SvgMarker { .. } | SymbolLayer::Marker { .. } => {
                 for c in points(g) {
-                    let (x, y) = to_px(&c);
-                    let place = SkTransform::from_scale(rx, ry)
-                        .post_rotate(*angle as f32)
-                        .post_translate(x + ox, y + oy);
-                    draw_marker(pm, shape, place, *color, stroke, sym.opacity, u);
+                    draw_marker_layer(pm, kind.as_ref(), sym.opacity, to_px(&c), 0.0, u);
                 }
             }
         }
     }
+}
+
+/// A marker symbol at one pixel position, every layer turned by `line_angle` degrees
+/// clockwise (QgsMarkerSymbol::setLineAngle: the layer angle plus the line angle).
+fn draw_point_symbol(pm: &mut Pixmap, sym: &Symbol, at: (f32, f32), line_angle: f64, u: &RenderUnits, ctx: &Attrs) {
+    for layer in &sym.layers {
+        let Some(kind) = layer.resolve(ctx) else { continue };
+        if !draw_marker_layer(pm, kind.as_ref(), sym.opacity, at, line_angle, u) {
+            // Other layer types in a marker sub-symbol: as a point symbol, unrotated.
+            let one = Symbol {
+                kind: sym.kind.clone(),
+                opacity: sym.opacity,
+                data_defined: false,
+                layers: vec![crate::symbology::Layer { kind: kind.into_owned(), dd: Default::default() }],
+            };
+            let g: Geometry<f64> = geo_types::Point::new(at.0 as f64, at.1 as f64).into();
+            draw_symbol(pm, &one, &g, &|c| (c.x as f32, c.y as f32), u, ctx, None);
+        }
+    }
+}
+
+/// QgsMarkerSymbolLayer::markerOffset + _rotatedOffset: where a `w`×`h` marker's centre
+/// goes relative to its point — the layer offset plus half the size towards the anchor
+/// point, turned with the marker's total angle.
+fn marker_shift(offset: (f32, f32), anchor: (u8, u8), w: f64, h: f64, angle: f64) -> (f32, f32) {
+    let (mut x, mut y) = (offset.0 as f64, offset.1 as f64);
+    match anchor.0 {
+        0 => x += w / 2.0,
+        2 => x -= w / 2.0,
+        _ => {}
+    }
+    match anchor.1 {
+        0 => y += h / 2.0,
+        2 => y -= h / 2.0,
+        _ => {}
+    }
+    if angle != 0.0 {
+        let (s, c) = angle.to_radians().sin_cos();
+        (x, y) = (x * c - y * s, x * s + y * c);
+    }
+    (x as f32, y as f32)
+}
+
+/// Draw one SVG or simple marker layer at a pixel position; false for other layer types.
+fn draw_marker_layer(pm: &mut Pixmap, kind: &SymbolLayer, opacity: f64, (x, y): (f32, f32), line_angle: f64, u: &RenderUnits) -> bool {
+    match kind {
+        SymbolLayer::SvgMarker { path, size, fixed_aspect, fill, stroke_color, stroke_width, angle, offset, anchor, .. } => {
+            let total = angle + line_angle;
+            let w = size.px(u);
+            let h = if anchor.1 == 1 {
+                w // unused
+            } else if *fixed_aspect > 0.0 {
+                w * fixed_aspect
+            } else {
+                w * path.as_deref().and_then(crate::svg::aspect).unwrap_or(1.0)
+            };
+            let marker = crate::svg::Marker {
+                path: path.as_deref(),
+                width: w,
+                fixed_aspect: *fixed_aspect,
+                fill: *fill,
+                stroke: *stroke_color,
+                stroke_width: stroke_width.px(u),
+                angle: total,
+                opacity,
+            };
+            let (ox, oy) = marker_shift((offset.0.px(u) as f32, offset.1.px(u) as f32), *anchor, w, h, total);
+            crate::svg::draw(pm, &marker, x + ox, y + oy);
+            true
+        }
+        SymbolLayer::Marker { shape, width, height, color, stroke, angle, offset, anchor, .. } => {
+            let (w, h) = (width.px(u), height.px(u));
+            // Zero-size markers are a common way to make label-only layers.
+            if w <= 0.0 || h <= 0.0 {
+                return true;
+            }
+            let total = angle + line_angle;
+            let (ox, oy) = marker_shift((offset.0.px(u) as f32, offset.1.px(u) as f32), *anchor, w, h, total);
+            let place = SkTransform::from_scale((w / 2.0) as f32, (h / 2.0) as f32)
+                .post_rotate(total as f32)
+                .post_translate(x + ox, y + oy);
+            draw_marker(pm, shape, place, *color, stroke, opacity, u);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// QGIS's private `Line` (line_p.h): direction, angle and step of one segment.
+struct Seg {
+    vertical: bool,
+    increasing: bool,
+    tangent: f64,
+    length: f64,
+}
+
+impl Seg {
+    fn new(p1: (f64, f64), p2: (f64, f64)) -> Seg {
+        let mut s = Seg { vertical: false, increasing: false, tangent: 0.0, length: 0.0 };
+        if p1 == p2 {
+            return s;
+        }
+        // qgsDoubleNear: 4 * DBL_EPSILON
+        if (p1.0 - p2.0).abs() <= 4.0 * f64::EPSILON {
+            s.vertical = true;
+            s.increasing = p2.1 > p1.1;
+        } else {
+            s.tangent = (p2.1 - p1.1) / (p2.0 - p1.0);
+            s.increasing = p2.0 > p1.0;
+        }
+        s.length = ((p2.0 - p1.0).powi(2) + (p2.1 - p1.1).powi(2)).sqrt();
+        s
+    }
+
+    /// Radians.
+    fn angle(&self) -> f64 {
+        let a = if self.vertical { std::f64::consts::FRAC_PI_2 } else { self.tangent.atan() };
+        if self.increasing { a } else { a + std::f64::consts::PI }
+    }
+
+    fn diff_for_interval(&self, interval: f64) -> (f64, f64) {
+        if self.vertical {
+            return (0.0, if self.increasing { interval } else { -interval });
+        }
+        let alpha = self.tangent.atan();
+        let (dx, dy) = (alpha.cos() * interval, alpha.sin() * interval);
+        if self.increasing { (dx, dy) } else { (-dx, -dy) }
+    }
+}
+
+/// QgsTemplatedLineSymbolLayerBase::markerAngle at the first / last vertex (not a ring):
+/// the angle of the first / last non-degenerate segment, in degrees.
+fn end_angle(pts: &[(f64, f64)], first: bool) -> f64 {
+    let seg = if first {
+        pts.iter().skip(1).find(|p| **p != pts[0]).map(|p| Seg::new(pts[0], *p))
+    } else {
+        let last = pts[pts.len() - 1];
+        pts.iter().rev().skip(1).find(|p| **p != last).map(|p| Seg::new(*p, last))
+    };
+    seg.map_or(0.0, |s| s.angle().to_degrees())
+}
+
+/// QgsTemplatedLineSymbolLayerBase::collectOffsetPoints.
+fn collect_offset_points(
+    p: &[(f64, f64)],
+    dest: &mut Vec<(f64, f64)>,
+    interval: f64,
+    initial_offset: f64,
+    initial_lag: f64,
+    required: usize,
+) {
+    if p.is_empty() {
+        return;
+    }
+    let closed = p.first() == p.last();
+    let mut points: Vec<(f64, f64)> = p.to_vec();
+    let mut length_left = initial_offset;
+    let mut lag_left = if initial_lag > 0.0 { -initial_lag } else { 1.0 };
+    if lag_left < 0.0 && closed {
+        // Track back around the ring: pseudo vertices before the first one.
+        let mut last = *points.last().expect("non-empty");
+        let mut pseudo = vec![];
+        for i in (1..points.len().saturating_sub(1)).rev() {
+            if lag_left >= 0.0 {
+                break;
+            }
+            let pt = points[i];
+            if last == pt {
+                continue;
+            }
+            lag_left += Seg::new(last, pt).length;
+            last = pt;
+            pseudo.push(pt);
+        }
+        pseudo.reverse();
+        pseudo.extend_from_slice(p);
+        points = pseudo;
+    } else {
+        while lag_left < 0.0 {
+            dest.push(points[0]);
+            lag_left += interval;
+        }
+    }
+    if initial_lag > 0.0 {
+        length_left += interval - lag_left;
+    }
+    let mut last = points[0];
+    let mut i = 1;
+    while i < points.len() {
+        let pt = points[i];
+        if last == pt {
+            if closed && i == points.len() - 1 && required > 0 && dest.len() < required {
+                last = points[0];
+                i = 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        let l = Seg::new(last, pt);
+        let diff = l.diff_for_interval(interval);
+        let mut c = 1.0 - length_left / interval;
+        length_left += l.length;
+        while length_left > interval || (length_left - interval).abs() <= 0.000000001 {
+            last = (last.0 + c * diff.0, last.1 + c * diff.1);
+            length_left -= interval;
+            dest.push(last);
+            c = 1.0;
+            if required > 0 && dest.len() >= required {
+                break;
+            }
+        }
+        last = pt;
+        if required > 0 && dest.len() >= required {
+            break;
+        }
+        if closed && i == points.len() - 1 && required > 0 && dest.len() < required {
+            last = points[0];
+            i = 1;
+            continue;
+        }
+        i += 1;
+    }
+    if !closed && required > 0 {
+        while dest.len() < required {
+            dest.push(*points.last().expect("non-empty"));
+        }
+    }
+}
+
+/// QgsTemplatedLineSymbolLayerBase::renderPolylineInterval: symbol positions along a pixel
+/// polyline with the line angle (degrees, clockwise) at each.
+fn interval_points(points: &[(f64, f64)], interval: f64, offset_along: f64, average_over: f64) -> Vec<((f64, f64), f64)> {
+    let mut out = vec![];
+    if points.is_empty() || interval < 1e-5 {
+        return out;
+    }
+    let mut along = offset_along;
+    if along.abs() > 4.0 * f64::EPSILON && points.first() == points.last() {
+        let total: f64 = points.windows(2).map(|w| Seg::new(w[0], w[1]).length).sum();
+        along = if along > 0.0 { along % total } else { total - (-along % total) };
+    }
+    let mut length_left = interval - along;
+    if average_over > 0.0 && average_over.abs() > 4.0 * f64::EPSILON {
+        let mut sym = vec![];
+        collect_offset_points(points, &mut sym, interval, length_left, 0.0, 0);
+        if sym.is_empty() {
+            return out;
+        }
+        if sym.len() > 1 && sym.first() == sym.last() {
+            sym.pop();
+        }
+        let (mut start, mut end) = (vec![], vec![]);
+        if average_over <= along {
+            collect_offset_points(points, &mut start, interval, length_left + average_over, 0.0, sym.len());
+        } else {
+            collect_offset_points(points, &mut start, interval, 0.0, average_over - along, sym.len());
+        }
+        collect_offset_points(points, &mut end, interval, length_left - average_over, 0.0, sym.len());
+        for (i, pt) in sym.iter().enumerate() {
+            let (Some(a), Some(b)) = (start.get(i), end.get(i)) else { break };
+            out.push((*pt, Seg::new(*a, *b).angle().to_degrees()));
+        }
+    } else {
+        let mut last = points[0];
+        for &pt in &points[1..] {
+            if last == pt {
+                continue;
+            }
+            let l = Seg::new(last, pt);
+            let diff = l.diff_for_interval(interval);
+            let mut c = 1.0 - length_left / interval;
+            length_left += l.length;
+            let angle = l.angle().to_degrees();
+            while length_left > interval {
+                last = (last.0 + c * diff.0, last.1 + c * diff.1);
+                c = 1.0;
+                out.push((last, angle));
+                length_left -= interval;
+            }
+            last = pt;
+        }
+    }
+    out
 }
 
 /// Half the widest stroke of a line symbol in pixels (QgsSymbolLayer::estimateMaxBleed).

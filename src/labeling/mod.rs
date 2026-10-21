@@ -106,6 +106,20 @@ impl Engine {
         s.px(&self.units) * self.mupp
     }
 
+    /// Whether a labeling rule registers anything at this scale: its scale range, then the
+    /// settings' scale visibility (hidden labels still register as obstacles).
+    pub fn rule_active(&self, rule: &LabelingRule) -> bool {
+        if let Some((mindenom, maxdenom)) = rule.scale_range
+            && ((mindenom > 0.0 && self.scale < mindenom) || (maxdenom > 0.0 && self.scale > maxdenom))
+        {
+            return false;
+        }
+        let s = &rule.settings;
+        let visible = !s.scale_visibility
+            || !((s.minimum_scale > 0.0 && self.scale >= s.minimum_scale) || (s.maximum_scale > 0.0 && self.scale < s.maximum_scale));
+        visible || s.obstacle
+    }
+
     /// Register a layer's labels (QgsVectorLayerLabelProvider per labeling rule).
     pub fn register_layer(&mut self, layer: &MapLayer, features: &[LabelSource], vars: &Attrs, render_order: usize) {
         for rule in &layer.labeling {

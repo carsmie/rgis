@@ -165,6 +165,26 @@ pub enum SymbolLayer {
         stroke_width: Size,
         angle: f64,
         offset: (Size, Size),
+        /// (horizontal, vertical) anchor point: 0 left/top, 1 centre, 2 right/bottom.
+        anchor: (u8, u8),
+    },
+    /// QgsMarkerLineSymbolLayer / QgsHashedLineSymbolLayer with interval placement: a marker
+    /// sub-symbol, or a `hash_length` tick drawn with a line sub-symbol, every `interval`.
+    TemplatedLine {
+        /// Qgis::MarkerLinePlacements this port handles: Interval, FirstVertex, LastVertex.
+        on_interval: bool,
+        on_first: bool,
+        on_last: bool,
+        /// place_on_every_part; false = first vertex of the first part, last of the last.
+        every_part: bool,
+        interval: Size,
+        offset_along: Size,
+        /// average_angle_length (the angle is averaged over ± half of it).
+        average_over: Size,
+        rotate: bool,
+        /// Some((hash_length, hash_angle)) for HashLine.
+        hash: Option<(Size, f64)>,
+        sub: Box<Symbol>,
     },
     /// SimpleMarker (width = height = size) and EllipseMarker (symbol_width × symbol_height).
     Marker {
@@ -178,6 +198,8 @@ pub enum SymbolLayer {
         /// Clockwise rotation in degrees.
         angle: f64,
         offset: (Size, Size),
+        /// (horizontal, vertical) anchor point: 0 left/top, 1 centre, 2 right/bottom.
+        anchor: (u8, u8),
     },
 }
 
@@ -279,6 +301,14 @@ impl Layer {
                 }
                 if let Some(w) = dd_num(dd, "strokeWidth", ctx) {
                     stroke_width.value = w;
+                }
+            }
+            SymbolLayer::TemplatedLine { interval, offset_along, .. } => {
+                if let Some(i) = dd_num(dd, "interval", ctx) {
+                    interval.value = i;
+                }
+                if let Some(o) = dd_num(dd, "offsetAlongLine", ctx) {
+                    offset_along.value = o;
                 }
             }
             SymbolLayer::LinePatternFill {
@@ -526,6 +556,11 @@ pub fn parse_symbol(n: Node) -> Symbol {
             (Size::new(x, unit, 0.0), Size::new(y, unit, 0.0))
         };
         let angle = g("angle").and_then(|a| a.parse().ok()).unwrap_or(0.0);
+        // QgsMarkerSymbolLayer::decode{Horizontal,Vertical}AnchorPoint (Baseline = Bottom)
+        let anchor = (
+            g("horizontal_anchor_point").and_then(|v| v.parse().ok()).unwrap_or(1u8).min(2),
+            g("vertical_anchor_point").and_then(|v| v.parse().ok()).unwrap_or(1u8).min(2),
+        );
         let kind = match class {
             "SimpleFill" => {
                 let style = g("style").unwrap_or("solid");
@@ -590,6 +625,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 ),
                 angle,
                 offset: offset(),
+                anchor,
             },
             "SvgMarker" => SymbolLayer::SvgMarker {
                 name: g("name").unwrap_or("").to_string(),
@@ -607,6 +643,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 stroke_width: Size::new(g("outline_width"), g("outline_width_unit"), 0.2),
                 angle,
                 offset: offset(),
+                anchor,
             },
             "SimpleMarker" | "FontMarker" => {
                 if class != "SimpleMarker" {
@@ -631,6 +668,61 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     ),
                     angle,
                     offset: offset(),
+                    anchor,
+                }
+            }
+            "MarkerLine" | "HashLine" => {
+                // `placements` (flags) since QGIS 3.24, the single `placement` before.
+                let placements: Vec<String> = match g("placements") {
+                    Some(v) => v.split('|').map(String::from).collect(),
+                    None => vec![match g("placement").unwrap_or("interval") {
+                        "vertex" => "Vertex",
+                        "lastvertex" => "LastVertex",
+                        "firstvertex" => "FirstVertex",
+                        "centralpoint" => "CentralPoint",
+                        "curvepoint" => "CurvePoint",
+                        "segmentcenter" => "SegmentCenter",
+                        "innervertices" => "InnerVertices",
+                        _ => "Interval",
+                    }
+                    .to_string()],
+                };
+                let has = |n: &str| placements.iter().any(|p| p == n);
+                let offset = g("offset").and_then(|o| o.split(',').next()?.parse::<f64>().ok()).unwrap_or(0.0);
+                let along = g("offset_along_line").and_then(|o| o.parse::<f64>().ok()).unwrap_or(0.0);
+                let Some(sub) = l.children().find(|c| c.has_tag_name("symbol")) else {
+                    warn!("{class} without a sub-symbol ignored");
+                    continue;
+                };
+                let unsupported: Vec<&String> = placements
+                    .iter()
+                    .filter(|p| !matches!(p.as_str(), "Interval" | "FirstVertex" | "LastVertex"))
+                    .collect();
+                if !unsupported.is_empty() {
+                    warn!("{class}: placement {unsupported:?} not supported; those are left out");
+                }
+                // A perpendicular offset needs QGIS's GEOS offset curve; the vertex placements'
+                // offset along the line its renderOffsetVertexAlongLine — neither ported yet.
+                if offset != 0.0 || (along != 0.0 && (has("FirstVertex") || has("LastVertex"))) {
+                    warn!("{class} with an offset is not supported; ignored");
+                    continue;
+                }
+                SymbolLayer::TemplatedLine {
+                    on_interval: has("Interval"),
+                    on_first: has("FirstVertex"),
+                    on_last: has("LastVertex"),
+                    every_part: g("place_on_every_part").is_none_or(|v| v == "true" || v == "1"),
+                    interval: Size::new(g("interval"), g("interval_unit"), 3.0),
+                    offset_along: Size::new(g("offset_along_line"), g("offset_along_line_unit"), 0.0),
+                    average_over: Size::new(g("average_angle_length"), g("average_angle_unit"), 4.0),
+                    rotate: g("rotate").is_none_or(|r| r == "1" || r == "true"),
+                    hash: (class == "HashLine").then(|| {
+                        (
+                            Size::new(g("hash_length"), g("hash_length_unit"), 3.0),
+                            g("hash_angle").and_then(|a| a.parse().ok()).unwrap_or(0.0),
+                        )
+                    }),
+                    sub: Box::new(parse_symbol(sub)),
                 }
             }
             other => {
@@ -714,6 +806,7 @@ impl Symbol {
                     }
                 }
                 SymbolLayer::LinePatternFill { line, .. } => line.resolve_paths(project_dir),
+                SymbolLayer::TemplatedLine { sub, .. } => sub.resolve_paths(project_dir),
                 _ => {}
             }
         }
@@ -937,6 +1030,22 @@ impl Renderer {
                 walk(rules, symbols, &mut out);
                 out
             }
+        }
+    }
+}
+
+impl Renderer {
+    /// Whether any feature can get a symbol at this scale (QgsRuleBasedRenderer::startRender
+    /// leaves no active rule → QGIS fetches nothing). False lets the layer be skipped
+    /// before any data is read.
+    pub fn active_at(&self, scale: f64) -> bool {
+        fn any(rules: &[Rule], scale: f64) -> bool {
+            rules.iter().any(|r| r.active && in_scale(r, scale) && (r.symbol.is_some() || any(&r.children, scale)))
+        }
+        match self {
+            Renderer::Rules { rules, .. } => any(rules, scale),
+            Renderer::Null => false,
+            _ => true,
         }
     }
 }

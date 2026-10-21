@@ -488,7 +488,12 @@ mod imp {
 
     /// An opened GDAL raster (QgsGdalProvider), north-up (via a warped VRT if needed).
     pub struct RasterSource {
-        ds: Mutex<(Handle, Option<Handle>)>,
+        /// GDAL name the handles are opened from.
+        name: String,
+        /// Free dataset handles (base, warped VRT). A GDAL dataset must not be read from two
+        /// threads at once, and one shared handle made concurrent requests for the same
+        /// raster queue behind each other; a handle per concurrent reader instead.
+        pool: Mutex<Vec<(Handle, Option<Handle>)>>,
         width: usize,
         height: usize,
         gt: [f64; 6],
@@ -522,6 +527,68 @@ mod imp {
         }
     }
 
+    /// GDALOpenEx plus QgsGdalProvider::initBaseDataset's north-up warped VRT when needed.
+    fn open_pair(name: &str) -> Result<(Handle, Option<Handle>)> {
+        let c = CString::new(name)?;
+        let base = unsafe {
+            g::GDALOpenEx(
+                c.as_ptr(),
+                GDAL_OF_RASTER,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if base.is_null() {
+            bail!("GDAL cannot open raster '{name}'");
+        }
+        let base = Handle(base);
+        let mut gt = [0f64; 6];
+        let has_gt =
+            unsafe { g::GDALGetGeoTransform(base.0, gt.as_mut_ptr()) } == g::CPLErr::CE_None;
+        // QgsGdalProvider::initBaseDataset: rotated / south-up / GCP / RPC rasters
+        // are read through a north-up warped VRT.
+        let needs_warp = unsafe {
+            (has_gt && (gt[1] < 0.0 || gt[2] != 0.0 || gt[4] != 0.0 || gt[5] > 0.0))
+                || g::GDALGetGCPCount(base.0) > 0
+                || !g::GDALGetMetadata(base.0 as g::GDALMajorObjectH, c"RPC".as_ptr()).is_null()
+                || !g::GDALGetMetadata(base.0 as g::GDALMajorObjectH, c"GEOLOCATION".as_ptr())
+                .is_null()
+        };
+        let mut warped = None;
+        if needs_warp {
+            unsafe {
+                let opts = g::GDALCreateWarpOptions();
+                let south_up_plain = has_gt
+                && gt[1] > 0.0
+                && gt[2] == 0.0
+                && gt[4] == 0.0
+                && gt[5] > 0.0
+                && g::GDALGetGCPCount(base.0) == 0;
+                if !south_up_plain
+                && g::GDALGetMaskFlags(g::GDALGetRasterBand(base.0, 1)) == GMF_ALL_VALID
+                {
+                (*opts).nDstAlphaBand = g::GDALGetRasterCount(base.0) + 1;
+                }
+                let vrt = g::GDALAutoCreateWarpedVRT(
+                base.0,
+                std::ptr::null(),
+                std::ptr::null(),
+                g::GDALResampleAlg::GRA_NearestNeighbour,
+                0.2,
+                opts,
+                );
+                g::GDALDestroyWarpOptions(opts);
+                if vrt.is_null() {
+                warn!("warped VRT creation failed for {name}");
+                } else {
+                warped = Some(Handle(vrt));
+                }
+            }
+        }
+        Ok((base, warped))
+    }
+
     impl RasterSource {
         pub fn open(datasource: &str, base_dir: &Path) -> Result<Arc<RasterSource>> {
             let name = gdal_name(datasource, base_dir);
@@ -530,63 +597,8 @@ mod imp {
             }
             static INIT: Once = Once::new();
             INIT.call_once(|| unsafe { g::GDALAllRegister() });
-            let c = CString::new(name.clone())?;
-            let base = unsafe {
-                g::GDALOpenEx(
-                    c.as_ptr(),
-                    GDAL_OF_RASTER,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            };
-            if base.is_null() {
-                bail!("GDAL cannot open raster '{name}'");
-            }
-            let base = Handle(base);
+            let (base, warped) = open_pair(&name)?;
             let mut gt = [0f64; 6];
-            let has_gt =
-                unsafe { g::GDALGetGeoTransform(base.0, gt.as_mut_ptr()) } == g::CPLErr::CE_None;
-            // QgsGdalProvider::initBaseDataset: rotated / south-up / GCP / RPC rasters
-            // are read through a north-up warped VRT.
-            let needs_warp = unsafe {
-                (has_gt && (gt[1] < 0.0 || gt[2] != 0.0 || gt[4] != 0.0 || gt[5] > 0.0))
-                    || g::GDALGetGCPCount(base.0) > 0
-                    || !g::GDALGetMetadata(base.0 as g::GDALMajorObjectH, c"RPC".as_ptr()).is_null()
-                    || !g::GDALGetMetadata(base.0 as g::GDALMajorObjectH, c"GEOLOCATION".as_ptr())
-                        .is_null()
-            };
-            let mut warped = None;
-            if needs_warp {
-                unsafe {
-                    let opts = g::GDALCreateWarpOptions();
-                    let south_up_plain = has_gt
-                        && gt[1] > 0.0
-                        && gt[2] == 0.0
-                        && gt[4] == 0.0
-                        && gt[5] > 0.0
-                        && g::GDALGetGCPCount(base.0) == 0;
-                    if !south_up_plain
-                        && g::GDALGetMaskFlags(g::GDALGetRasterBand(base.0, 1)) == GMF_ALL_VALID
-                    {
-                        (*opts).nDstAlphaBand = g::GDALGetRasterCount(base.0) + 1;
-                    }
-                    let vrt = g::GDALAutoCreateWarpedVRT(
-                        base.0,
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        g::GDALResampleAlg::GRA_NearestNeighbour,
-                        0.2,
-                        opts,
-                    );
-                    g::GDALDestroyWarpOptions(opts);
-                    if vrt.is_null() {
-                        warn!("warped VRT creation failed for {name}");
-                    } else {
-                        warped = Some(Handle(vrt));
-                    }
-                }
-            }
             let ds = warped.as_ref().map(|h| h.0).unwrap_or(base.0);
             let (width, height, count) = unsafe {
                 (
@@ -626,7 +638,8 @@ mod imp {
             );
             debug!("raster {name}: {width}x{height}, {count} band(s), extent {extent:?}");
             let src = Arc::new(RasterSource {
-                ds: Mutex::new((base, warped)),
+                name: name.clone(),
+                pool: Mutex::new(vec![(base, warped)]),
                 width,
                 height,
                 gt,
@@ -635,6 +648,18 @@ mod imp {
             });
             SOURCES.lock().insert(name, src.clone());
             Ok(src)
+        }
+
+        /// Run `f` on a dataset handle no other thread is using (taken from the pool, opened
+        /// if all are busy) and return it to the pool.
+        fn with_ds<R>(&self, f: impl FnOnce(g::GDALDatasetH) -> R) -> Result<R> {
+            let pair = match self.pool.lock().pop() {
+                Some(p) => p,
+                None => open_pair(&self.name)?,
+            };
+            let r = f(pair.1.as_ref().map(|h| h.0).unwrap_or(pair.0.0));
+            self.pool.lock().push(pair);
+            Ok(r)
         }
 
         /// GDALRasterIO of a window into a `bw`×`bh` buffer (nearest neighbour, may use overviews).
@@ -650,9 +675,7 @@ mod imp {
             bh: usize,
         ) -> Result<Vec<f64>> {
             let mut buf = vec![0f64; bw * bh];
-            let guard = self.ds.lock();
-            let ds = guard.1.as_ref().map(|h| h.0).unwrap_or(guard.0.0);
-            let err = unsafe {
+            let err = self.with_ds(|ds| unsafe {
                 let b = g::GDALGetRasterBand(ds, band);
                 g::GDALRasterIO(
                     b,
@@ -668,7 +691,7 @@ mod imp {
                     0,
                     0,
                 )
-            };
+            })?;
             if err != g::CPLErr::CE_None {
                 bail!("GDALRasterIO failed");
             }
@@ -693,9 +716,7 @@ mod imp {
             if buf.len() < need {
                 bail!("raster buffer too small");
             }
-            let guard = self.ds.lock();
-            let ds = guard.1.as_ref().map(|h| h.0).unwrap_or(guard.0.0);
-            let err = unsafe {
+            let err = self.with_ds(|ds| unsafe {
                 g::GDALRasterIOEx(
                     g::GDALGetRasterBand(ds, band),
                     g::GDALRWFlag::GF_Read,
@@ -711,7 +732,7 @@ mod imp {
                     (info.size * line) as g::GSpacing,
                     extra.map_or(std::ptr::null_mut(), |e| e as *mut _),
                 )
-            };
+            })?;
             if err != g::CPLErr::CE_None {
                 bail!("GDALRasterIOEx failed");
             }

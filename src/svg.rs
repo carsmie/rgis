@@ -142,8 +142,17 @@ fn leading_number(s: &str) -> Option<f64> {
 /// viewBox size, else width/height (QgsSvgCache::calcSizeScaleFactor).
 /// Height / width of an SVG file's view box (QgsSvgCache::svgViewboxSize).
 pub fn aspect(path: &Path) -> Option<f64> {
-    let (w, h) = viewbox_size(&read_svg(path).ok()?)?;
-    (w > 0.0).then(|| h / w)
+    // Cached: anchored markers need it per drawn marker.
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, Option<f64>>>> = LazyLock::new(Default::default);
+    if let Some(a) = CACHE.lock().get(path) {
+        return *a;
+    }
+    let a = read_svg(path)
+        .ok()
+        .and_then(|s| viewbox_size(&s))
+        .and_then(|(w, h)| (w > 0.0).then(|| h / w));
+    CACHE.lock().insert(path.to_path_buf(), a);
+    a
 }
 
 fn viewbox_size(svg: &str) -> Option<(f64, f64)> {
