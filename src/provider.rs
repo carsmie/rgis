@@ -198,15 +198,23 @@ impl Provider {
 
     /// Features intersecting `bbox` (in layer CRS), or all features.
     pub fn features(&self, bbox_filter: Option<Rect>) -> Result<Vec<Feature>> {
+        self.features_where(bbox_filter, None)
+    }
+
+    /// Features in `bbox_filter` whose attributes pass `keep` (and the layer subset).
+    /// FlatGeobuf checks `keep` right after decoding the properties, so rejected features
+    /// never have their geometry decoded.
+    pub fn features_where(&self, bbox_filter: Option<Rect>, keep: Option<&dyn Fn(&Attrs) -> bool>) -> Result<Vec<Feature>> {
         let started = std::time::Instant::now();
         let out = match &self.kind {
             Kind::Fgb(FgbSource::File(p)) => fgb_features(
                 BufReader::new(std::fs::File::open(p)?),
                 bbox_filter,
                 &self.fields,
+                keep,
             ),
             Kind::Fgb(FgbSource::Http(f)) => {
-                fgb_features(HttpReader::new(f.clone()), bbox_filter, &self.fields)
+                fgb_features(HttpReader::new(f.clone()), bbox_filter, &self.fields, keep)
             }
             Kind::Gpkg(g) => gpkg_features(g, &self.fields, bbox_filter),
             Kind::Memory(all) => Ok(all
@@ -217,6 +225,10 @@ impl Provider {
         }?;
         let out: Vec<Feature> = match &self.filter {
             Some(e) => out.into_iter().filter(|f| e.matches(&f.attrs)).collect(),
+            None => out,
+        };
+        let out: Vec<Feature> = match keep {
+            Some(k) => out.into_iter().filter(|f| k(&f.attrs)).collect(),
             None => out,
         };
         // OGR's rectangle spatial filter is exact (OGRLayer::FilterGeometry): a feature whose
@@ -310,6 +322,7 @@ fn fgb_features<R: Read + Seek>(
     mut r: R,
     filter: Option<Rect>,
     fields: &[Field],
+    keep: Option<&dyn Fn(&Attrs) -> bool>,
 ) -> Result<Vec<Feature>> {
     let (count, indexed) = {
         let reader = FgbReader::open(&mut r)?;
@@ -323,6 +336,9 @@ fn fgb_features<R: Read + Seek>(
             attrs.insert(fl.name.clone(), Value::Null);
         }
         f.process_properties(&mut Props(&mut attrs))?;
+        if keep.is_some_and(|k| !k(&attrs)) {
+            return Ok(());
+        }
         out.push(Feature {
             fid: fid as i64,
             geometry: f.to_geo().ok(),
@@ -377,6 +393,8 @@ fn fgb_features<R: Read + Seek>(
 // ------------------------------------------------- HTTP range reads (/vsicurl/)
 
 const BLOCK: u64 = 256 * 1024;
+/// Largest read-ahead: 16 blocks = 4 MB per request.
+const MAX_READAHEAD_BLOCKS: u64 = 16;
 
 /// Blocks of all remote files, evicted oldest-first beyond RGIS_HTTP_CACHE_MB (default 256).
 /// One budget for the process: a per-file cap grows with the number of files opened.
@@ -419,6 +437,8 @@ pub struct HttpFile {
     client: reqwest::Client,
     /// Key of this file's blocks in BLOCK_CACHE.
     id: u64,
+    /// Sequential-read detection: (block after the last fetch, blocks per request).
+    readahead: Mutex<(u64, u64)>,
     /// GCS canonical resource (`/bucket/object`) when requests are HMAC-signed (/vsigs/).
     gcs_resource: Option<String>,
 }
@@ -530,6 +550,7 @@ impl HttpFile {
             len,
             client,
             id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            readahead: Mutex::new((u64::MAX, 1)),
             gcs_resource,
         })
     }
@@ -538,8 +559,25 @@ impl HttpFile {
         if let Some(b) = BLOCK_CACHE.lock().blocks.get(&(self.id, n)) {
             return Ok(b.clone());
         }
+        // A miss right after the previous fetch is a sequential scan (FlatGeobuf features
+        // in a bbox are contiguous): double the blocks per request up to 4 MB, as GDAL's
+        // /vsicurl/ does; anything else is a lookup and fetches one block. One request
+        // per 256 KB made a 200 km view of a national file take minutes at GCS latency.
+        let window = {
+            let mut ra = self.readahead.lock();
+            ra.1 = if n == ra.0 { (ra.1 * 2).min(MAX_READAHEAD_BLOCKS) } else { 1 };
+            ra.1
+        };
+        let last_block = (self.len - 1) / BLOCK;
+        let mut count = 1;
+        {
+            let cache = BLOCK_CACHE.lock();
+            while count < window && n + count <= last_block && !cache.blocks.contains_key(&(self.id, n + count)) {
+                count += 1;
+            }
+        }
         let start = n * BLOCK;
-        let end = (start + BLOCK).min(self.len) - 1;
+        let end = ((n + count) * BLOCK).min(self.len) - 1;
         let (c, u, r) = (self.client.clone(), self.url.clone(), self.gcs_resource.clone());
         let data = run(async move {
             let resp = gcs_get(&c, &u, r.as_deref())
@@ -549,12 +587,20 @@ impl HttpFile {
                 .error_for_status()?;
             Ok(resp.bytes().await?.to_vec())
         })?;
-        debug!("vsicurl: fetched bytes {start}-{end} of {}", self.url);
-        let data = Arc::new(data);
+        debug!("vsicurl: fetched bytes {start}-{end} ({count} blocks) of {}", self.url);
+        self.readahead.lock().0 = n + count;
+        let mut first = None;
         let mut c = BLOCK_CACHE.lock();
-        if c.blocks.insert((self.id, n), data.clone()).is_none() {
-            c.bytes += data.len();
-            c.order.push_back((self.id, n));
+        for (i, chunk) in data.chunks(BLOCK as usize).enumerate() {
+            let chunk = Arc::new(chunk.to_vec());
+            if i == 0 {
+                first = Some(chunk.clone());
+            }
+            let key = (self.id, n + i as u64);
+            if c.blocks.insert(key, chunk.clone()).is_none() {
+                c.bytes += chunk.len();
+                c.order.push_back(key);
+            }
         }
         while c.bytes > c.budget {
             let Some(k) = c.order.pop_front() else { break };
@@ -562,7 +608,7 @@ impl HttpFile {
                 c.bytes -= b.len();
             }
         }
-        Ok(data)
+        first.ok_or_else(|| anyhow!("empty range response for {}", self.url))
     }
 }
 

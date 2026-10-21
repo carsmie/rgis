@@ -346,14 +346,22 @@ pub fn draw(pm: &mut Pixmap, m: &Marker, x: f32, y: f32) {
         };
         let (w, h) = (m.width, m.width * hw);
         let rect = fit(vb, w, h, (w, h), m.fixed_aspect > 0.0);
+        // Rendered into a pixmap just around the rotated marker (whole-pixel offset, so the
+        // samples are those of a canvas-sized one) instead of a canvas-sized layer: marker
+        // lines draw hundreds of rotated markers per image, each was a full-image composite.
+        let r = ((w * w + h * h).sqrt() / 2.0 + m.stroke_width + 2.0) as f32;
+        let (ox, oy) = ((x - r).floor(), (y - r).floor());
+        let size = (2.0 * r).ceil() as u32 + 2;
         let base = Transform::from_translate(-(w as f32) / 2.0, -(h as f32) / 2.0)
             .post_rotate(m.angle as f32)
-            .post_translate(x, y);
-        let mut layer = Pixmap::new(pm.width(), pm.height()).expect("same size");
+            .post_translate(x - ox, y - oy);
+        let Some(mut layer) = Pixmap::new(size, size) else {
+            return;
+        };
         render_into(&mut layer.as_mut(), &tree, rect, base);
         pm.draw_pixmap(
-            0,
-            0,
+            ox as i32,
+            oy as i32,
             layer.as_ref(),
             &tiny_skia::PixmapPaint {
                 opacity: m.opacity as f32,

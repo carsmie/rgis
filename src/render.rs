@@ -121,8 +121,15 @@ fn features_for_drawing(
         ms.extent.xmax + b,
         ms.extent.ymax + b,
     );
-    let mut out = provider.features(to_layer.rect(&render_extent).ok())?;
-    out.retain(|f| filter.is_none_or(|e| e.matches(&f.attrs)));
+    // Unlabelled layers: drop features no rule/class gives a symbol while reading, before
+    // their geometry is decoded (lag24's airport rules keep a few dozen of ~250 000 N50
+    // points in a 200 km view).
+    let scale = ms.scale();
+    let symbolled = !keep_full && !matches!(layer.renderer, crate::symbology::Renderer::Single(_));
+    let keep = |a: &Attrs| {
+        filter.is_none_or(|e| e.matches(a)) && (!symbolled || !layer.renderer.symbols_for(a, scale).is_empty())
+    };
+    let out = provider.features_where(to_layer.rect(&render_extent).ok(), Some(&keep))?;
 
     // The pixel tolerance in layer units, as QgsVectorLayerRenderer computes it: scale by the
     // diagonal ratio of a small square (0.0008983° or 100 units) at the centre of the extent
@@ -1596,4 +1603,53 @@ pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
     w.write_image_data(&rgba).map_err(fail)?;
     w.finish().map_err(fail)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn interval_placement_follows_qgis() {
+        // renderPolylineInterval without averaging: first marker after the offset, then
+        // every interval; nothing in the last partial interval.
+        let line = [(0.0, 0.0), (100.0, 0.0)];
+        let p = interval_points(&line, 20.0, 10.0, 0.0);
+        let xs: Vec<f64> = p.iter().map(|((x, _), _)| *x).collect();
+        assert_eq!(xs.len(), 5);
+        for (x, want) in xs.iter().zip([10.0, 30.0, 50.0, 70.0, 90.0]) {
+            assert!(near(*x, want), "{xs:?}");
+        }
+        assert!(p.iter().all(|(_, a)| near(*a, 0.0)));
+        // Averaged angles on a straight line are the line's angle (pixel y down: 90° = down).
+        let down = [(0.0, 0.0), (0.0, 100.0)];
+        let p = interval_points(&down, 20.0, 10.0, 7.5);
+        assert_eq!(p.len(), 5);
+        assert!(p.iter().all(|(_, a)| near(*a, 90.0)), "{p:?}");
+        // The interval carries over a vertex: 15 px left on the first segment.
+        let bent = [(0.0, 0.0), (25.0, 0.0), (25.0, 40.0)];
+        let p = interval_points(&bent, 20.0, 10.0, 0.0);
+        let pts: Vec<(f64, f64)> = p.iter().map(|(pt, _)| *pt).collect();
+        assert_eq!(pts.len(), 3, "{pts:?}");
+        assert!(near(pts[0].0, 10.0) && near(pts[1].1, 5.0) && near(pts[2].1, 25.0), "{pts:?}");
+    }
+
+    #[test]
+    fn end_angles_and_anchor_shift() {
+        let left = [(10.0, 0.0), (10.0, 0.0), (0.0, 0.0)];
+        assert!(near(end_angle(&left, true), 180.0));
+        assert!(near(end_angle(&left, false), 180.0));
+        // Top anchor: centre moves half the height down, then turns with the marker
+        // (QgsMarkerSymbolLayer::markerOffset + _rotatedOffset).
+        let (x, y) = marker_shift((0.0, 0.0), (1, 0), 10.0, 20.0, 0.0);
+        assert!(near(x as f64, 0.0) && near(y as f64, 10.0));
+        let (x, y) = marker_shift((0.0, 0.0), (1, 0), 10.0, 20.0, 90.0);
+        assert!((x + 10.0).abs() < 1e-5 && y.abs() < 1e-5, "{x} {y}");
+        let (x, y) = marker_shift((2.0, 0.0), (0, 2), 10.0, 20.0, 0.0);
+        assert!(near(x as f64, 7.0) && near(y as f64, -10.0));
+    }
 }
