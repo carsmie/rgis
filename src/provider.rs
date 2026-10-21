@@ -212,9 +212,11 @@ impl Provider {
                 bbox_filter,
                 &self.fields,
                 keep,
+                None,
             ),
             Kind::Fgb(FgbSource::Http(f)) => {
-                fgb_features(HttpReader::new(f.clone()), bbox_filter, &self.fields, keep)
+                let prefetch = |ranges: &[(u64, u64)]| f.prefetch(ranges);
+                fgb_features(HttpReader::new(f.clone()), bbox_filter, &self.fields, keep, Some(&prefetch))
             }
             Kind::Gpkg(g) => gpkg_features(g, &self.fields, bbox_filter),
             Kind::Memory(all) => Ok(all
@@ -310,6 +312,9 @@ fn fgb_header<R: Read>(r: &mut R) -> Result<(Vec<Field>, Option<Rect>)> {
     Ok((fields, extent))
 }
 
+/// Fetches byte ranges of a remote file ahead of reading them.
+type Prefetch<'a> = dyn Fn(&[(u64, u64)]) + 'a;
+
 fn memory_extent(all: &[(Rect, Feature)]) -> Option<Rect> {
     let mut e = Rect::empty();
     for (r, _) in all {
@@ -323,6 +328,7 @@ fn fgb_features<R: Read + Seek>(
     filter: Option<Rect>,
     fields: &[Field],
     keep: Option<&dyn Fn(&Attrs) -> bool>,
+    prefetch: Option<&Prefetch>,
 ) -> Result<Vec<Feature>> {
     let (count, indexed) = {
         let reader = FgbReader::open(&mut r)?;
@@ -351,6 +357,7 @@ fn fgb_features<R: Read + Seek>(
             // The reader is positioned right after the header: search the packed R-tree
             // ourselves to learn feature numbers (= OGR FIDs), then stream the same
             // selection through FgbReader::select_bbox (identical, offset-ordered list).
+            let header_end = r.stream_position()?;
             let hits = PackedRTree::stream_search(
                 &mut r,
                 count,
@@ -360,6 +367,25 @@ fn fgb_features<R: Read + Seek>(
                 b.xmax,
                 b.ymax,
             )?;
+            // Remote files: the index says where every selected feature is, so fetch those
+            // bytes in parallel up front instead of one range request at a time while decoding.
+            if let Some(prefetch) = prefetch
+                && !hits.is_empty()
+            {
+                let data_start = header_end + PackedRTree::index_size(count, PackedRTree::DEFAULT_NODE_SIZE) as u64;
+                // A feature's size is only in its own prefix: allow 64 KB after the last one of
+                // a run; consecutive hits less than 256 KB apart share a run.
+                const TAIL: u64 = 64 * 1024;
+                let mut ranges: Vec<(u64, u64)> = vec![];
+                for h in &hits {
+                    let start = data_start + h.offset as u64;
+                    match ranges.last_mut() {
+                        Some(last) if start <= last.1 + 256 * 1024 => last.1 = last.1.max(start + TAIL),
+                        _ => ranges.push((start, start + TAIL)),
+                    }
+                }
+                prefetch(&ranges);
+            }
             r.seek(SeekFrom::Start(0))?;
             let mut it = FgbReader::open(&mut r)?.select_bbox(b.xmin, b.ymin, b.xmax, b.ymax)?;
             let mut ids = hits.iter().map(|h| h.index);
@@ -553,6 +579,82 @@ impl HttpFile {
             readahead: Mutex::new((u64::MAX, 1)),
             gcs_resource,
         })
+    }
+
+    /// Fetch the blocks covering `ranges` that are not cached yet: consecutive missing
+    /// blocks in one request (up to MAX_READAHEAD_BLOCKS), at most 8 requests at a time.
+    /// Best effort — a failed run is left to the on-demand read.
+    fn prefetch(&self, ranges: &[(u64, u64)]) {
+        let last_block = (self.len.max(1) - 1) / BLOCK;
+        let mut runs: Vec<(u64, u64)> = vec![]; // (first block, count)
+        {
+            let cache = BLOCK_CACHE.lock();
+            let mut wanted: Vec<u64> = ranges
+                .iter()
+                .flat_map(|&(a, b)| (a / BLOCK)..=(b.min(self.len.max(1) - 1) / BLOCK).min(last_block))
+                .filter(|n| !cache.blocks.contains_key(&(self.id, *n)))
+                .collect();
+            wanted.sort_unstable();
+            wanted.dedup();
+            for n in wanted {
+                match runs.last_mut() {
+                    Some((first, count)) if *first + *count == n && *count < MAX_READAHEAD_BLOCKS => *count += 1,
+                    _ => runs.push((n, 1)),
+                }
+            }
+        }
+        if runs.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let n_runs = runs.len();
+        let (c, u, r, len) = (self.client.clone(), self.url.clone(), self.gcs_resource.clone(), self.len);
+        let fetched = run(async move {
+            let limit = Arc::new(tokio::sync::Semaphore::new(8));
+            let mut set = tokio::task::JoinSet::new();
+            for (first, count) in runs {
+                let (c, u, r, limit) = (c.clone(), u.clone(), r.clone(), limit.clone());
+                set.spawn(async move {
+                    let _permit = limit.acquire_owned().await.ok()?;
+                    let start = first * BLOCK;
+                    let end = ((first + count) * BLOCK).min(len) - 1;
+                    let resp = gcs_get(&c, &u, r.as_deref())
+                        .header("Range", format!("bytes={start}-{end}"))
+                        .send()
+                        .await
+                        .ok()?
+                        .error_for_status()
+                        .ok()?;
+                    Some((first, resp.bytes().await.ok()?.to_vec()))
+                });
+            }
+            let mut out = vec![];
+            while let Some(res) = set.join_next().await {
+                if let Ok(Some(x)) = res {
+                    out.push(x);
+                }
+            }
+            Ok(out)
+        });
+        let Ok(fetched) = fetched else { return };
+        let mut c = BLOCK_CACHE.lock();
+        for (first, data) in fetched {
+            for (i, chunk) in data.chunks(BLOCK as usize).enumerate() {
+                let key = (self.id, first + i as u64);
+                let chunk = Arc::new(chunk.to_vec());
+                if c.blocks.insert(key, chunk.clone()).is_none() {
+                    c.bytes += chunk.len();
+                    c.order.push_back(key);
+                }
+            }
+        }
+        while c.bytes > c.budget {
+            let Some(k) = c.order.pop_front() else { break };
+            if let Some(b) = c.blocks.remove(&k) {
+                c.bytes -= b.len();
+            }
+        }
+        debug!("vsicurl: prefetched {n_runs} range(s) of {} in {:?}", self.url, started.elapsed());
     }
 
     fn block(&self, n: u64) -> Result<Arc<Vec<u8>>> {
