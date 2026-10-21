@@ -15,14 +15,19 @@ RUN apt-get update \
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION}
 WORKDIR /src
+# Dependencies in their own layer, rebuilt only when Cargo.toml/Cargo.lock (or the GDAL base
+# image, for gdal-sys) change: CI's layer cache (cache-to: gha) keeps layers, not cache mounts,
+# so with mounts every release compiled all dependencies again (~5 of ~6 min).
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+ && cargo build --release --locked \
+ && rm -rf src
 COPY . .
-# Cache mounts keep the registry and incremental target dir across builds; the binary is
-# copied out because the target mount is not part of the image. Target cache is keyed by
-# GDAL version: gdal-sys doesn't re-run bindgen when only the installed GDAL changes.
-ARG GDAL_VERSION
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=rgis-target-gdal${GDAL_VERSION},target=/src/target \
-    cargo build --release --locked && cp target/release/rgis /usr/local/bin/rgis
+# Only rgis itself compiles here; target/ is dropped so this layer stays small in the cache.
+RUN touch src/main.rs \
+ && cargo build --release --locked \
+ && cp target/release/rgis /usr/local/bin/rgis \
+ && rm -rf target
 
 FROM ghcr.io/osgeo/gdal:ubuntu-small-${GDAL_VERSION}
 # The font packages of the tnt-qgis QGIS Server image (CJK left out), so labels resolve to
