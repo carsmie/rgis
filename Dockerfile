@@ -42,6 +42,15 @@ ENV RGIS_LABEL_FONT="Noto Sans"
 # glibc keeps an arena per busy thread and hands little back after a burst of parallel
 # renders (RSS stayed ~2x higher); two arenas cost no measurable latency.
 ENV MALLOC_ARENA_MAX=2
+# GDAL (rasters, /vsigs/): the block cache otherwise defaults to 5 % of the RAM GDAL sees,
+# which can be the node's rather than the pod's limit (a GEBCO read kept ~500 MB); the rest
+# matches the tnt-qgis image: HTTP/2, no sidecar-file probing on open, retries.
+ENV GDAL_CACHEMAX=256 \
+    GDAL_HTTP_VERSION=2 \
+    GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR \
+    GDAL_HTTP_MAX_RETRY=3 \
+    GDAL_HTTP_RETRY_DELAY=1 \
+    GDAL_PAM_ENABLED=NO
 COPY --from=build /usr/local/bin/rgis /usr/local/bin/rgis
 COPY demo /opt/rgis/demo
 RUN useradd --uid 10001 --no-create-home rgis
