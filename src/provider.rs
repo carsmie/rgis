@@ -74,6 +74,7 @@ struct GpkgSource {
 enum Kind {
     Fgb(FgbSource),
     Gpkg(GpkgSource),
+    Pg(crate::postgis::PgSource),
     Memory(Vec<(Rect, Feature)>),
 }
 
@@ -123,8 +124,12 @@ fn parse_uri(ds: &str) -> Uri {
 
 impl Provider {
     pub fn open(base_dir: &Path, provider_key: &str, datasource: &str) -> Result<Provider> {
+        if provider_key == "postgres" {
+            let (pg, fields, description) = crate::postgis::PgSource::open(datasource)?;
+            return Ok(Provider { kind: Kind::Pg(pg), fields, description, extent: None, filter: None });
+        }
         if provider_key != "ogr" {
-            bail!("provider '{provider_key}' is not supported (only 'ogr')");
+            bail!("provider '{provider_key}' is not supported (only 'ogr' and 'postgres')");
         }
         let uri = parse_uri(datasource);
         let mut p = Self::open_uri(base_dir, &uri)?;
@@ -219,6 +224,7 @@ impl Provider {
                 fgb_features(HttpReader::new(f.clone()), bbox_filter, &self.fields, keep, Some(&prefetch))
             }
             Kind::Gpkg(g) => gpkg_features(g, &self.fields, bbox_filter),
+            Kind::Pg(p) => p.features(bbox_filter, keep),
             Kind::Memory(all) => Ok(all
                 .iter()
                 .filter(|(r, _)| bbox_filter.is_none_or(|b| b.intersects(r)))
@@ -234,8 +240,9 @@ impl Provider {
             None => out,
         };
         // OGR's rectangle spatial filter is exact (OGRLayer::FilterGeometry): a feature whose
-        // bbox touches the rectangle but whose geometry does not is not returned.
-        let out = match bbox_filter {
+        // bbox touches the rectangle but whose geometry does not is not returned. QGIS's
+        // postgres provider renders with the bbox test (&&) only.
+        let out = match bbox_filter.filter(|_| !matches!(self.kind, Kind::Pg(_))) {
             Some(b) => out
                 .into_iter()
                 .filter(|f| match &f.geometry {
@@ -527,8 +534,13 @@ pub fn fetch_vsigs_if_changed(path: &str, etag: Option<&str>) -> Result<Option<(
     .with_context(|| format!("cannot read /vsigs/{path}"))
 }
 
+/// Start a background task on the I/O runtime (postgres connection drivers).
+pub(crate) fn spawn_io(fut: impl std::future::Future<Output = ()> + Send + 'static) {
+    IO_RUNTIME.spawn(fut);
+}
+
 /// Run async HTTP work from synchronous provider code on a dedicated runtime.
-fn run<T: Send + 'static>(
+pub(crate) fn run<T: Send + 'static>(
     fut: impl std::future::Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
     let (tx, rx) = std::sync::mpsc::channel();

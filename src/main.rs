@@ -6,6 +6,7 @@ mod expression;
 mod geom;
 mod labeling;
 mod params;
+mod postgis;
 mod project;
 mod provider;
 mod raster;
@@ -54,6 +55,7 @@ ENVIRONMENT:
                                comma-separated; * = all in a local directory)
     RGIS_RENDER_BUDGET_MPX     megapixels rendered at once (default 16)
     RGIS_HTTP_CACHE_MB         remote-file block cache size (default 256)
+    PGUSER, PGPASSWORD         credentials for postgres layers (override the datasource's)
 
     GET /health answers 200 (liveness); GET /ready answers 503 until the warm-up is done.
 ";
