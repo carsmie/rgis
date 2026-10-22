@@ -570,8 +570,29 @@ pub enum Renderer {
     Rules {
         rules: Vec<Rule>,
         symbols: HashMap<String, Symbol>,
+        /// Unique per parsed renderer (keys RULE_CACHE; addresses are reused on reload).
+        id: u64,
+        /// Every field the rule filters read, when they depend on nothing else: features
+        /// with equal values for these get the same symbols (memoised in RULE_CACHE).
+        fields: Option<Vec<String>>,
     },
     Null,
+}
+
+static NEXT_RENDERER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    /// (renderer id, scale bits, field values) → symbol names of the matching rules.
+    /// Rule filters ran up to three times per feature (read filter, drawing, labels),
+    /// each through every rule (23 in lag20's FKB roads); most features share a few
+    /// attribute combinations.
+    static RULE_CACHE: std::cell::RefCell<HashMap<(u64, u64, String), Vec<String>>> = Default::default();
+}
+
+fn rule_fields(rules: &[Rule], out: &mut Vec<String>) -> bool {
+    rules.iter().fold(true, |ok, r| {
+        r.filter.as_ref().is_none_or(|f| f.fields(out)) & rule_fields(&r.children, out) & ok
+    })
 }
 
 /// A legend entry (one per symbol class) – used by GetLegendGraphic.
@@ -1045,17 +1066,24 @@ impl Renderer {
                     .unwrap_or_default(),
                 symbols: parse_symbols(r),
             },
-            "RuleRenderer" => Renderer::Rules {
-                rules: child(r, "rules")
+            "RuleRenderer" => {
+                let rules: Vec<Rule> = child(r, "rules")
                     .map(|rs| {
                         rs.children()
                             .filter(|c| c.has_tag_name("rule"))
                             .map(parse_rule)
                             .collect()
                     })
-                    .unwrap_or_default(),
-                symbols: parse_symbols(r),
-            },
+                    .unwrap_or_default();
+                let mut fields = vec![];
+                let fields = rule_fields(&rules, &mut fields).then_some(fields);
+                Renderer::Rules {
+                    rules,
+                    symbols: parse_symbols(r),
+                    id: NEXT_RENDERER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    fields,
+                }
+            }
             "nullSymbol" => Renderer::Null,
             _ => {
                 // Wrapper renderers (inverted polygons, point displacement, …) embed another one.
@@ -1123,10 +1151,37 @@ impl Renderer {
                     .into_iter()
                     .collect()
             }
-            Renderer::Rules { rules, symbols } => {
-                let mut out = vec![];
-                collect_rules(rules, a, scale, symbols, &mut out);
-                out
+            Renderer::Rules { rules, symbols, id, fields } => {
+                let Some(fields) = fields else {
+                    let mut out = vec![];
+                    collect_rules(rules, a, scale, symbols, &mut out);
+                    return out;
+                };
+                let mut key = String::new();
+                for f in fields {
+                    // JSON text keeps types apart (null vs "", 1 vs "1")
+                    key.push_str(&crate::expression::field_value(a, f).to_string());
+                    key.push('\u{1f}');
+                }
+                let k = (*id, scale.to_bits(), key);
+                let names = RULE_CACHE.with(|c| c.borrow().get(&k).cloned());
+                let names = names.unwrap_or_else(|| {
+                    let mut out = vec![];
+                    collect_rules(rules, a, scale, symbols, &mut out);
+                    let names: Vec<String> = out
+                        .iter()
+                        .filter_map(|s| symbols.iter().find(|(_, v)| std::ptr::eq(*v, *s)).map(|(n, _)| n.clone()))
+                        .collect();
+                    RULE_CACHE.with(|c| {
+                        let mut c = c.borrow_mut();
+                        if c.len() > 50_000 {
+                            c.clear();
+                        }
+                        c.insert(k, names.clone());
+                    });
+                    names
+                });
+                names.iter().filter_map(|n| symbols.get(n)).collect()
             }
         }
     }
@@ -1162,7 +1217,7 @@ impl Renderer {
                     })
                 })
                 .collect(),
-            Renderer::Rules { rules, symbols } => {
+            Renderer::Rules { rules, symbols, .. } => {
                 fn walk<'a>(
                     rs: &'a [Rule],
                     symbols: &'a HashMap<String, Symbol>,

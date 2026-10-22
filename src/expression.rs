@@ -340,6 +340,27 @@ impl Expr {
         Ok(e)
     }
 
+    /// Collect the fields this expression reads; false when its value can depend on
+    /// more than those fields' values (attribute(name), random or clock functions).
+    pub fn fields(&self, out: &mut Vec<String>) -> bool {
+        match self {
+            Expr::Lit(_) => true,
+            Expr::Field(f) => {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+                true
+            }
+            Expr::Unary(_, e) | Expr::IsNull(e, _) => e.fields(out),
+            Expr::Binary(_, l, r) => l.fields(out) & r.fields(out),
+            Expr::In(e, list, _) => list.iter().fold(e.fields(out), |ok, x| x.fields(out) & ok),
+            Expr::Call(f, args) => {
+                let pure = !matches!(f.as_str(), "attribute" | "now" | "uuid" | "$uuid") && !f.starts_with("rand");
+                args.iter().fold(pure, |ok, x| x.fields(out) & ok)
+            }
+        }
+    }
+
     pub fn matches(&self, attrs: &Attrs) -> bool {
         truthy(&self.eval_cow(attrs))
     }
@@ -521,7 +542,7 @@ pub fn num(v: &Value) -> Option<f64> {
 static NULL: Value = Value::Null;
 
 /// A field by name, falling back to a case-insensitive match (QGIS field names are).
-fn field_value<'a>(a: &'a Attrs, f: &str) -> &'a Value {
+pub(crate) fn field_value<'a>(a: &'a Attrs, f: &str) -> &'a Value {
     a.get(f)
         .or_else(|| a.iter().find(|(k, _)| k.eq_ignore_ascii_case(f)).map(|(_, v)| v))
         .unwrap_or(&NULL)

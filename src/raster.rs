@@ -1497,13 +1497,23 @@ mod imp {
                     *alpha_band > 0 || !transparency.is_empty() || (*opacity - 1.0).abs() > 1e-9;
                 let nd = nodata_pixel(*nodata_color);
                 let mut out = vec![PremultipliedColorU8::TRANSPARENT; n];
+                // ColorRamp::shade per distinct value (byte rasters have at most 256)
+                let mut shades = Memo::<u64, Option<[i32; 4]>>::new();
                 for i in 0..n {
                     if input.nodata[i] {
                         out[i] = nd;
                         continue;
                     }
                     let v = input.data[i];
-                    let Some([mut r, mut g, mut b, a]) = ramp.shade(v) else {
+                    let shade = match shades.get(v.to_bits()) {
+                        Some(c) => c,
+                        None => {
+                            let c = ramp.shade(v);
+                            shades.put(v.to_bits(), c);
+                            c
+                        }
+                    };
+                    let Some([mut r, mut g, mut b, a]) = shade else {
                         out[i] = nd;
                         continue;
                     };
@@ -1555,10 +1565,13 @@ mod imp {
         let curve = |c: f64| {
             255.0 * ((((c / 255.0 - 0.5) * f + 0.5) * 255.0 + brightness as f64) / 255.0).powf(gc)
         };
+        // Opaque pixels only depend on the 8-bit channel: one powf per value, not per pixel
+        // (6 M powf calls for a 1424² HiDPI metatile).
+        let opaque: [i32; 256] = std::array::from_fn(|c| (curve(c as f64) as i32).clamp(0, 255));
         // adjustColorComponent
         let adjust = |c: u8, a: u8| -> i32 {
             match a {
-                255 => (curve(c as f64) as i32).clamp(0, 255),
+                255 => opaque[c as usize],
                 0 => 0,
                 _ => {
                     let af = a as f64 / 255.0;
@@ -1566,17 +1579,30 @@ mod imp {
                 }
             }
         };
+        // Translucent pixels (ramps with alpha, e.g. lag11's shading) take the powf path:
+        // memoised per input pixel like hue_saturation.
+        let mut memo = Memo::<u32, PremultipliedColorU8>::new();
         for p in img.iter_mut() {
             if *p == PremultipliedColorU8::TRANSPARENT {
                 continue;
             }
             let a = p.alpha();
+            let key = u32::from_le_bytes([p.red(), p.green(), p.blue(), a]);
+            if a != 255
+                && let Some(v) = memo.get(key)
+            {
+                *p = v;
+                continue;
+            }
             *p = rgba(
                 adjust(p.red(), a),
                 adjust(p.green(), a),
                 adjust(p.blue(), a),
                 a as i32,
             );
+            if a != 255 {
+                memo.put(key, *p);
+            }
         }
     }
 
@@ -1678,9 +1704,17 @@ mod imp {
             return;
         }
         let scale = hs.saturation as f64 / 100.0 + 1.0;
+        // A pure function of the input pixel, and renderer output repeats colours (ramps,
+        // byte rasters): memoised, it skips most of the per-pixel HSL round trips.
+        let mut memo = Memo::<u32, PremultipliedColorU8>::new();
         for p in img.iter_mut() {
             let a = p.alpha();
             if a == 0 {
+                continue;
+            }
+            let key = u32::from_le_bytes([p.red(), p.green(), p.blue(), a]);
+            if let Some(v) = memo.get(key) {
+                *p = v;
                 continue;
             }
             let (mut r, mut g, mut b) = (p.red() as i32, p.green() as i32, p.blue() as i32);
@@ -1739,6 +1773,35 @@ mod imp {
                 b = (b as f64 * af) as i32;
             }
             *p = rgba(r, g, b, a as i32);
+            memo.put(key, *p);
+        }
+    }
+
+    /// A small direct-mapped cache for per-pixel functions of a repeating input.
+    struct Memo<K, V> {
+        slots: Vec<Option<(K, V)>>,
+    }
+
+    impl<K: Copy + PartialEq + Into<u64>, V: Copy> Memo<K, V> {
+        const BITS: u32 = 12;
+
+        fn new() -> Self {
+            Memo { slots: vec![None; 1 << Self::BITS] }
+        }
+
+        fn slot(k: K) -> usize {
+            (k.into().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - Self::BITS)) as usize
+        }
+
+        fn get(&self, k: K) -> Option<V> {
+            match self.slots[Self::slot(k)] {
+                Some((kk, v)) if kk == k => Some(v),
+                _ => None,
+            }
+        }
+
+        fn put(&mut self, k: K, v: V) {
+            self.slots[Self::slot(k)] = Some((k, v));
         }
     }
 
