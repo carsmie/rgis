@@ -581,10 +581,14 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
         }
     }
     if patches.is_empty() {
-        return Err(OwsError::bad(
-            "InvalidParameterValue",
-            "No legend items found",
-        ));
+        // An unknown RULE is a client error; a layer with nothing to show (raster, labels
+        // only) gets an empty image, not a 400: tnt-mapproxy's legend builder fetches every
+        // project and treats tiny images as "no legend", errors as failures.
+        if rule.is_some() {
+            return Err(OwsError::bad("InvalidParameterValue", "No legend items found"));
+        }
+        let empty = tiny_skia::Pixmap::new(1, 1).expect("1x1");
+        return Ok(Response::ok("image/png", render::encode_png(&empty)?));
     }
     let pad = if rule.is_some() { 0 } else { 2 };
     let total_h = patches.iter().map(|pm| pm.height() + pad).sum::<u32>() + pad;
