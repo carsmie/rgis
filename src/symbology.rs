@@ -227,6 +227,9 @@ pub enum SymbolLayer {
         offset: (Size, Size),
         /// (horizontal, vertical) anchor point: 0 left/top, 1 centre, 2 right/bottom.
         anchor: (u8, u8),
+        /// QgsSimpleMarkerSymbolLayer draws from a cached image when nothing that shapes it
+        /// is data-defined: the marker lands on whole pixels (see render::draw_marker_layer).
+        cached: bool,
     },
 }
 
@@ -758,6 +761,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 angle,
                 offset: offset(),
                 anchor,
+                cached: false,
             },
             "SvgMarker" => SymbolLayer::SvgMarker {
                 name: g("name").unwrap_or("").to_string(),
@@ -790,6 +794,11 @@ pub fn parse_symbol(n: Node) -> Symbol {
             },
             "SimpleMarker" => {
                 let size = Size::new(g("size"), g("size_unit"), 2.0);
+                // QgsSimpleMarkerSymbolLayer::startRender's mUsingCache conditions
+                let dd = data_defined(l);
+                let cached = !["size", "angle", "name", "fillColor", "strokeColor", "strokeWidth", "strokeStyle", "joinStyle"]
+                    .iter()
+                    .any(|k| dd.contains_key(*k));
                 SymbolLayer::Marker {
                     shape: g("name").unwrap_or("circle").to_string(),
                     width: size,
@@ -809,6 +818,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     angle,
                     offset: offset(),
                     anchor,
+                    cached,
                 }
             }
             "MarkerLine" | "HashLine" => {

@@ -964,14 +964,14 @@ pub fn draw_symbol(
                                 let (dx, dy) = (w * b.sin(), w * b.cos());
                                 draw_line_px(pm, &sub, (x + dx, y + dy), (x - dx, y - dy), u, ctx);
                             }
-                            None => draw_point_symbol(pm, &sub, (x as f32, y as f32), a, u, ctx),
+                            None => draw_point_symbol(pm, &sub, (x as f32, y as f32), a, *rotate, u, ctx),
                         }
                     }
                 }
             }
             SymbolLayer::SvgMarker { .. } | SymbolLayer::Marker { .. } | SymbolLayer::FontMarker { .. } => {
                 for c in points(g) {
-                    draw_marker_layer(pm, kind.as_ref(), sym.opacity, to_px(&c), 0.0, u);
+                    draw_marker_layer(pm, kind.as_ref(), sym.opacity, to_px(&c), 0.0, false, u);
                 }
             }
         }
@@ -980,10 +980,11 @@ pub fn draw_symbol(
 
 /// A marker symbol at one pixel position, every layer turned by `line_angle` degrees
 /// clockwise (QgsMarkerSymbol::setLineAngle: the layer angle plus the line angle).
-fn draw_point_symbol(pm: &mut Pixmap, sym: &Symbol, at: (f32, f32), line_angle: f64, u: &RenderUnits, ctx: &Attrs) {
+/// `rotating`: the line rotates its markers (Qgis::SymbolRenderHint::DynamicRotation).
+fn draw_point_symbol(pm: &mut Pixmap, sym: &Symbol, at: (f32, f32), line_angle: f64, rotating: bool, u: &RenderUnits, ctx: &Attrs) {
     for layer in &sym.layers {
         let Some(kind) = layer.resolve(ctx) else { continue };
-        if !draw_marker_layer(pm, kind.as_ref(), sym.opacity, at, line_angle, u) {
+        if !draw_marker_layer(pm, kind.as_ref(), sym.opacity, at, line_angle, rotating, u) {
             // Other layer types in a marker sub-symbol: as a point symbol, unrotated.
             let one = Symbol {
                 kind: sym.kind.clone(),
@@ -1020,7 +1021,16 @@ fn marker_shift(offset: (f32, f32), anchor: (u8, u8), w: f64, h: f64, angle: f64
 }
 
 /// Draw one SVG or simple marker layer at a pixel position; false for other layer types.
-fn draw_marker_layer(pm: &mut Pixmap, kind: &SymbolLayer, opacity: f64, (x, y): (f32, f32), line_angle: f64, u: &RenderUnits) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn draw_marker_layer(
+    pm: &mut Pixmap,
+    kind: &SymbolLayer,
+    opacity: f64,
+    (x, y): (f32, f32),
+    line_angle: f64,
+    rotating: bool,
+    u: &RenderUnits,
+) -> bool {
     match kind {
         SymbolLayer::SvgMarker { path, size, fixed_aspect, fill, stroke_color, stroke_width, angle, offset, anchor, .. } => {
             let total = angle + line_angle;
@@ -1046,7 +1056,7 @@ fn draw_marker_layer(pm: &mut Pixmap, kind: &SymbolLayer, opacity: f64, (x, y): 
             crate::svg::draw(pm, &marker, x + ox, y + oy);
             true
         }
-        SymbolLayer::Marker { shape, width, height, color, stroke, angle, offset, anchor, .. } => {
+        SymbolLayer::Marker { shape, width, height, color, stroke, angle, offset, anchor, cached, .. } => {
             let (w, h) = (width.px(u), height.px(u));
             // Zero-size markers are a common way to make label-only layers.
             if w <= 0.0 || h <= 0.0 {
@@ -1054,9 +1064,26 @@ fn draw_marker_layer(pm: &mut Pixmap, kind: &SymbolLayer, opacity: f64, (x, y): 
             }
             let total = angle + line_angle;
             let (ox, oy) = marker_shift((offset.0.px(u) as f32, offset.1.px(u) as f32), *anchor, w, h, total);
+            let (mut cx, mut cy) = (x + ox, y + oy);
+            if *cached && !rotating {
+                // QgsSimpleMarkerSymbolLayer::prepareCache + renderPoint: the marker is drawn
+                // centred in an s×s image, which is blitted at (point - s/2) rounded to whole
+                // pixels. s = int(size) + pw + 1 (double arithmetic: not always odd as the
+                // comment there says, so the centre is a pixel centre or a pixel corner).
+                let pen = stroke.width.px(u);
+                let pw = ((if pen.abs() < 1e-8 { 1.0 } else { pen * 4.0 } + 1.0).round() as i64 / 2 * 2) as f64;
+                let mut size = w;
+                if angle.abs() > 1e-8 {
+                    let a = angle.to_radians();
+                    size *= a.sin().abs() + a.cos().abs();
+                }
+                let s = (size.trunc() + pw + 1.0).trunc();
+                let snap = |v: f32| ((v as f64 - s / 2.0 + 0.5).floor() + s / 2.0) as f32; // qRound
+                (cx, cy) = (snap(cx), snap(cy));
+            }
             let place = SkTransform::from_scale((w / 2.0) as f32, (h / 2.0) as f32)
                 .post_rotate(total as f32)
-                .post_translate(x + ox, y + oy);
+                .post_translate(cx, cy);
             draw_marker(pm, shape, place, *color, stroke, opacity, u);
             true
         }

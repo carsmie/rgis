@@ -2,6 +2,7 @@
 
 python3 tools/topo/seed_bench.py --server http://127.0.0.1:8097/ --label rgis [--levels 0-7]
 python3 tools/topo/seed_bench.py --dev rgis|qgis --label rgis-dev     (servers deployed in atkv3-dev)
+    [--bbox 10.45,59.80,11.05,60.05 --levels 6-13]                    (one area instead of Norway)
 
 Runs the real tnt-mapproxy image (docker build -t tnt-mapproxy:seedtest <tnt-mapproxy>) with
 its own mapproxy.yaml/caches.yaml, but sources.yaml rendered so every source asks the one
@@ -28,6 +29,7 @@ ap.add_argument("--projects", type=Path, default=HERE.parent.parent / "out" / "t
 ap.add_argument("--mapproxy-repo", type=Path, default=Path.home() / "repos" / "tnt-mapproxy")
 ap.add_argument("--image", default="tnt-mapproxy:seedtest")
 ap.add_argument("--levels", default="0-7")
+ap.add_argument("--bbox", help="minx,miny,maxx,maxy (EPSG:4326) instead of all of Norway")
 ap.add_argument("--concurrency", type=int, default=4)  # the scheduled seed jobs' -c
 ap.add_argument("--cpu-pid", type=int, help="server process to measure CPU of (rGIS)")
 ap.add_argument("--cpu-container", help="server container to measure CPU of (QGIS)")
@@ -99,7 +101,7 @@ if missing:
     levels: {{from: {lo}, to: {hi or lo}}}
 coverages:
   norway:
-    datasource: /mapproxy/coverage_norway.json
+    {f"bbox: [{args.bbox}]" if args.bbox else "datasource: /mapproxy/coverage_norway.json"}
     srs: 'EPSG:4326'
 """)
 script = (
