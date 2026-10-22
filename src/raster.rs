@@ -101,6 +101,19 @@ pub enum RasterRenderer {
         nodata_color: Option<Rgba>,
         ramp: ColorRamp,
     },
+    /// QgsHillshadeRenderer (Horn slope, GDAL-DEM fast formula).
+    Hillshade {
+        band: i32,
+        alpha_band: i32,
+        opacity: f64,
+        transparency: Vec<(f64, f64, f64)>,
+        nodata_color: Option<Rgba>,
+        /// lightAngle / lightAzimuth in degrees.
+        angle: f64,
+        azimuth: f64,
+        z_factor: f64,
+        multi_directional: bool,
+    },
     Unsupported(String),
 }
 
@@ -467,6 +480,20 @@ fn parse_renderer(pipe: Node) -> RasterRenderer {
             opacity,
             nodata_color,
         },
+        "hillshade" => {
+            let num = |k: &str, d: f64| r.attribute(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+            RasterRenderer::Hillshade {
+                band: int("band", 1),
+                alpha_band: int("alphaBand", -1),
+                opacity,
+                transparency: parse_transparency(r),
+                nodata_color,
+                angle: num("angle", 45.0),
+                azimuth: num("azimuth", 315.0),
+                z_factor: num("zfactor", 1.0),
+                multi_directional: int("multidirection", 0) != 0,
+            }
+        }
         other => RasterRenderer::Unsupported(other.to_string()),
     }
 }
@@ -1548,6 +1575,109 @@ mod imp {
                         (o * b as f64) as i32,
                         (o * a as f64) as i32,
                     );
+                }
+                Ok(out)
+            }
+            RasterRenderer::Hillshade {
+                band,
+                alpha_band,
+                opacity,
+                transparency,
+                nodata_color,
+                angle,
+                azimuth,
+                z_factor,
+                multi_directional,
+            } => {
+                let input = input_block(src, rs, *band, bbox, w, h)?;
+                let alpha = if *alpha_band > 0 && alpha_band != band {
+                    Some(input_block(src, rs, *alpha_band, bbox, w, h)?)
+                } else {
+                    None
+                };
+                // QGIS precomputes these in float; the per-pixel math then promotes to double.
+                let cell_x = (bbox.width() as f32 / w as f32) as f64;
+                let cell_y = (bbox.height() as f32 / h as f32) as f64;
+                let zenith = ((90.0 - angle).max(0.0) * std::f64::consts::PI / 180.0) as f32;
+                let az = (-azimuth * std::f64::consts::PI / 180.0) as f32;
+                let cos_alt_z = zenith.cos() * *z_factor as f32;
+                let cos_az_254 = (254.0 * (az.cos() * cos_alt_z)) as f64;
+                let sin_az_254 = (254.0 * (az.sin() * cos_alt_z)) as f64;
+                let square_z = (z_factor * z_factor) as f32;
+                let sin_alt_254 = 254.0f32 * zenith.sin();
+                let sin_alt_127 = 127.0f32 * zenith.sin();
+                let cos225_127 = -32.870_018_728_020_12_f32 * cos_alt_z;
+                let cos_alt_127 = 127.0f32 * cos_alt_z;
+                let nd = nodata_pixel(*nodata_color);
+                let mut out = vec![PremultipliedColorU8::TRANSPARENT; n];
+                // Edge rows/columns reuse the centre cell, nodata neighbours take its value.
+                for row in 0..h {
+                    let up = row.saturating_sub(1);
+                    let down = (row + 1).min(h - 1);
+                    for col in 0..w {
+                        let i = row * w + col;
+                        if input.nodata[i] {
+                            out[i] = nd;
+                            continue;
+                        }
+                        let x22 = input.data[i];
+                        let (l, r) = (col.saturating_sub(1), (col + 1).min(w - 1));
+                        let v = |rr: usize, cc: usize| {
+                            let k = rr * w + cc;
+                            if input.nodata[k] { x22 } else { input.data[k] }
+                        };
+                        let (x11, x12, x13) = (v(up, l), v(up, col), v(up, r));
+                        let (x21, x23) = (v(row, l), v(row, r));
+                        let (x31, x32, x33) = (v(down, l), v(down, col), v(down, r));
+                        let der_x =
+                            ((x13 + x23 + x23 + x33) - (x11 + x21 + x21 + x31)) / (8.0 * cell_x);
+                        let der_y =
+                            ((x31 + x32 + x32 + x33) - (x11 + x12 + x12 + x13)) / (8.0 * -cell_y);
+                        let gray = if !multi_directional {
+                            ((sin_alt_254 as f64 - (der_y * cos_az_254 - der_x * sin_az_254))
+                                / (1.0 + square_z as f64 * (der_x * der_x + der_y * der_y)).sqrt())
+                            .clamp(0.0, 255.0)
+                        } else {
+                            // USGS weighted multi-direction, in float as in QGIS
+                            let (dx, dy) = (der_x as f32, der_y as f32);
+                            let (xx, yy) = (dx * dx, dy * dy);
+                            let xy = xx + yy;
+                            if xy == 0.0 {
+                                (1.0 + sin_alt_254).clamp(0.0, 255.0) as f64
+                            } else {
+                                let v225 = (sin_alt_127 + (dx - dy) * cos225_127).max(0.0);
+                                let v270 = (sin_alt_127 - dx * cos_alt_127).max(0.0);
+                                let v315 = (sin_alt_127 + (dx + dy) * cos225_127).max(0.0);
+                                let v360 = (sin_alt_127 - dy * cos_alt_127).max(0.0);
+                                let w225 = 0.5 * xy - dx * dy;
+                                let cang =
+                                    ((w225 * v225 + xx * v270 + (xy - w225) * v315 + yy * v360)
+                                        / xy)
+                                        / (1.0 + square_z * xy);
+                                (1.0 + cang).clamp(0.0, 255.0) as f64
+                            }
+                        };
+                        let mut a = *opacity;
+                        if let Some(&(_, _, pct)) = transparency
+                            .iter()
+                            .find(|(mn, mx, _)| x22 >= *mn && x22 <= *mx)
+                        {
+                            a *= 1.0 - pct / 100.0;
+                        }
+                        if *alpha_band > 0 {
+                            a *= alpha.as_ref().map(|b| b.data[i]).unwrap_or(x22) / 255.0;
+                        }
+                        out[i] = if (a - 1.0).abs() < 1e-9 {
+                            rgba(gray as i32, gray as i32, gray as i32, 255)
+                        } else {
+                            rgba(
+                                (a * gray) as i32,
+                                (a * gray) as i32,
+                                (a * gray) as i32,
+                                (a * 255.0) as i32,
+                            )
+                        };
+                    }
                 }
                 Ok(out)
             }
