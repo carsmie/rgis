@@ -517,7 +517,7 @@ mod imp {
     use super::{Contrast, HueSaturation, RasterRenderer, RasterStyle, Resampling};
     use crate::crs::{Crs, Transform};
     use crate::geom::Rect;
-    use crate::render::MapSettings;
+    use crate::render::{MapSettings, OGC_DPI};
 
     const GDAL_OF_RASTER: u32 = 0x02;
     const GMF_ALL_VALID: i32 = 0x01;
@@ -2300,6 +2300,13 @@ mod imp {
         }
     }
 
+    /// HiDPI requests (DPI >= 2x OGC) draw rasters at 1x pixel density and upscale them:
+    /// sources run out of resolution a zoom earlier on 2x grids, so full density only adds
+    /// cost (~4x pixels) and cubic blur. Deliberate QGIS deviation; RGIS_RASTER_HIDPI=full
+    /// restores per-pixel rendering (parity tests).
+    static HIDPI_DOWNSAMPLE: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("RGIS_RASTER_HIDPI").as_deref() != Ok("full"));
+
     /// Render one raster layer onto the map (QgsRasterLayerRenderer + QgsRasterDrawer).
     pub fn render(
         pm: &mut Pixmap,
@@ -2308,17 +2315,137 @@ mod imp {
         layer_crs: &Crs,
         ms: &MapSettings,
     ) -> Result<()> {
-        let started = std::time::Instant::now();
-        let same_crs = layer_crs == &ms.crs;
-        let layer_extent_map = if same_crs {
+        // Nothing below reads ms.dpi: raster detail depends only on extent / pixel size.
+        let f = (ms.dpi / OGC_DPI + 0.01).floor();
+        if !*HIDPI_DOWNSAMPLE || f < 2.0 {
+            return render_at(pm, src, style, layer_crs, ms, blend_mode(style.blend_mode));
+        }
+        if visible_extent(src, layer_crs, ms)?.is_none() {
+            return Ok(());
+        }
+        let (w, h) = (
+            (ms.width as f64 / f).ceil() as u32,
+            (ms.height as f64 / f).ceil() as u32,
+        );
+        // Keep map units per pixel exactly f x the request's; ceil overhang goes right/down.
+        let (mx, my) = (
+            ms.extent.width() / ms.width as f64 * f,
+            ms.extent.height() / ms.height as f64 * f,
+        );
+        let mut low = ms.clone();
+        low.width = w;
+        low.height = h;
+        low.dpi = ms.dpi / f;
+        low.extent = Rect::new(
+            ms.extent.xmin,
+            ms.extent.ymax - my * h as f64,
+            ms.extent.xmin + mx * w as f64,
+            ms.extent.ymax,
+        );
+        let mut tmp = Pixmap::new(w, h).ok_or_else(|| anyhow!("raster pixmap {w}x{h}"))?;
+        // Parts tile the transparent pixmap without overlap; the layer's blend mode is
+        // applied once, when compositing onto the map.
+        render_at(
+            &mut tmp,
+            src,
+            style,
+            layer_crs,
+            &low,
+            tiny_skia::BlendMode::SourceOver,
+        )?;
+        // tiny-skia's scaled draw_pixmap (bicubic) cost more than rendering at full density.
+        let up = upscale(&tmp, f as usize, ms.width, ms.height);
+        pm.draw_pixmap(
+            0,
+            0,
+            up.as_ref(),
+            &PixmapPaint {
+                blend_mode: blend_mode(style.blend_mode),
+                ..Default::default()
+            },
+            SkTransform::identity(),
+            None,
+        );
+        Ok(())
+    }
+
+    /// Bilinear upscale by an integer factor (pixel centres aligned, edges clamped) on
+    /// premultiplied RGBA, cropped to w x h. Separable, fixed point.
+    fn upscale(src: &Pixmap, f: usize, w: u32, h: u32) -> Pixmap {
+        let (sw, sh) = (src.width() as usize, src.height() as usize);
+        let (w, h) = (w as usize, h as usize);
+        // Per output index: two source indices and the 8-bit weight of the second.
+        let taps = |n: usize, sn: usize| -> Vec<(usize, usize, u32)> {
+            (0..n)
+                .map(|i| {
+                    let x = ((i as f64 + 0.5) / f as f64 - 0.5).max(0.0);
+                    let i0 = (x.floor() as usize).min(sn - 1);
+                    let i1 = (i0 + 1).min(sn - 1);
+                    (i0, i1, ((x - i0 as f64) * 256.0).round() as u32)
+                })
+                .collect()
+        };
+        let (tx, ty) = (taps(w, sw), taps(h, sh));
+        let sp = src.data();
+        // Horizontal pass into u16 rows (value * 256 fits: 255 * 256 < 65536).
+        let mut mid = vec![0u16; w * sh * 4];
+        for y in 0..sh {
+            let row = &sp[y * sw * 4..(y + 1) * sw * 4];
+            let out = &mut mid[y * w * 4..(y + 1) * w * 4];
+            for (x, &(a, b, wt)) in tx.iter().enumerate() {
+                for c in 0..4 {
+                    let v = row[a * 4 + c] as u32 * (256 - wt) + row[b * 4 + c] as u32 * wt;
+                    out[x * 4 + c] = v as u16;
+                }
+            }
+        }
+        let mut dst = Pixmap::new(w as u32, h as u32).expect("upscale size");
+        let dp = dst.data_mut();
+        for (y, &(a, b, wt)) in ty.iter().enumerate() {
+            let (ra, rb) = (
+                &mid[a * w * 4..(a + 1) * w * 4],
+                &mid[b * w * 4..(b + 1) * w * 4],
+            );
+            let out = &mut dp[y * w * 4..(y + 1) * w * 4];
+            for i in 0..w * 4 {
+                let v = ra[i] as u32 * (256 - wt) + rb[i] as u32 * wt;
+                out[i] = ((v + 32768) >> 16) as u8;
+            }
+        }
+        dst
+    }
+
+    /// Part of the map extent the raster covers, None if it doesn't intersect.
+    fn visible_extent(
+        src: &RasterSource,
+        layer_crs: &Crs,
+        ms: &MapSettings,
+    ) -> Result<Option<Rect>> {
+        let layer_extent_map = if layer_crs == &ms.crs {
             src.extent
         } else {
             Transform::new(layer_crs, &ms.crs).rect(&src.extent)?
         };
         let visible = intersect(&ms.extent, &layer_extent_map);
         if visible.is_empty() || visible.width() <= 0.0 || visible.height() <= 0.0 {
-            return Ok(());
+            return Ok(None);
         }
+        Ok(Some(visible))
+    }
+
+    fn render_at(
+        pm: &mut Pixmap,
+        src: &RasterSource,
+        style: &RasterStyle,
+        layer_crs: &Crs,
+        ms: &MapSettings,
+        blend: tiny_skia::BlendMode,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let same_crs = layer_crs == &ms.crs;
+        let Some(visible) = visible_extent(src, layer_crs, ms)? else {
+            return Ok(());
+        };
         // Viewport: pixel-aligned size; the drawn extent is the unaligned one (as in QGIS).
         let mupp_x = ms.extent.width() / ms.width as f64;
         let mupp_y = ms.extent.height() / ms.height as f64;
@@ -2376,7 +2503,7 @@ mod imp {
                         (tly + row0 as f64).floor() as i32,
                         part_pm.as_ref(),
                         &PixmapPaint {
-                            blend_mode: blend_mode(style.blend_mode),
+                            blend_mode: blend,
                             ..Default::default()
                         },
                         SkTransform::identity(),
@@ -2389,5 +2516,36 @@ mod imp {
         }
         debug!("raster rendered {vw}x{vh} in {:?}", started.elapsed());
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn px(p: &Pixmap, x: u32, y: u32) -> [u8; 4] {
+            let i = ((y * p.width() + x) * 4) as usize;
+            p.data()[i..i + 4].try_into().unwrap()
+        }
+
+        #[test]
+        fn upscale_constant_and_ramp() {
+            // 2x1 source: opaque black | opaque white (premultiplied == straight here).
+            let mut src = Pixmap::new(2, 1).unwrap();
+            src.data_mut()
+                .copy_from_slice(&[0, 0, 0, 255, 255, 255, 255, 255]);
+            let up = upscale(&src, 2, 4, 2);
+            let row: Vec<u8> = (0..4).map(|x| px(&up, x, 0)[0]).collect();
+            // Centres at -0.25, 0.25, 0.75, 1.25 in source pixels, clamped at the edges.
+            assert_eq!(row, vec![0, 64, 191, 255]);
+            assert!((0..4).all(|x| px(&up, x, 0)[3] == 255 && px(&up, x, 1) == px(&up, x, 0)));
+            // Odd request size: cropped, not stretched.
+            assert_eq!(
+                (
+                    upscale(&src, 2, 3, 1).width(),
+                    upscale(&src, 2, 3, 1).height()
+                ),
+                (3, 1)
+            );
+        }
     }
 }
