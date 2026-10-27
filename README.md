@@ -35,9 +35,21 @@ with the data sources pointing at local copies in `demo/natural_earth/` (built f
 from the build machine).
 
 Options: `-p/--project FILE` (default project when no `MAP`), `--projects-dir DIR`
-(restrict `MAP` to a directory — QGIS has no such guard), `QGIS_PROJECT_FILE` (fixed
-project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
-`QGIS_SERVER_IGNORE_RENDERING_ERRORS`, `RUST_LOG`.
+(restrict `MAP` to a directory — QGIS has no such guard). `rgis --help` lists the server
+environment variables; in addition:
+
+| Variable | Effect |
+|---|---|
+| `QGIS_PROJECT_FILE` | fixed project that overrides `MAP`, as in QGIS |
+| `QGIS_SERVER_WMS_MAX_WIDTH` / `_HEIGHT` | GetMap size limits, as in QGIS |
+| `QGIS_SERVER_IGNORE_RENDERING_ERRORS` | render what can be rendered instead of failing, as in QGIS |
+| `RGIS_FONT_DIRS` | colon-separated font directories that replace the system fonts (e.g. a QGIS Server image's) |
+| `RGIS_LABEL_FONT` | fallback family for missing label fonts (Qt: the system UI font on macOS, fontconfig's sans-serif elsewhere) |
+| `RGIS_TEXT_ENGINE` | `coretext` or `freetype`: which Qt font engine's metrics to reproduce (default: the platform's) |
+| `RGIS_SVG_PATHS` | colon-separated directories searched for relative SVG marker names, before the QGIS install locations |
+| `RGIS_SVG_FONT` | default font family for text inside SVGs |
+| `RGIS_RASTER_HIDPI=full` | render rasters at full density for HiDPI requests (see deliberate differences) |
+| `RUST_LOG` | log filter; `rgis::labels=debug` logs every placed label for diffing against QGIS |
 
 ## Architecture: QGIS Server → this crate
 
@@ -72,13 +84,16 @@ project that overrides `MAP`, as in QGIS), `QGIS_SERVER_WMS_MAX_WIDTH/HEIGHT`,
   `/vsigs/` on Google Cloud Storage signed with GDAL's `GS_ACCESS_KEY_ID`/`GS_SECRET_ACCESS_KEY`
   HMAC keys; spatial index used), GeoPackage (R-tree used), Shapefile, GeoJSON, CSV (WKT);
   `subset=` filters on all of them; OGR's exact rectangle filter.
+* PostGIS: QGIS `postgres` datasources, queried as QGIS renders them (`geom && ST_MakeEnvelope`
+  plus the datasource's `sql=`); `PGUSER`/`PGPASSWORD` override the datasource's credentials.
 * Projects can live on GCS too: `MAP=/vsigs/bucket/key.qgs` (cached for
   `RGIS_REMOTE_PROJECT_TTL` seconds), and with `--projects-dir` the tnt-qgis URL scheme
   `/qgis/QLR/<name>` serves `<projects-dir><name>.qgs`. `GET /health` for probes; CORS headers
   as the tnt-qgis front sets them.
-* Raster data (feature `raster`, on by default): GDAL provider — single-band gray and multiband
-  colour renderers with contrast enhancement, transparency, alpha bands, reprojection and
-  warped VRTs, ported from QGIS's raster pipeline.
+* Raster data (feature `raster`, on by default): GDAL provider — single-band gray, single-band
+  pseudocolour (interpolated, discrete and exact colour ramps), multiband colour and hillshade
+  renderers with contrast enhancement, transparency, alpha bands, hue/saturation, provider-stage
+  resampling, reprojection and warped VRTs, ported from QGIS's raster pipeline.
 * Symbology: single symbol, categorized, graduated, rule-based (filters, ELSE, scale ranges,
   nested rules), null; SimpleFill (incl. Qt brush patterns), SimpleLine, SimpleMarker,
   EllipseMarker, SvgMarker (QGIS SVG search paths, `param()` substitution), LinePatternFill;
@@ -165,6 +180,11 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
   `QGIS_SERVER_WMS_MAX_*` is set (QGIS is unlimited and rendered a 99999 px image).
 * Field names are sanitised into valid XML element names in GML (QGIS emits
   `<qgs:feature::id>`, which is not well-formed).
+* Expressions (`FILTER`, `EXP_FILTER`, project filters) are limited to 128 levels of nesting,
+  counting each link of an `a OR b OR …` chain, so a crafted request cannot overflow the
+  stack; use `IN (…)` for long value lists. `LIKE` matches in linear time.
+* HiDPI GetMap requests (`DPI` ≥ 2× 90.7) render raster layers at 1× density and upscale them;
+  `RGIS_RASTER_HIDPI=full` renders them per pixel as QGIS does.
 
 ## Limitations
 
@@ -179,10 +199,11 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
   of touching labels this can change which of two equally good labels wins.
 * Stretched GetMap requests (BBOX aspect ≠ WIDTH/HEIGHT) are resized bilinearly, not with
   Qt's area-averaging `SmoothTransformation`, so thin lines differ there.
-* Raster: paletted, pseudocolour and hillshade renderers, non-nearest resampling, and
-  raster GetFeatureInfo are not implemented yet.
+* Raster: paletted and contour renderers, hue/saturation colorize, and raster GetFeatureInfo
+  are not implemented yet.
 * Not implemented: diagrams, 3D, print layouts (GetPrint), DXF/PDF output, WMTS/WCS, WFS-T,
-  Python server plugins, access control; PostGIS and other non-file providers;
+  Python server plugins, access control; non-file providers other than PostGIS (WMS, WFS,
+  virtual layers, …);
   GeometryGenerator, MarkerLine, PointPatternFill and other less common symbol layers
   (skipped with a warning); blend modes and paint effects.
 * PNG output only; GetLegendGraphic PNG has symbol patches without text (use
@@ -193,9 +214,16 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 
 ```sh
 cargo test                     # unit tests (CRS, expressions, symbology, geometry, …)
+cargo test --no-default-features   # without GDAL
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
 # side-by-side checks need QGIS Server on :8099 and this server on :8098:
 python3 tools/compare_with_qgis.py "$PWD/demo/earth_local_wfs.qgs"
 python3 tools/render_projects.py out/ path/to/project.qgs …
 cargo run --release --example compare_png -- a.png b.png diff.png
 python3 tools/range_server.py demo/natural_earth 8097   # local S3-like range server
 ```
+
+CI (`.github/workflows/ci.yml`) runs formatting, clippy with `-D warnings` and the tests, with
+GDAL in the same `osgeo/gdal` image as the Dockerfile and without GDAL. Keep its Rust and GDAL
+versions in step with the Dockerfile. The commit that ran `cargo fmt` over the whole crate is
+listed in `.git-blame-ignore-revs` (`git config blame.ignoreRevsFile .git-blame-ignore-revs`).
