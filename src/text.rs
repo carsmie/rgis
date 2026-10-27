@@ -339,7 +339,13 @@ pub fn font(req: &FontRequest, px: i32) -> Option<Arc<SizedFont>> {
     }
     let (face, weight) = resolve_face(req)?;
     let f = Arc::new(SizedFont::new(face, weight, px));
-    FONTS.lock().insert(key, f.clone());
+    let mut fonts = FONTS.lock();
+    // Pixel sizes follow the request's DPI, so clients choose the keys: start over rather
+    // than keep every size (each with its glyph and shaping caches) forever.
+    if fonts.len() >= 1_000 {
+        fonts.clear();
+    }
+    fonts.insert(key, f.clone());
     Some(f)
 }
 

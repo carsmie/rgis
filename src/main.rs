@@ -31,6 +31,8 @@ ENVIRONMENT:
     RGIS_WARM_PROJECTS         projects to load at startup (names under --projects-dir,
                                comma-separated; * = all in a local directory)
     RGIS_RENDER_BUDGET_MPX     megapixels rendered at once (default 16)
+    RGIS_REQUEST_TIMEOUT       seconds before a request gives up with 503 (default 120,
+                               0 = never); checked between layers
     RGIS_HTTP_CACHE_MB         remote-file block cache size (default 256)
     PGUSER, PGPASSWORD         credentials for postgres layers (override the datasource's)
 
@@ -85,6 +87,14 @@ async fn main() -> anyhow::Result<()> {
             .filter(|p| !p.as_os_str().is_empty()),
         default_project,
         projects_dir,
+        request_timeout: match std::env::var("RGIS_REQUEST_TIMEOUT") {
+            Ok(v) => match v.trim().parse::<f64>() {
+                Ok(s) if s > 0.0 => Some(std::time::Duration::from_secs_f64(s)),
+                Ok(_) => None,
+                Err(_) => anyhow::bail!("RGIS_REQUEST_TIMEOUT must be a number of seconds"),
+            },
+            Err(_) => Some(std::time::Duration::from_secs(120)),
+        },
     };
     let server = Arc::new(Server::new(settings));
     let warm: Vec<String> = std::env::var("RGIS_WARM_PROJECTS")

@@ -9,11 +9,10 @@ use rgis::{Server, Settings};
 /// Serve `demo/earth_local.qgs` on an ephemeral port; returns the base URL.
 async fn start() -> String {
     let server = Arc::new(Server::new(Settings {
-        fixed_project: None,
         default_project: Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("demo/earth_local.qgs"),
         ),
-        projects_dir: None,
+        ..Default::default()
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

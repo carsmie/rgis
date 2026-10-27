@@ -12,9 +12,8 @@ fn root() -> PathBuf {
 
 fn server() -> Server {
     Server::new(Settings {
-        fixed_project: None,
         default_project: Some(root().join("demo/earth_local.qgs")),
-        projects_dir: None,
+        ..Default::default()
     })
 }
 

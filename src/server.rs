@@ -2,10 +2,11 @@
 //! parse parameters → resolve the project path → load it through the config cache →
 //! dispatch to an OGC API (no SERVICE) or to a registered OWS service module.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
@@ -234,7 +235,13 @@ impl ConfigCache {
             .join("rgis-projects")
             .join(obj.replace('/', "__"));
         std::fs::create_dir_all(local.parent().expect("has parent"))?;
-        std::fs::write(&local, bytes)?;
+        // Write under a unique name and rename into place: concurrent reloads of the same
+        // object would otherwise read each other's half-written file.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = local.with_extension(format!("{}.{n}.part", std::process::id()));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &local)?;
         let p = Arc::new(Project::read(&local)?);
         info!("loaded project /vsigs/{obj}");
         self.remote
@@ -246,6 +253,27 @@ impl ConfigCache {
 
 pub type ApiHandler = fn(&Request, &Params, Option<&Project>) -> Result<Response, OwsError>;
 
+thread_local! {
+    /// When the request on this thread has to give up (Settings::request_timeout).
+    static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// The current request's deadline, if it has one.
+pub(crate) fn deadline() -> Option<Instant> {
+    DEADLINE.get()
+}
+
+/// Fail once the current request is past its deadline. Called between units of work
+/// (layers, the label solver), so a runaway request frees its thread instead of only
+/// having its response dropped.
+pub(crate) fn check_deadline() -> anyhow::Result<()> {
+    match DEADLINE.get() {
+        Some(d) if Instant::now() >= d => anyhow::bail!("request timed out"),
+        _ => Ok(()),
+    }
+}
+
+#[derive(Default)]
 pub struct Settings {
     /// QGIS_PROJECT_FILE: a fixed project that overrides MAP.
     pub fixed_project: Option<PathBuf>,
@@ -253,6 +281,8 @@ pub struct Settings {
     pub default_project: Option<PathBuf>,
     /// When set, MAP must point inside this directory.
     pub projects_dir: Option<PathBuf>,
+    /// Requests still working after this long stop at the next layer and answer 503.
+    pub request_timeout: Option<Duration>,
 }
 
 pub struct Server {
@@ -277,6 +307,10 @@ impl Server {
             registry,
             apis: vec![("/wfs3", crate::services::oapif::handle)],
         }
+    }
+
+    pub fn request_timeout(&self) -> Option<std::time::Duration> {
+        self.settings.request_timeout
     }
 
     pub fn is_ready(&self) -> bool {
@@ -414,15 +448,36 @@ impl Server {
 
     pub fn handle(&self, req: &Request) -> Response {
         let started = Instant::now();
+        DEADLINE.set(self.settings.request_timeout.map(|t| started + t));
         let params = Params::from_query(&req.query);
         let service = params.service();
         let resp = self.dispatch(req, &params, &service);
+        let timed_out = check_deadline().is_err();
+        DEADLINE.set(None);
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 warn!("{} {}: {} ({})", req.method, req.path, e.message, e.code);
                 let version = if service == "WFS" { "1.2.0" } else { "1.3.0" };
-                e.to_response(version)
+                if timed_out {
+                    OwsError::new(
+                        "RequestTimeout",
+                        format!("The request took longer than {:?}", started.elapsed()),
+                        503,
+                    )
+                    .to_response(version)
+                } else if e.status >= 500 {
+                    // Internal errors carry file paths, data source URLs and library
+                    // messages; those are logged above, not sent to the client.
+                    OwsError::new(
+                        &e.code,
+                        "Internal server error, see the server log",
+                        e.status,
+                    )
+                    .to_response(version)
+                } else {
+                    e.to_response(version)
+                }
             }
         };
         // One logfmt-style line per request (Loki: `| logfmt | unwrap ms` for percentiles).
@@ -448,11 +503,18 @@ impl Server {
         service: &str,
     ) -> Result<Response, OwsError> {
         let project = match self.config_path(req, params)? {
-            Some(path) => Some(
-                self.cache
-                    .project(&path)
-                    .map_err(|e| OwsError::bad("ProjectFileError", format!("{e:#}")))?,
-            ),
+            Some(path) => Some(self.cache.project(&path).map_err(|e| {
+                // The cause (missing file, permissions, XML error) would tell clients
+                // about files on the server; it goes to the log only.
+                warn!("project {}: {e:#}", path.display());
+                OwsError::bad(
+                    "ProjectFileError",
+                    match params.get("MAP") {
+                        Some(map) => format!("cannot load project '{map}'"),
+                        None => "cannot load the project".to_string(),
+                    },
+                )
+            })?),
             None => None,
         };
         if service.is_empty() {

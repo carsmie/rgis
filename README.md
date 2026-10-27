@@ -48,6 +48,7 @@ environment variables; in addition:
 | `RGIS_TEXT_ENGINE` | `coretext` or `freetype`: which Qt font engine's metrics to reproduce (default: the platform's) |
 | `RGIS_SVG_PATHS` | colon-separated directories searched for relative SVG marker names, before the QGIS install locations |
 | `RGIS_SVG_FONT` | default font family for text inside SVGs |
+| `RGIS_REQUEST_TIMEOUT` | seconds before a request stops at the next layer and answers 503 (default 120; 0 = never) |
 | `RGIS_RASTER_HIDPI=full` | render rasters at full density for HiDPI requests (see deliberate differences) |
 | `RUST_LOG` | log filter; `rgis::labels=debug` logs every placed label for diffing against QGIS |
 
@@ -183,6 +184,12 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 * Expressions (`FILTER`, `EXP_FILTER`, project filters) are limited to 128 levels of nesting,
   counting each link of an `a OR b OR …` chain, so a crafted request cannot overflow the
   stack; use `IN (…)` for long value lists. `LIKE` matches in linear time.
+* Requests time out (`RGIS_REQUEST_TIMEOUT`, default 120 s; QGIS Server has no limit). The
+  check runs between layers, so the thread is freed too; work inside a single layer can
+  overrun, and the client then gets a 504 30 s later while that thread finishes.
+* Error responses leave out server details: a project that cannot be loaded is reported
+  without the cause (missing, unreadable or invalid look the same), and internal errors
+  (HTTP 5xx) say only "see the server log". The full messages are logged.
 * HiDPI GetMap requests (`DPI` ≥ 2× 90.7) render raster layers at 1× density and upscale them;
   `RGIS_RASTER_HIDPI=full` renders them per pixel as QGIS does.
 

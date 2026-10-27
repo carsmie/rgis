@@ -282,20 +282,28 @@ impl Drop for RenderPermit {
     }
 }
 
-/// Wait until `width`×`height` pixels fit in the render budget.
-pub fn render_permit(width: u32, height: u32) -> RenderPermit {
+/// Wait until `width`×`height` pixels fit in the render budget, or until the request's
+/// deadline passes.
+pub fn render_permit(width: u32, height: u32) -> Result<RenderPermit> {
     let need = (width as u64 * height as u64).clamp(1, GATE.budget);
     let mut used = GATE.used.lock();
     let started = std::time::Instant::now();
     while *used + need > GATE.budget {
-        GATE.freed.wait(&mut used);
+        match crate::server::deadline() {
+            Some(d) => {
+                if GATE.freed.wait_until(&mut used, d).timed_out() {
+                    anyhow::bail!("request timed out waiting for the render budget");
+                }
+            }
+            None => GATE.freed.wait(&mut used),
+        }
     }
     *used += need;
     let waited = started.elapsed();
     if waited.as_millis() > 100 {
         debug!("render gate: waited {waited:?} for {need} px");
     }
-    RenderPermit(need)
+    Ok(RenderPermit(need))
 }
 
 /// An ignored rendering error, logged once per distinct message (an unsupported layer
@@ -376,6 +384,7 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
         )
     })?;
     if let Some(engine) = labels.filter(|e| e.has_layers()) {
+        crate::server::check_deadline()?;
         let started = std::time::Instant::now();
         engine.draw(&mut pm);
         debug!("labeling took {:?}", started.elapsed());
@@ -472,6 +481,7 @@ fn render_layers(
 ) -> Result<()> {
     let mut k = 0;
     for (order, job) in jobs.iter().enumerate() {
+        crate::server::check_deadline()?;
         let l = &job.layer;
         if !l.visible_at(scale) {
             debug!("layer {} not visible at 1:{scale:.0}", l.name);

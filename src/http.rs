@@ -2,6 +2,7 @@
 //! on blocking threads.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -54,7 +55,26 @@ async fn handle(
         base_url: format!("{proto}://{host}{}", uri.path()),
     };
     // Rendering and data access are blocking work, like QGIS Server's request thread.
-    let resp = tokio::task::spawn_blocking(move || server.handle(&req)).await;
+    // Server::handle stops between layers once the timeout passes; work inside one layer
+    // (a large raster read, a whole-layer WFS response) can overrun it, so the client gets
+    // its answer after a grace period while that thread finishes on its own.
+    let limit = server
+        .request_timeout()
+        .map(|t| t + Duration::from_secs(30));
+    let task = tokio::task::spawn_blocking(move || server.handle(&req));
+    let resp = match limit {
+        Some(limit) => match tokio::time::timeout(limit, task).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!("{method} {}: no response after {limit:?}", uri.path());
+                let mut out = HttpResponse::new(Body::from("request timed out"));
+                *out.status_mut() = StatusCode::GATEWAY_TIMEOUT;
+                cors(out.headers_mut());
+                return out;
+            }
+        },
+        None => task.await,
+    };
     match resp {
         Ok(r) => {
             let mut out = HttpResponse::new(Body::from(r.body));
@@ -69,7 +89,8 @@ async fn handle(
             out
         }
         Err(e) => {
-            let mut out = HttpResponse::new(Body::from(format!("Internal Server Error: {e}")));
+            tracing::error!("{method} {}: request task failed: {e}", uri.path());
+            let mut out = HttpResponse::new(Body::from("Internal Server Error"));
             *out.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             out
         }

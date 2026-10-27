@@ -320,7 +320,7 @@ fn get_map(ctx: &Context, version: &str) -> Result<Response, OwsError> {
         }
     }
     // Held through scaling and PNG encoding, which allocate at the requested size too.
-    let _permit = render::render_permit(ms.width.max(requested.0), ms.height.max(requested.1));
+    let _permit = render::render_permit(ms.width.max(requested.0), ms.height.max(requested.1))?;
     let t = std::time::Instant::now();
     let pm = render::render(&jobs, &ms)
         .map_err(|e| OwsError::internal(format!("Rendering error : '{e:#}'")))?;
