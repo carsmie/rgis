@@ -30,7 +30,10 @@ static OPTIONS: LazyLock<usvg::Options<'static>> = LazyLock::new(|| {
     let started = std::time::Instant::now();
     // RGIS_FONT_DIRS (colon-separated) replaces the system fonts, e.g. a QGIS Server image's.
     match std::env::var("RGIS_FONT_DIRS") {
-        Ok(dirs) => dirs.split(':').filter(|d| !d.is_empty()).for_each(|d| opt.fontdb_mut().load_fonts_dir(d)),
+        Ok(dirs) => dirs
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .for_each(|d| opt.fontdb_mut().load_fonts_dir(d)),
         Err(_) => opt.fontdb_mut().load_system_fonts(),
     }
     // QgsServer::initServer loads QGIS's standard test fonts ("QGIS Vera Sans" Roman and Bold).
@@ -90,12 +93,17 @@ fn embedded(name: &str) -> Option<PathBuf> {
         let (meta, data) = rest.split_once(',')?;
         meta.ends_with(";base64").then_some(data)
     })?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .ok()?;
     let svg = String::from_utf8(bytes).ok()?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     svg.hash(&mut h);
     let path = PathBuf::from(format!("embedded:{:016x}.svg", h.finish()));
-    EMBEDDED.lock().entry(path.clone()).or_insert_with(|| svg.into());
+    EMBEDDED
+        .lock()
+        .entry(path.clone())
+        .or_insert_with(|| svg.into());
     Some(path)
 }
 

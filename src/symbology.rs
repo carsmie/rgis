@@ -249,16 +249,30 @@ pub enum Effect {
     /// QgsDrawSourceEffect: the layer itself.
     DrawSource { opacity: f64 },
     /// QgsDropShadowEffect (outer) / QgsInnerShadowEffect.
-    Shadow { inner: bool, color: Rgba, blur: Size, offset: Size, angle: f64, opacity: f64 },
+    Shadow {
+        inner: bool,
+        color: Rgba,
+        blur: Size,
+        offset: Size,
+        angle: f64,
+        opacity: f64,
+    },
     /// QgsOuterGlowEffect with a single colour fading to transparent.
-    OuterGlow { color: Rgba, spread: Size, blur: Size, opacity: f64 },
+    OuterGlow {
+        color: Rgba,
+        spread: Size,
+        blur: Size,
+        opacity: f64,
+    },
 }
 
 /// The layer's `effectStack`, or empty when it only draws the source (the common case).
 /// Modifier-only entries (draw_mode 0) and inner glows are not drawn.
 fn parse_effects(layer: Node) -> Vec<Effect> {
     let Some(stack) = layer.children().find(|c| {
-        c.has_tag_name("effect") && c.attribute("enabled") == Some("1") && c.attribute("type") == Some("effectStack")
+        c.has_tag_name("effect")
+            && c.attribute("enabled") == Some("1")
+            && c.attribute("type") == Some("effectStack")
     }) else {
         return vec![];
     };
@@ -280,7 +294,9 @@ fn parse_effects(layer: Node) -> Vec<Effect> {
             "drawSource" => Effect::DrawSource { opacity },
             "dropShadow" | "innerShadow" => Effect::Shadow {
                 inner: ty == "innerShadow",
-                color: g("color").and_then(Rgba::parse).unwrap_or(Rgba(0, 0, 0, 255)),
+                color: g("color")
+                    .and_then(Rgba::parse)
+                    .unwrap_or(Rgba(0, 0, 0, 255)),
                 blur: Size::new(g("blur_level"), g("blur_unit"), 2.645),
                 offset: Size::new(g("offset_distance"), g("offset_unit"), 2.0),
                 angle: num("offset_angle", 135.0),
@@ -291,7 +307,9 @@ fn parse_effects(layer: Node) -> Vec<Effect> {
                     warn!("outer glow colour ramp drawn with its single colour");
                 }
                 Effect::OuterGlow {
-                    color: g("single_color").and_then(Rgba::parse).unwrap_or(Rgba(255, 255, 255, 255)),
+                    color: g("single_color")
+                        .and_then(Rgba::parse)
+                        .unwrap_or(Rgba(255, 255, 255, 255)),
                     spread: Size::new(g("spread"), g("spread_unit"), 2.0),
                     blur: Size::new(g("blur_level"), g("blur_unit"), 2.645),
                     opacity,
@@ -303,7 +321,11 @@ fn parse_effects(layer: Node) -> Vec<Effect> {
             }
         });
     }
-    if out.iter().all(|e| matches!(e, Effect::DrawSource { opacity } if *opacity == 1.0)) && out.len() == 1 {
+    if out
+        .iter()
+        .all(|e| matches!(e, Effect::DrawSource { opacity } if *opacity == 1.0))
+        && out.len() == 1
+    {
         return vec![];
     }
     out
@@ -409,7 +431,13 @@ impl Layer {
                     stroke_width.value = w;
                 }
             }
-            SymbolLayer::FontMarker { size, angle, color, stroke, .. } => {
+            SymbolLayer::FontMarker {
+                size,
+                angle,
+                color,
+                stroke,
+                ..
+            } => {
                 if let Some(s) = dd_num(dd, "size", ctx) {
                     size.value = s;
                 }
@@ -421,7 +449,11 @@ impl Layer {
                 }
                 stroke_dd(stroke);
             }
-            SymbolLayer::TemplatedLine { interval, offset_along, .. } => {
+            SymbolLayer::TemplatedLine {
+                interval,
+                offset_along,
+                ..
+            } => {
                 if let Some(i) = dd_num(dd, "interval", ctx) {
                     interval.value = i;
                 }
@@ -697,8 +729,14 @@ pub fn parse_symbol(n: Node) -> Symbol {
         let angle = g("angle").and_then(|a| a.parse().ok()).unwrap_or(0.0);
         // QgsMarkerSymbolLayer::decode{Horizontal,Vertical}AnchorPoint (Baseline = Bottom)
         let anchor = (
-            g("horizontal_anchor_point").and_then(|v| v.parse().ok()).unwrap_or(1u8).min(2),
-            g("vertical_anchor_point").and_then(|v| v.parse().ok()).unwrap_or(1u8).min(2),
+            g("horizontal_anchor_point")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1u8)
+                .min(2),
+            g("vertical_anchor_point")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1u8)
+                .min(2),
         );
         let kind = match class {
             "SimpleFill" => {
@@ -728,8 +766,12 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     warn!("ShapeburstFill blur is not supported; drawn without blur");
                 }
                 SymbolLayer::ShapeburstFill {
-                    color1: g("color").and_then(Rgba::parse).unwrap_or(Rgba(0, 0, 255, 255)),
-                    color2: g("gradient_color2").and_then(Rgba::parse).unwrap_or(Rgba(255, 255, 255, 255)),
+                    color1: g("color")
+                        .and_then(Rgba::parse)
+                        .unwrap_or(Rgba(0, 0, 255, 255)),
+                    color2: g("gradient_color2")
+                        .and_then(Rgba::parse)
+                        .unwrap_or(Rgba(255, 255, 255, 255)),
                     max_distance: (g("use_whole_shape") != Some("1"))
                         .then(|| Size::new(g("max_distance"), g("distance_unit"), 5.0)),
                     ignore_rings: g("ignore_rings") == Some("1"),
@@ -807,8 +849,17 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 style: g("font_style").unwrap_or("").to_string(),
                 chr: g("chr").unwrap_or("A").to_string(),
                 size: Size::new(g("size"), g("size_unit"), 2.0),
-                color: g("color").and_then(Rgba::parse).unwrap_or(Rgba(255, 0, 0, 255)),
-                stroke: stroke(&p, "outline_color", "outline_width", "outline_width_unit", "outline_style", 0.0),
+                color: g("color")
+                    .and_then(Rgba::parse)
+                    .unwrap_or(Rgba(255, 0, 0, 255)),
+                stroke: stroke(
+                    &p,
+                    "outline_color",
+                    "outline_width",
+                    "outline_width_unit",
+                    "outline_style",
+                    0.0,
+                ),
                 angle,
                 offset: offset(),
                 anchor,
@@ -817,9 +868,18 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 let size = Size::new(g("size"), g("size_unit"), 2.0);
                 // QgsSimpleMarkerSymbolLayer::startRender's mUsingCache conditions
                 let dd = data_defined(l);
-                let cached = !["size", "angle", "name", "fillColor", "strokeColor", "strokeWidth", "strokeStyle", "joinStyle"]
-                    .iter()
-                    .any(|k| dd.contains_key(*k));
+                let cached = ![
+                    "size",
+                    "angle",
+                    "name",
+                    "fillColor",
+                    "strokeColor",
+                    "strokeWidth",
+                    "strokeStyle",
+                    "joinStyle",
+                ]
+                .iter()
+                .any(|k| dd.contains_key(*k));
                 SymbolLayer::Marker {
                     shape: g("name").unwrap_or("circle").to_string(),
                     width: size,
@@ -846,21 +906,27 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 // `placements` (flags) since QGIS 3.24, the single `placement` before.
                 let placements: Vec<String> = match g("placements") {
                     Some(v) => v.split('|').map(String::from).collect(),
-                    None => vec![match g("placement").unwrap_or("interval") {
-                        "vertex" => "Vertex",
-                        "lastvertex" => "LastVertex",
-                        "firstvertex" => "FirstVertex",
-                        "centralpoint" => "CentralPoint",
-                        "curvepoint" => "CurvePoint",
-                        "segmentcenter" => "SegmentCenter",
-                        "innervertices" => "InnerVertices",
-                        _ => "Interval",
-                    }
-                    .to_string()],
+                    None => vec![
+                        match g("placement").unwrap_or("interval") {
+                            "vertex" => "Vertex",
+                            "lastvertex" => "LastVertex",
+                            "firstvertex" => "FirstVertex",
+                            "centralpoint" => "CentralPoint",
+                            "curvepoint" => "CurvePoint",
+                            "segmentcenter" => "SegmentCenter",
+                            "innervertices" => "InnerVertices",
+                            _ => "Interval",
+                        }
+                        .to_string(),
+                    ],
                 };
                 let has = |n: &str| placements.iter().any(|p| p == n);
-                let offset = g("offset").and_then(|o| o.split(',').next()?.parse::<f64>().ok()).unwrap_or(0.0);
-                let along = g("offset_along_line").and_then(|o| o.parse::<f64>().ok()).unwrap_or(0.0);
+                let offset = g("offset")
+                    .and_then(|o| o.split(',').next()?.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let along = g("offset_along_line")
+                    .and_then(|o| o.parse::<f64>().ok())
+                    .unwrap_or(0.0);
                 let Some(sub) = l.children().find(|c| c.has_tag_name("symbol")) else {
                     warn!("{class} without a sub-symbol ignored");
                     continue;
@@ -875,7 +941,9 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 // The vertex placements' offset along the line is QGIS's
                 // renderOffsetVertexAlongLine, not ported yet.
                 if along != 0.0 && (has("FirstVertex") || has("LastVertex")) {
-                    warn!("{class} at first/last vertex with an offset along the line is not supported; ignored");
+                    warn!(
+                        "{class} at first/last vertex with an offset along the line is not supported; ignored"
+                    );
                     continue;
                 }
                 SymbolLayer::TemplatedLine {
@@ -885,8 +953,16 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     every_part: g("place_on_every_part").is_none_or(|v| v == "true" || v == "1"),
                     offset: Size::new(Some(&offset.to_string()), g("offset_unit"), 0.0),
                     interval: Size::new(g("interval"), g("interval_unit"), 3.0),
-                    offset_along: Size::new(g("offset_along_line"), g("offset_along_line_unit"), 0.0),
-                    average_over: Size::new(g("average_angle_length"), g("average_angle_unit"), 4.0),
+                    offset_along: Size::new(
+                        g("offset_along_line"),
+                        g("offset_along_line_unit"),
+                        0.0,
+                    ),
+                    average_over: Size::new(
+                        g("average_angle_length"),
+                        g("average_angle_unit"),
+                        4.0,
+                    ),
                     rotate: g("rotate").is_none_or(|r| r == "1" || r == "true"),
                     hash: (class == "HashLine").then(|| {
                         (
@@ -1151,7 +1227,12 @@ impl Renderer {
                     .into_iter()
                     .collect()
             }
-            Renderer::Rules { rules, symbols, id, fields } => {
+            Renderer::Rules {
+                rules,
+                symbols,
+                id,
+                fields,
+            } => {
                 let Some(fields) = fields else {
                     let mut out = vec![];
                     collect_rules(rules, a, scale, symbols, &mut out);
@@ -1170,7 +1251,12 @@ impl Renderer {
                     collect_rules(rules, a, scale, symbols, &mut out);
                     let names: Vec<String> = out
                         .iter()
-                        .filter_map(|s| symbols.iter().find(|(_, v)| std::ptr::eq(*v, *s)).map(|(n, _)| n.clone()))
+                        .filter_map(|s| {
+                            symbols
+                                .iter()
+                                .find(|(_, v)| std::ptr::eq(*v, *s))
+                                .map(|(n, _)| n.clone())
+                        })
                         .collect();
                     RULE_CACHE.with(|c| {
                         let mut c = c.borrow_mut();
@@ -1247,7 +1333,9 @@ impl Renderer {
     /// before any data is read.
     pub fn active_at(&self, scale: f64) -> bool {
         fn any(rules: &[Rule], scale: f64) -> bool {
-            rules.iter().any(|r| r.active && in_scale(r, scale) && (r.symbol.is_some() || any(&r.children, scale)))
+            rules.iter().any(|r| {
+                r.active && in_scale(r, scale) && (r.symbol.is_some() || any(&r.children, scale))
+            })
         }
         match self {
             Renderer::Rules { rules, .. } => any(rules, scale),

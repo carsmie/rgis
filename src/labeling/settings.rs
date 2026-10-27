@@ -8,8 +8,8 @@ use roxmltree::Node;
 use tracing::warn;
 
 use crate::expression::Expr;
-use crate::symbology::{data_defined_in, parse_symbol, Rgba, Size, Symbol, Unit};
-use crate::text::{qt_join, FontRequest};
+use crate::symbology::{Rgba, Size, Symbol, Unit, data_defined_in, parse_symbol};
+use crate::text::{FontRequest, qt_join};
 
 /// Qgis::LabelPlacement.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,7 +191,9 @@ fn background(ts: Option<Node>) -> Option<BackgroundSettings> {
         let u = unit(attr(bg, ku), Unit::Mm);
         (sized(num(bg, kx, 0.0), u), sized(num(bg, ky, 0.0), u))
     };
-    let fill = bg?.children().find(|c| c.has_tag_name("symbol") && c.attribute("name") == Some("fillSymbol"));
+    let fill = bg?
+        .children()
+        .find(|c| c.has_tag_name("symbol") && c.attribute("name") == Some("fillSymbol"));
     let Some(fill) = fill.map(parse_symbol) else {
         warn!("label background without fillSymbol is not supported");
         return None;
@@ -315,7 +317,9 @@ fn attr<'a>(n: Option<Node<'a, '_>>, k: &str) -> Option<&'a str> {
 }
 
 fn num(n: Option<Node>, k: &str, default: f64) -> f64 {
-    attr(n, k).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    attr(n, k)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn int(n: Option<Node>, k: &str, default: i64) -> i64 {
@@ -368,10 +372,17 @@ fn text_format(settings: Node) -> TextFormat {
         .or_else(|| attr(child(settings, "text-format"), "multilineHeight"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(1.0);
-    let tb = ts.and_then(|t| child(t, "text-buffer")).or_else(|| child(settings, "text-buffer"));
+    let tb = ts
+        .and_then(|t| child(t, "text-buffer"))
+        .or_else(|| child(settings, "text-buffer"));
     let buffer = (int(tb, "bufferDraw", 0) != 0).then(|| BufferSettings {
-        size: sized(num(tb, "bufferSize", 0.0), unit(attr(tb, "bufferSizeUnits"), Unit::Mm)),
-        color: attr(tb, "bufferColor").and_then(Rgba::parse).unwrap_or(Rgba(255, 255, 255, 255)),
+        size: sized(
+            num(tb, "bufferSize", 0.0),
+            unit(attr(tb, "bufferSizeUnits"), Unit::Mm),
+        ),
+        color: attr(tb, "bufferColor")
+            .and_then(Rgba::parse)
+            .unwrap_or(Rgba(255, 255, 255, 255)),
         opacity: match attr(tb, "bufferOpacity") {
             Some(v) => v.parse().unwrap_or(1.0),
             None => 1.0 - int(tb, "bufferTransp", 0) as f64 / 100.0,
@@ -386,7 +397,9 @@ fn text_format(settings: Node) -> TextFormat {
     TextFormat {
         font,
         size: sized(num(ts, "fontSize", 10.0), size_unit),
-        color: attr(ts, "textColor").and_then(Rgba::parse).unwrap_or(Rgba(0, 0, 0, 255)),
+        color: attr(ts, "textColor")
+            .and_then(Rgba::parse)
+            .unwrap_or(Rgba(0, 0, 0, 255)),
         opacity,
         line_height,
         buffer,
@@ -416,9 +429,18 @@ pub fn parse_settings(settings: Node) -> PalSettings {
         Some(Expr::field(&field_name))
     };
     let (overlap, allow_degraded) = match attr(pl, "overlapHandling") {
-        Some("AllowOverlapIfRequired") => (OverlapHandling::AllowOverlapIfRequired, int(pl, "allowDegraded", 0) != 0),
-        Some("AllowOverlapAtNoCost") => (OverlapHandling::AllowOverlapAtNoCost, int(pl, "allowDegraded", 0) != 0),
-        Some(_) => (OverlapHandling::PreventOverlap, int(pl, "allowDegraded", 0) != 0),
+        Some("AllowOverlapIfRequired") => (
+            OverlapHandling::AllowOverlapIfRequired,
+            int(pl, "allowDegraded", 0) != 0,
+        ),
+        Some("AllowOverlapAtNoCost") => (
+            OverlapHandling::AllowOverlapAtNoCost,
+            int(pl, "allowDegraded", 0) != 0,
+        ),
+        Some(_) => (
+            OverlapHandling::PreventOverlap,
+            int(pl, "allowDegraded", 0) != 0,
+        ),
         None if int(rd, "displayAll", 0) != 0 => (OverlapHandling::AllowOverlapIfRequired, true),
         None => (OverlapHandling::PreventOverlap, false),
     };
@@ -444,7 +466,8 @@ pub fn parse_settings(settings: Node) -> PalSettings {
             _ => Unit::Mm,
         },
     };
-    let mut position_order = decode_position_order(attr(pl, "predefinedPositionOrder").unwrap_or(""));
+    let mut position_order =
+        decode_position_order(attr(pl, "predefinedPositionOrder").unwrap_or(""));
     if position_order.is_empty() {
         position_order = default_position_order();
     }
@@ -483,15 +506,24 @@ pub fn parse_settings(settings: Node) -> PalSettings {
         angle_offset,
         priority: int(pl, "priority", 0),
         repeat_distance: sized(num(pl, "repeatDistance", 0.0), repeat_unit),
-        overrun_distance: sized(num(pl, "overrunDistance", 0.0), unit(attr(pl, "overrunDistanceUnit"), Unit::Mm)),
+        overrun_distance: sized(
+            num(pl, "overrunDistance", 0.0),
+            unit(attr(pl, "overrunDistanceUnit"), Unit::Mm),
+        ),
         line_anchor_percent: num(pl, "lineAnchorPercent", 0.5),
         line_anchor_strict: int(pl, "lineAnchorType", 0) == 1,
         line_anchor_entire_line: int(pl, "lineAnchorClipping", 0) == 1,
-        line_anchor_text_point: attr(pl, "lineAnchorTextPoint").and_then(TextAnchor::parse).unwrap_or(TextAnchor::Center),
-        ignore_whitespace_collisions: attr(pl, "whitespaceCollisions") == Some("IgnoreWhitespaceCollisions"),
+        line_anchor_text_point: attr(pl, "lineAnchorTextPoint")
+            .and_then(TextAnchor::parse)
+            .unwrap_or(TextAnchor::Center),
+        ignore_whitespace_collisions: attr(pl, "whitespaceCollisions")
+            == Some("IgnoreWhitespaceCollisions"),
         max_curved_char_angle_in: num(pl, "maxCurvedCharAngleIn", 25.0),
         max_curved_char_angle_out: num(pl, "maxCurvedCharAngleOut", -25.0),
-        max_distance: sized(num(pl, "maximumDistance", 0.0), unit(attr(pl, "maximumDistanceUnit"), Unit::Mm)),
+        max_distance: sized(
+            num(pl, "maximumDistance", 0.0),
+            unit(attr(pl, "maximumDistanceUnit"), Unit::Mm),
+        ),
         draw_labels: int(rd, "drawLabels", 1) != 0,
         scale_visibility: int(rd, "scaleVisibility", 0) != 0,
         maximum_scale: num(rd, "scaleMin", 0.0),
@@ -513,7 +545,10 @@ pub fn parse_settings(settings: Node) -> PalSettings {
             unit(attr(pl, "labelMarginDistanceUnit"), Unit::Mm),
         ),
         min_distance_to_duplicates: (int(pl, "allowDuplicateRemoval", 0) != 0).then(|| {
-            sized(num(pl, "minDistanceToDuplicates", 20.0), unit(attr(pl, "minDistanceToDuplicatesUnit"), Unit::Mm))
+            sized(
+                num(pl, "minDistanceToDuplicates", 20.0),
+                unit(attr(pl, "minDistanceToDuplicatesUnit"), Unit::Mm),
+            )
         }),
         obstacle: int(rd, "obstacle", 1) != 0,
         obstacle_factor: num(rd, "obstacleFactor", 1.0),
@@ -523,7 +558,9 @@ pub fn parse_settings(settings: Node) -> PalSettings {
             _ => ObstacleType::PolygonInterior,
         },
         z_index: num(rd, "zIndex", 0.0),
-        dd: child(settings, "dd_properties").map(data_defined_in).unwrap_or_default(),
+        dd: child(settings, "dd_properties")
+            .map(data_defined_in)
+            .unwrap_or_default(),
     }
 }
 
@@ -545,9 +582,14 @@ fn collect_rules(rule: Node, parent_filter: Option<&Expr>, out: &mut Vec<Labelin
         None => parent_filter.cloned(),
     };
     if let Some(s) = child(rule, "settings") {
-        let scale = |k| rule.attribute(k).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-        let scale_range = (rule.attribute("scalemindenom").is_some() || rule.attribute("scalemaxdenom").is_some())
-            .then(|| (scale("scalemindenom"), scale("scalemaxdenom")));
+        let scale = |k| {
+            rule.attribute(k)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        let scale_range = (rule.attribute("scalemindenom").is_some()
+            || rule.attribute("scalemaxdenom").is_some())
+        .then(|| (scale("scalemindenom"), scale("scalemaxdenom")));
         out.push(LabelingRule {
             filter: filter.clone(),
             scale_range,
@@ -568,10 +610,20 @@ pub fn parse_labeling(maplayer: Node) -> Vec<LabelingRule> {
     let Some(l) = child(maplayer, "labeling") else {
         return Vec::new();
     };
-    let id = child(maplayer, "id").and_then(|n| n.text()).unwrap_or("").to_string();
+    let id = child(maplayer, "id")
+        .and_then(|n| n.text())
+        .unwrap_or("")
+        .to_string();
     match l.attribute("type") {
         Some("simple") => child(l, "settings")
-            .map(|s| vec![LabelingRule { filter: None, scale_range: None, settings: parse_settings(s), key: id }])
+            .map(|s| {
+                vec![LabelingRule {
+                    filter: None,
+                    scale_range: None,
+                    settings: parse_settings(s),
+                    key: id,
+                }]
+            })
             .unwrap_or_default(),
         Some("rule-based") => {
             let mut out = Vec::new();
@@ -616,7 +668,11 @@ impl Default for EngineSettings {
 impl EngineSettings {
     /// From the project's `PAL/…` entries (`get` returns the raw entry text).
     pub fn from_project(get: impl Fn(&str) -> Option<String>) -> EngineSettings {
-        let b = |k: &str, d: bool| get(k).map(|v| matches!(v.trim(), "true" | "1")).unwrap_or(d);
+        let b = |k: &str, d: bool| {
+            get(k)
+                .map(|v| matches!(v.trim(), "true" | "1"))
+                .unwrap_or(d)
+        };
         let f = |k: &str, d: f64| get(k).and_then(|v| v.trim().parse().ok()).unwrap_or(d);
         EngineSettings {
             candidates_line_per_cm: f("CandidatesLinePerCM", 5.0),

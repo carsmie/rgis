@@ -259,7 +259,10 @@ fn qt_hsv_hue_saturation(r: i32, g: i32, b: i32) -> (i32, i32) {
     }
     // qt_div_257 for the saturation
     let x = sat + 128;
-    ((hue * 100.0).round() as i32 / 100, ((x - (x >> 8)) >> 8) as i32)
+    (
+        (hue * 100.0).round() as i32 / 100,
+        ((x - (x >> 8)) >> 8) as i32,
+    )
 }
 
 /// A raster layer's pipe: provider resampling, renderer, then the image filters.
@@ -612,36 +615,36 @@ mod imp {
                 || g::GDALGetGCPCount(base.0) > 0
                 || !g::GDALGetMetadata(base.0 as g::GDALMajorObjectH, c"RPC".as_ptr()).is_null()
                 || !g::GDALGetMetadata(base.0 as g::GDALMajorObjectH, c"GEOLOCATION".as_ptr())
-                .is_null()
+                    .is_null()
         };
         let mut warped = None;
         if needs_warp {
             unsafe {
                 let opts = g::GDALCreateWarpOptions();
                 let south_up_plain = has_gt
-                && gt[1] > 0.0
-                && gt[2] == 0.0
-                && gt[4] == 0.0
-                && gt[5] > 0.0
-                && g::GDALGetGCPCount(base.0) == 0;
+                    && gt[1] > 0.0
+                    && gt[2] == 0.0
+                    && gt[4] == 0.0
+                    && gt[5] > 0.0
+                    && g::GDALGetGCPCount(base.0) == 0;
                 if !south_up_plain
-                && g::GDALGetMaskFlags(g::GDALGetRasterBand(base.0, 1)) == GMF_ALL_VALID
+                    && g::GDALGetMaskFlags(g::GDALGetRasterBand(base.0, 1)) == GMF_ALL_VALID
                 {
-                (*opts).nDstAlphaBand = g::GDALGetRasterCount(base.0) + 1;
+                    (*opts).nDstAlphaBand = g::GDALGetRasterCount(base.0) + 1;
                 }
                 let vrt = g::GDALAutoCreateWarpedVRT(
-                base.0,
-                std::ptr::null(),
-                std::ptr::null(),
-                g::GDALResampleAlg::GRA_NearestNeighbour,
-                0.2,
-                opts,
+                    base.0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    g::GDALResampleAlg::GRA_NearestNeighbour,
+                    0.2,
+                    opts,
                 );
                 g::GDALDestroyWarpOptions(opts);
                 if vrt.is_null() {
-                warn!("warped VRT creation failed for {name}");
+                    warn!("warped VRT creation failed for {name}");
                 } else {
-                warped = Some(Handle(vrt));
+                    warped = Some(Handle(vrt));
                 }
             }
         }
@@ -1916,7 +1919,9 @@ mod imp {
         const BITS: u32 = 12;
 
         fn new() -> Self {
-            Memo { slots: vec![None; 1 << Self::BITS] }
+            Memo {
+                slots: vec![None; 1 << Self::BITS],
+            }
         }
 
         fn slot(k: K) -> usize {

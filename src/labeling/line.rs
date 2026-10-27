@@ -8,7 +8,9 @@ use super::shape::Pt;
 
 /// PointSet::length / GEOSLength.
 pub fn length(l: &[Pt]) -> f64 {
-    l.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum()
+    l.windows(2)
+        .map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1))
+        .sum()
 }
 
 /// PointSet::edgeDistances: per-vertex distance from the previous vertex, and the total.
@@ -33,7 +35,10 @@ pub fn interpolate_point(l: &[Pt], distance: f64) -> Option<Pt> {
         let seg = (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1);
         if walked + seg >= distance && seg > 0.0 {
             let t = (distance - walked) / seg;
-            return Some((w[0].0 + t * (w[1].0 - w[0].0), w[0].1 + t * (w[1].1 - w[0].1)));
+            return Some((
+                w[0].0 + t * (w[1].0 - w[0].0),
+                w[0].1 + t * (w[1].1 - w[0].1),
+            ));
         }
         walked += seg;
     }
@@ -47,7 +52,11 @@ pub fn line_locate_point(l: &[Pt], p: Pt) -> f64 {
         let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
         let len2 = dx * dx + dy * dy;
         let seg = len2.sqrt();
-        let t = if len2 > 0.0 { (((p.0 - w[0].0) * dx + (p.1 - w[0].1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let t = if len2 > 0.0 {
+            (((p.0 - w[0].0) * dx + (p.1 - w[0].1) * dy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let (cx, cy) = (w[0].0 + t * dx, w[0].1 + t * dy);
         let d2 = (p.0 - cx).powi(2) + (p.1 - cy).powi(2);
         if d2 < best_d2 {
@@ -136,7 +145,11 @@ pub fn offset_curve(l: &[Pt], distance: f64) -> Vec<Pt> {
             let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
             let len = dx.hypot(dy);
             let (nx, ny) = (-dy / len * distance, dx / len * distance);
-            ((w[0].0 + nx, w[0].1 + ny), (w[1].0 + nx, w[1].1 + ny), (dx / len, dy / len))
+            (
+                (w[0].0 + nx, w[0].1 + ny),
+                (w[1].0 + nx, w[1].1 + ny),
+                (dx / len, dy / len),
+            )
         })
         .collect();
     let mut out = vec![segs[0].0];
@@ -162,7 +175,9 @@ pub fn offset_curve(l: &[Pt], distance: f64) -> Vec<Pt> {
         let vertex = pts[i];
         match mitre {
             Some(m) if !outer => out.push(m),
-            Some(m) if (m.0 - vertex.0).hypot(m.1 - vertex.1) <= 2.0 * distance.abs() => out.push(m),
+            Some(m) if (m.0 - vertex.0).hypot(m.1 - vertex.1) <= 2.0 * distance.abs() => {
+                out.push(m)
+            }
             _ => {
                 // OffsetSegmentGenerator::addLimitedMitreJoin: a bevel perpendicular to the
                 // outer bisector at the mitre limit distance, cut by both offset lines.
@@ -243,9 +258,19 @@ pub enum Direction {
 
 /// QgsTextRendererUtils::findLineCircleIntersection.
 #[allow(clippy::too_many_arguments)]
-fn line_circle_intersection(cx: f64, cy: f64, radius: f64, x1: f64, y1: f64, x2: f64, y2: f64, res: &mut Pt) {
+fn line_circle_intersection(
+    cx: f64,
+    cy: f64,
+    radius: f64,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    res: &mut Pt,
+) {
     let m = if radius < 10.0 { 10000.0 } else { 1.0 };
-    let (cx, cy, radius, x1, y1, x2, y2) = (cx * m, cy * m, radius * m, x1 * m, y1 * m, x2 * m, y2 * m);
+    let (cx, cy, radius, x1, y1, x2, y2) =
+        (cx * m, cy * m, radius * m, x1 * m, y1 * m, x2 * m, y2 * m);
     let (dx, dy) = (x2 - x1, y2 - y1);
     let a = dx * dx + dy * dy;
     let b = 2.0 * (dx * (x1 - cx) + dy * (y1 - cy));
@@ -254,7 +279,11 @@ fn line_circle_intersection(cx: f64, cy: f64, radius: f64, x1: f64, y1: f64, x2:
     if a <= 0.000000000001 || det < 0.0 {
         return;
     }
-    let t = if (det - 0.0).abs() <= 4.0 * f64::EPSILON { -b / (2.0 * a) } else { (-b + det.sqrt()) / (2.0 * a) };
+    let t = if (det - 0.0).abs() <= 4.0 * f64::EPSILON {
+        -b / (2.0 * a)
+    } else {
+        (-b + det.sqrt()) / (2.0 * a)
+    };
     *res = ((x1 + t * dx) / m, (y1 + t * dy) / m);
 }
 
@@ -349,7 +378,9 @@ pub fn curved_text_placement(
         let (mut d, mut end_index) = (along, index);
         let (mut start, mut end) = ((0.0, 0.0), (0.0, 0.0));
         for i in 0..count {
-            let Some((s, e)) = next_char_position(m.widths[i], dists, &x, &y, &mut end_index, &mut d, false) else {
+            let Some((s, e)) =
+                next_char_position(m.widths[i], dists, &x, &y, &mut end_index, &mut d, false)
+            else {
                 return out;
             };
             if i == 0 {
@@ -375,7 +406,8 @@ pub fn curved_text_placement(
         if near0(w) {
             continue;
         }
-        let Some((mut s, e)) = next_char_position(w, dists, &x, &y, &mut index, &mut along, false) else {
+        let Some((mut s, e)) = next_char_position(w, dists, &x, &y, &mut index, &mut along, false)
+        else {
             out.graphemes.clear();
             return out;
         };
@@ -388,7 +420,9 @@ pub fn curved_text_placement(
             while delta < -PI {
                 delta += 2.0 * PI;
             }
-            if (max_concave >= 0.0 && delta > 0.0 && delta > max_concave) || (max_convex >= 0.0 && delta < 0.0 && delta < -max_convex) {
+            if (max_concave >= 0.0 && delta > 0.0 && delta > max_concave)
+                || (max_convex >= 0.0 && delta < 0.0 && delta < -max_convex)
+            {
                 out.graphemes.clear();
                 return out;
             }
@@ -430,7 +464,17 @@ pub fn curved_text_placement(
         }
     }
     if !second_attempt && upright_only && out.upside_down_count as f64 >= count as f64 / 2.0 {
-        return curved_text_placement(m, line, dists, offset_along_line, direction, max_concave, max_convex, upright_only, true);
+        return curved_text_placement(
+            m,
+            line,
+            dists,
+            offset_along_line,
+            direction,
+            max_concave,
+            max_convex,
+            upright_only,
+            true,
+        );
     }
     out
 }
@@ -468,7 +512,17 @@ mod tests {
         };
         let line = [(0.0, 0.0), (10.0, 0.0)];
         let (d, _) = edge_distances(&line);
-        let p = curved_text_placement(&m, &line, &d, 1.0, Direction::FollowLine, -1.0, -1.0, true, false);
+        let p = curved_text_placement(
+            &m,
+            &line,
+            &d,
+            1.0,
+            Direction::FollowLine,
+            -1.0,
+            -1.0,
+            true,
+            false,
+        );
         assert_eq!(p.graphemes.len(), 2);
         assert!((p.graphemes[0].x - 1.0).abs() < 1e-9 && (p.graphemes[1].x - 3.0).abs() < 1e-9);
         // Mean line on the path: lower-left corner 0.9 · h / 2 below it.
@@ -476,7 +530,17 @@ mod tests {
         assert_eq!(p.upside_down_count, 0);
         // Right to left: placed flipped, so the text still reads left to right.
         let line = [(10.0, 0.0), (0.0, 0.0)];
-        let p = curved_text_placement(&m, &line, &d, 1.0, Direction::FollowLine, -1.0, -1.0, true, false);
+        let p = curved_text_placement(
+            &m,
+            &line,
+            &d,
+            1.0,
+            Direction::FollowLine,
+            -1.0,
+            -1.0,
+            true,
+            false,
+        );
         assert!(p.flipped);
         assert!(p.graphemes[0].index == 1);
     }

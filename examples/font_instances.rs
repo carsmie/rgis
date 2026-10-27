@@ -11,7 +11,11 @@ fn main() {
             .english_or_first()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let coords: Vec<String> = ni.user_coords().zip(font.axes().iter()).map(|(c, ax)| format!("{}={c}", ax.tag())).collect();
+        let coords: Vec<String> = ni
+            .user_coords()
+            .zip(font.axes().iter())
+            .map(|(c, ax)| format!("{}={c}", ax.tag()))
+            .collect();
         println!("{name}: {}", coords.join(" "));
     }
 }

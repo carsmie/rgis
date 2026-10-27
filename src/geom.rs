@@ -761,7 +761,10 @@ pub fn offset_polyline(pts: &[(f64, f64)], dist: f64, limit: f64) -> Vec<(f64, f
             ((w[0].0 + n.0, w[0].1 + n.1), (w[1].0 + n.0, w[1].1 + n.1))
         })
         .collect();
-    let join = |a: &((f64, f64), (f64, f64)), b: &((f64, f64), (f64, f64)), v: (f64, f64), out: &mut Vec<(f64, f64)>| {
+    let join = |a: &((f64, f64), (f64, f64)),
+                b: &((f64, f64), (f64, f64)),
+                v: (f64, f64),
+                out: &mut Vec<(f64, f64)>| {
         // Intersection of the two shifted segment lines.
         let (p1, p2, p3, p4) = (a.0, a.1, b.0, b.1);
         let d1 = (p2.0 - p1.0, p2.1 - p1.1);

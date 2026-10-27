@@ -127,7 +127,8 @@ fn features_for_drawing(
     let scale = ms.scale();
     let symbolled = !keep_full && !matches!(layer.renderer, crate::symbology::Renderer::Single(_));
     let keep = |a: &Attrs| {
-        filter.is_none_or(|e| e.matches(a)) && (!symbolled || !layer.renderer.symbols_for(a, scale).is_empty())
+        filter.is_none_or(|e| e.matches(a))
+            && (!symbolled || !layer.renderer.symbols_for(a, scale).is_empty())
     };
     let out = provider.features_where(to_layer.rect(&render_extent).ok(), Some(&keep))?;
 
@@ -348,7 +349,10 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
                 while let Some(k) = ahead.next_job() {
                     let job = &jobs[order[k]];
                     let labeled = reads[order[k]].unwrap_or(false);
-                    ahead.put(k, features_for_drawing(&job.layer, ms, job.filter.as_ref(), labeled));
+                    ahead.put(
+                        k,
+                        features_for_drawing(&job.layer, ms, job.filter.as_ref(), labeled),
+                    );
                 }
             });
         }
@@ -360,7 +364,16 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             }
         }
         let _cancel = Cancel(&ahead);
-        render_layers(&mut pm, jobs, ms, scale, &mut labels, &reads, &order, &ahead)
+        render_layers(
+            &mut pm,
+            jobs,
+            ms,
+            scale,
+            &mut labels,
+            &reads,
+            &order,
+            &ahead,
+        )
     })?;
     if let Some(engine) = labels.filter(|e| e.has_layers()) {
         let started = std::time::Instant::now();
@@ -419,7 +432,11 @@ impl Lookahead {
     }
 
     /// Read `k` (in order): taken from a loader, or read here when none has claimed it.
-    fn take(&self, k: usize, read: impl FnOnce() -> Result<Vec<Prepared>>) -> Result<Vec<Prepared>> {
+    fn take(
+        &self,
+        k: usize,
+        read: impl FnOnce() -> Result<Vec<Prepared>>,
+    ) -> Result<Vec<Prepared>> {
         let mut st = self.state.lock();
         st.drawn = k;
         self.ready.notify_all();
@@ -483,7 +500,9 @@ fn render_layers(
             continue;
         };
         debug_assert_eq!(order, read_order[k]);
-        let read = ahead.take(k, || features_for_drawing(l, ms, job.filter.as_ref(), labeled));
+        let read = ahead.take(k, || {
+            features_for_drawing(l, ms, job.filter.as_ref(), labeled)
+        });
         k += 1;
         let features = match read {
             Ok(f) => f,
@@ -759,7 +778,17 @@ pub fn draw_symbol(
             continue;
         };
         if !layer.effects.is_empty() {
-            draw_with_effects(pm, sym, kind.into_owned(), &layer.effects, g, to_px, u, ctx, origin);
+            draw_with_effects(
+                pm,
+                sym,
+                kind.into_owned(),
+                &layer.effects,
+                g,
+                to_px,
+                u,
+                ctx,
+                origin,
+            );
             continue;
         }
         match kind.as_ref() {
@@ -813,14 +842,30 @@ pub fn draw_symbol(
                     );
                 }
             }
-            SymbolLayer::ShapeburstFill { color1, color2, max_distance, ignore_rings, offset, .. } => {
+            SymbolLayer::ShapeburstFill {
+                color1,
+                color2,
+                max_distance,
+                ignore_rings,
+                offset,
+                ..
+            } => {
                 let off = (offset.0.px(u) as f32, offset.1.px(u) as f32);
                 for p in polygons(g) {
                     let rings: Vec<Vec<(f32, f32)>> = geom::polygon_rings(p)
                         .map(|r| r.0.iter().map(to_px).collect())
                         .collect();
                     let max_px = max_distance.as_ref().map(|d| d.px(u).round() as i32);
-                    draw_shapeburst(pm, &rings, *color1, *color2, max_px, *ignore_rings, off, sym.opacity);
+                    draw_shapeburst(
+                        pm,
+                        &rings,
+                        *color1,
+                        *color2,
+                        max_px,
+                        *ignore_rings,
+                        off,
+                        sym.opacity,
+                    );
                 }
             }
             SymbolLayer::LinePatternFill {
@@ -928,20 +973,23 @@ pub fn draw_symbol(
                 let parts = lines(g);
                 let n_parts = parts.len();
                 for (part, l) in parts.into_iter().enumerate() {
-                    let pts: Vec<(f64, f64)> = l
-                        .0
-                        .iter()
-                        .map(|c| {
-                            let (x, y) = to_px(c);
-                            (x as f64, y as f64)
-                        })
-                        .collect();
+                    let pts: Vec<(f64, f64)> =
+                        l.0.iter()
+                            .map(|c| {
+                                let (x, y) = to_px(c);
+                                (x as f64, y as f64)
+                            })
+                            .collect();
                     if pts.is_empty() {
                         continue;
                     }
                     // QgsSymbolLayerUtils::offsetLine: symbols follow the offset curve.
                     let off = offset.px(u);
-                    let pts = if off != 0.0 { geom::offset_polyline(&pts, off, 2.0) } else { pts };
+                    let pts = if off != 0.0 {
+                        geom::offset_polyline(&pts, off, 2.0)
+                    } else {
+                        pts
+                    };
                     // QgsTemplatedLineSymbolLayerBase::renderPolyline order: interval, first, last.
                     let mut placed = vec![];
                     if *on_interval {
@@ -964,12 +1012,22 @@ pub fn draw_symbol(
                                 let (dx, dy) = (w * b.sin(), w * b.cos());
                                 draw_line_px(pm, &sub, (x + dx, y + dy), (x - dx, y - dy), u, ctx);
                             }
-                            None => draw_point_symbol(pm, &sub, (x as f32, y as f32), a, *rotate, u, ctx),
+                            None => draw_point_symbol(
+                                pm,
+                                &sub,
+                                (x as f32, y as f32),
+                                a,
+                                *rotate,
+                                u,
+                                ctx,
+                            ),
                         }
                     }
                 }
             }
-            SymbolLayer::SvgMarker { .. } | SymbolLayer::Marker { .. } | SymbolLayer::FontMarker { .. } => {
+            SymbolLayer::SvgMarker { .. }
+            | SymbolLayer::Marker { .. }
+            | SymbolLayer::FontMarker { .. } => {
                 for c in points(g) {
                     draw_marker_layer(pm, kind.as_ref(), sym.opacity, to_px(&c), 0.0, false, u);
                 }
@@ -981,16 +1039,30 @@ pub fn draw_symbol(
 /// A marker symbol at one pixel position, every layer turned by `line_angle` degrees
 /// clockwise (QgsMarkerSymbol::setLineAngle: the layer angle plus the line angle).
 /// `rotating`: the line rotates its markers (Qgis::SymbolRenderHint::DynamicRotation).
-fn draw_point_symbol(pm: &mut Pixmap, sym: &Symbol, at: (f32, f32), line_angle: f64, rotating: bool, u: &RenderUnits, ctx: &Attrs) {
+fn draw_point_symbol(
+    pm: &mut Pixmap,
+    sym: &Symbol,
+    at: (f32, f32),
+    line_angle: f64,
+    rotating: bool,
+    u: &RenderUnits,
+    ctx: &Attrs,
+) {
     for layer in &sym.layers {
-        let Some(kind) = layer.resolve(ctx) else { continue };
+        let Some(kind) = layer.resolve(ctx) else {
+            continue;
+        };
         if !draw_marker_layer(pm, kind.as_ref(), sym.opacity, at, line_angle, rotating, u) {
             // Other layer types in a marker sub-symbol: as a point symbol, unrotated.
             let one = Symbol {
                 kind: sym.kind.clone(),
                 opacity: sym.opacity,
                 data_defined: false,
-                layers: vec![crate::symbology::Layer { kind: kind.into_owned(), dd: Default::default(), effects: vec![] }],
+                layers: vec![crate::symbology::Layer {
+                    kind: kind.into_owned(),
+                    dd: Default::default(),
+                    effects: vec![],
+                }],
             };
             let g: Geometry<f64> = geo_types::Point::new(at.0 as f64, at.1 as f64).into();
             draw_symbol(pm, &one, &g, &|c| (c.x as f32, c.y as f32), u, ctx, None);
@@ -1032,7 +1104,18 @@ fn draw_marker_layer(
     u: &RenderUnits,
 ) -> bool {
     match kind {
-        SymbolLayer::SvgMarker { path, size, fixed_aspect, fill, stroke_color, stroke_width, angle, offset, anchor, .. } => {
+        SymbolLayer::SvgMarker {
+            path,
+            size,
+            fixed_aspect,
+            fill,
+            stroke_color,
+            stroke_width,
+            angle,
+            offset,
+            anchor,
+            ..
+        } => {
             let total = angle + line_angle;
             let w = size.px(u);
             let h = if anchor.1 == 1 {
@@ -1052,18 +1135,41 @@ fn draw_marker_layer(
                 angle: total,
                 opacity,
             };
-            let (ox, oy) = marker_shift((offset.0.px(u) as f32, offset.1.px(u) as f32), *anchor, w, h, total);
+            let (ox, oy) = marker_shift(
+                (offset.0.px(u) as f32, offset.1.px(u) as f32),
+                *anchor,
+                w,
+                h,
+                total,
+            );
             crate::svg::draw(pm, &marker, x + ox, y + oy);
             true
         }
-        SymbolLayer::Marker { shape, width, height, color, stroke, angle, offset, anchor, cached, .. } => {
+        SymbolLayer::Marker {
+            shape,
+            width,
+            height,
+            color,
+            stroke,
+            angle,
+            offset,
+            anchor,
+            cached,
+            ..
+        } => {
             let (w, h) = (width.px(u), height.px(u));
             // Zero-size markers are a common way to make label-only layers.
             if w <= 0.0 || h <= 0.0 {
                 return true;
             }
             let total = angle + line_angle;
-            let (ox, oy) = marker_shift((offset.0.px(u) as f32, offset.1.px(u) as f32), *anchor, w, h, total);
+            let (ox, oy) = marker_shift(
+                (offset.0.px(u) as f32, offset.1.px(u) as f32),
+                *anchor,
+                w,
+                h,
+                total,
+            );
             let (mut cx, mut cy) = (x + ox, y + oy);
             if *cached && !rotating {
                 // QgsSimpleMarkerSymbolLayer::prepareCache + renderPoint: the marker is drawn
@@ -1071,7 +1177,8 @@ fn draw_marker_layer(
                 // pixels. s = int(size) + pw + 1 (double arithmetic: not always odd as the
                 // comment there says, so the centre is a pixel centre or a pixel corner).
                 let pen = stroke.width.px(u);
-                let pw = ((if pen.abs() < 1e-8 { 1.0 } else { pen * 4.0 } + 1.0).round() as i64 / 2 * 2) as f64;
+                let pw = ((if pen.abs() < 1e-8 { 1.0 } else { pen * 4.0 } + 1.0).round() as i64 / 2
+                    * 2) as f64;
                 let mut size = w;
                 if angle.abs() > 1e-8 {
                     let a = angle.to_radians();
@@ -1087,7 +1194,17 @@ fn draw_marker_layer(
             draw_marker(pm, shape, place, *color, stroke, opacity, u);
             true
         }
-        SymbolLayer::FontMarker { font, style, chr, size, color, stroke, angle, offset, anchor } => {
+        SymbolLayer::FontMarker {
+            font,
+            style,
+            chr,
+            size,
+            color,
+            stroke,
+            angle,
+            offset,
+            anchor,
+        } => {
             // QgsFontMarkerSymbolLayer::startRender / renderPoint: the font at the rounded pixel
             // size (at least 2), the character centred on half its advance and half the
             // ascent (QPainterPath::addText(-w/2, ascent/2)), then rotated and placed.
@@ -1095,23 +1212,49 @@ fn draw_marker_layer(
             if px.abs() < 1e-9 {
                 return true;
             }
-            let req = crate::text::FontRequest { family: font.clone(), weight: 400, italic: false, style: style.clone() };
+            let req = crate::text::FontRequest {
+                family: font.clone(),
+                weight: 400,
+                italic: false,
+                style: style.clone(),
+            };
             let Some(f) = crate::text::font(&req, (px.round() as i32).max(2)) else {
                 return true;
             };
             let total = angle + line_angle;
-            let (ox, oy) = marker_shift((offset.0.px(u) as f32, offset.1.px(u) as f32), *anchor, px, px, total);
-            let ts = SkTransform::from_translate(-(f.horizontal_advance(chr) / 2.0) as f32, (f.ascent / 2.0) as f32)
-                .post_rotate(total as f32)
-                .post_translate(x + ox, y + oy);
+            let (ox, oy) = marker_shift(
+                (offset.0.px(u) as f32, offset.1.px(u) as f32),
+                *anchor,
+                px,
+                px,
+                total,
+            );
+            let ts = SkTransform::from_translate(
+                -(f.horizontal_advance(chr) / 2.0) as f32,
+                (f.ascent / 2.0) as f32,
+            )
+            .post_rotate(total as f32)
+            .post_translate(x + ox, y + oy);
             let mut pb = PathBuilder::new();
             f.append_run(&mut pb, &f.shape(chr), ts);
             let Some(path) = pb.finish() else {
                 return true;
             };
-            pm.fill_nonempty(&path, &paint(*color, opacity), FillRule::Winding, SkTransform::identity(), None);
+            pm.fill_nonempty(
+                &path,
+                &paint(*color, opacity),
+                FillRule::Winding,
+                SkTransform::identity(),
+                None,
+            );
             if stroke.visible && stroke.width.px(u) > 0.0 {
-                pm.stroke_path(&path, &paint(stroke.color, opacity), &sk_stroke(stroke, u), SkTransform::identity(), None);
+                pm.stroke_path(
+                    &path,
+                    &paint(stroke.color, opacity),
+                    &sk_stroke(stroke, u),
+                    SkTransform::identity(),
+                    None,
+                );
             }
             true
         }
@@ -1139,8 +1282,12 @@ fn draw_with_effects(
     let reach = effects
         .iter()
         .map(|e| match e {
-            Effect::Shadow { blur, offset, .. } => offset.px(u).abs().ceil() as i32 + 2 * blur_px(blur) + 10,
-            Effect::OuterGlow { spread, blur, .. } => spread.px(u).ceil() as i32 + 2 * blur_px(blur) + 10,
+            Effect::Shadow { blur, offset, .. } => {
+                offset.px(u).abs().ceil() as i32 + 2 * blur_px(blur) + 10
+            }
+            Effect::OuterGlow { spread, blur, .. } => {
+                spread.px(u).ceil() as i32 + 2 * blur_px(blur) + 10
+            }
             Effect::DrawSource { .. } => 0,
         })
         .max()
@@ -1163,19 +1310,33 @@ fn draw_with_effects(
         return;
     }
     let (w, h) = ((r - l) as usize, (b - t) as usize);
-    let Some(mut src) = Pixmap::new(w as u32, h as u32) else { return };
+    let Some(mut src) = Pixmap::new(w as u32, h as u32) else {
+        return;
+    };
     let one = Symbol {
         kind: sym.kind.clone(),
         opacity: sym.opacity,
         data_defined: false,
-        layers: vec![crate::symbology::Layer { kind, dd: Default::default(), effects: vec![] }],
+        layers: vec![crate::symbology::Layer {
+            kind,
+            dd: Default::default(),
+            effects: vec![],
+        }],
     };
     let (lf, tf) = (l as f32, t as f32);
     let shifted = |c: &Coord<f64>| {
         let (x, y) = to_px(c);
         (x - lf, y - tf)
     };
-    draw_symbol(&mut src, &one, g, &shifted, u, ctx, origin.map(|(x, y)| (x - lf, y - tf)));
+    draw_symbol(
+        &mut src,
+        &one,
+        g,
+        &shifted,
+        u,
+        ctx,
+        origin.map(|(x, y)| (x - lf, y - tf)),
+    );
     let src_a: Vec<u8> = src.pixels().iter().map(|p| p.alpha()).collect();
     if src_a.iter().all(|&a| a == 0) {
         return;
@@ -1185,11 +1346,21 @@ fn draw_with_effects(
     for e in effects {
         let out: Vec<[u8; 4]> = match e {
             Effect::DrawSource { opacity } => {
-                let paint = PixmapPaint { opacity: *opacity as f32, ..Default::default() };
+                let paint = PixmapPaint {
+                    opacity: *opacity as f32,
+                    ..Default::default()
+                };
                 pm.draw_pixmap(l, t, src.as_ref(), &paint, SkTransform::identity(), None);
                 continue;
             }
-            Effect::Shadow { inner, color, blur, offset, angle, opacity } => {
+            Effect::Shadow {
+                inner,
+                color,
+                blur,
+                offset,
+                angle,
+                opacity,
+            } => {
                 // invertPixels(InvertRgba) for the inner shadow, then overlayColor (opaque).
                 let mut im: Vec<[u8; 4]> = src_a
                     .iter()
@@ -1222,10 +1393,18 @@ fn draw_with_effects(
                 }
                 moved
             }
-            Effect::OuterGlow { color, spread, blur, opacity } => {
+            Effect::OuterGlow {
+                color,
+                spread,
+                blur,
+                opacity,
+            } => {
                 // QgsImageOperation::distanceTransform with shadeExterior: opaque pixels at
                 // 1 − alpha, the rest at infinity; shaded colour → transparent over `spread`.
-                let mut dt: Vec<f64> = src_a.iter().map(|&a| if a > 0 { 1.0 - a as f64 / 255.0 } else { 1e20 }).collect();
+                let mut dt: Vec<f64> = src_a
+                    .iter()
+                    .map(|&a| if a > 0 { 1.0 - a as f64 / 255.0 } else { 1e20 })
+                    .collect();
                 distance_transform_2d(&mut dt, w, h);
                 let s = spread.px(u);
                 let mut im: Vec<[u8; 4]> = dt
@@ -1251,13 +1430,27 @@ fn draw_with_effects(
                 im
             }
         };
-        let Some(mut layer) = Pixmap::new(w as u32, h as u32) else { return };
+        let Some(mut layer) = Pixmap::new(w as u32, h as u32) else {
+            return;
+        };
         for (p, v) in layer.pixels_mut().iter_mut().zip(out) {
             let a = v[3];
-            *p = tiny_skia::PremultipliedColorU8::from_rgba(v[0].min(a), v[1].min(a), v[2].min(a), a)
-                .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(
+                v[0].min(a),
+                v[1].min(a),
+                v[2].min(a),
+                a,
+            )
+            .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
         }
-        pm.draw_pixmap(l, t, layer.as_ref(), &PixmapPaint::default(), SkTransform::identity(), None);
+        pm.draw_pixmap(
+            l,
+            t,
+            layer.as_ref(),
+            &PixmapPaint::default(),
+            SkTransform::identity(),
+            None,
+        );
     }
 }
 
@@ -1286,7 +1479,13 @@ fn scale_alpha(im: &mut [[u8; 4]], a: i32) {
 /// premultiplied pixels: down, right, up, left.
 fn stack_blur(im: &mut [[u8; 4]], w: usize, h: usize, radius: i32) {
     const TAB: [i32; 17] = [14, 10, 8, 6, 5, 5, 4, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2];
-    let alpha = if radius < 1 { 16 } else if radius > 17 { 1 } else { TAB[radius as usize - 1] };
+    let alpha = if radius < 1 {
+        16
+    } else if radius > 17 {
+        1
+    } else {
+        TAB[radius as usize - 1]
+    };
     let line = |im: &mut [[u8; 4]], idx: &mut dyn Iterator<Item = usize>| {
         let Some(first) = idx.next() else { return };
         let mut acc = im[first].map(|v| (v as i32) << 4);
@@ -1326,13 +1525,18 @@ fn draw_shapeburst(
     opacity: f64,
 ) {
     const INF: f64 = 1e20;
-    let Some(outer) = rings.first().filter(|r| r.len() >= 3) else { return };
+    let Some(outer) = rings.first().filter(|r| r.len() >= 3) else {
+        return;
+    };
     let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for &(x, y) in outer {
         (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
     }
     let side = 4 + 2 * 4; // 4 + (blur + 2) * 4 with no blur
-    let (w, h) = ((r - l).round() as i32 + 2 * side, (b - t).round() as i32 + 2 * side);
+    let (w, h) = (
+        (r - l).round() as i32 + 2 * side,
+        (b - t).round() as i32 + 2 * side,
+    );
     if w <= 0 || h <= 0 || (w as i64) * (h as i64) > 40_000_000 {
         return;
     }
@@ -1353,26 +1557,60 @@ fn draw_shapeburst(
         pb.finish()
     };
     let Some(path) = path_of(rings) else { return };
-    let Some(mut alpha) = Pixmap::new(w as u32, h as u32) else { return };
+    let Some(mut alpha) = Pixmap::new(w as u32, h as u32) else {
+        return;
+    };
     let white = paint(Rgba(255, 255, 255, 255), 1.0);
     let black = paint(Rgba(0, 0, 0, 255), 1.0);
     // _renderPolygon with a white brush and a cosmetic (1 px) black pen.
-    let hairline = tiny_skia::Stroke { width: 1.0, ..Default::default() };
-    alpha.fill_nonempty(&path, &white, FillRule::EvenOdd, SkTransform::identity(), None);
+    let hairline = tiny_skia::Stroke {
+        width: 1.0,
+        ..Default::default()
+    };
+    alpha.fill_nonempty(
+        &path,
+        &white,
+        FillRule::EvenOdd,
+        SkTransform::identity(),
+        None,
+    );
     alpha.stroke_path(&path, &black, &hairline, SkTransform::identity(), None);
     let mut fill = Pixmap::new(w as u32, h as u32).expect("same size");
     fill.fill(tiny_skia::Color::BLACK);
     if ignore_rings {
         if let Some(outer_path) = path_of(&rings[..1]) {
-            fill.fill_nonempty(&outer_path, &white, FillRule::EvenOdd, SkTransform::identity(), None);
-            fill.stroke_path(&outer_path, &black, &hairline, SkTransform::identity(), None);
+            fill.fill_nonempty(
+                &outer_path,
+                &white,
+                FillRule::EvenOdd,
+                SkTransform::identity(),
+                None,
+            );
+            fill.stroke_path(
+                &outer_path,
+                &black,
+                &hairline,
+                SkTransform::identity(),
+                None,
+            );
         }
     } else {
-        fill.draw_pixmap(0, 0, alpha.as_ref(), &PixmapPaint::default(), SkTransform::identity(), None);
+        fill.draw_pixmap(
+            0,
+            0,
+            alpha.as_ref(),
+            &PixmapPaint::default(),
+            SkTransform::identity(),
+            None,
+        );
     }
     // Black (red == 0) pixels are the boundary/outside: distance 0, the rest to be computed.
     let (wu, hu) = (w as usize, h as usize);
-    let mut dt: Vec<f64> = fill.pixels().iter().map(|p| if p.red() == 0 { 0.0 } else { INF }).collect();
+    let mut dt: Vec<f64> = fill
+        .pixels()
+        .iter()
+        .map(|p| if p.red() == 0 { 0.0 } else { INF })
+        .collect();
     distance_transform_2d(&mut dt, wu, hu);
     let max_dist = match max_px {
         Some(m) if m != 0 => m as f64,
@@ -1382,7 +1620,15 @@ fn draw_shapeburst(
     let alpha_px = alpha.pixels().to_vec();
     for (i, px) in fill.pixels_mut().iter_mut().enumerate() {
         let sq = dt[i];
-        let v = if max_dist > 0.0 { if sq > 0.0 { (sq.sqrt() / max_dist).min(1.0) } else { 0.0 } } else { 1.0 };
+        let v = if max_dist > 0.0 {
+            if sq > 0.0 {
+                (sq.sqrt() / max_dist).min(1.0)
+            } else {
+                0.0
+            }
+        } else {
+            1.0
+        };
         let c = tiny_skia::ColorU8::from_rgba(
             lerp8(c1.0, c2.0, v),
             lerp8(c1.1, c2.1, v),
@@ -1393,7 +1639,13 @@ fn draw_shapeburst(
         // CompositionMode_DestinationIn with the polygon coverage (and the opacity).
         let a = alpha_px[i].alpha() as f64 / 255.0 * opacity;
         let m = |v: u8| (v as f64 * a).round() as u8;
-        *px = tiny_skia::PremultipliedColorU8::from_rgba(m(c.red()), m(c.green()), m(c.blue()), m(c.alpha())).unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        *px = tiny_skia::PremultipliedColorU8::from_rgba(
+            m(c.red()),
+            m(c.green()),
+            m(c.blue()),
+            m(c.alpha()),
+        )
+        .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
     }
     pm.draw_pixmap(
         (l + offset.0 - side as f32).round() as i32,
@@ -1450,7 +1702,12 @@ fn distance_transform_1d(f: &[f64], v: &mut [usize], z: &mut [f64], d: &mut [f64
 /// QgsShapeburstFillSymbolLayer::distanceTransform2d: columns, then rows.
 fn distance_transform_2d(im: &mut [f64], width: usize, height: usize) {
     let m = width.max(height);
-    let (mut f, mut v, mut z, mut d) = (vec![0.0; m], vec![0usize; m], vec![0.0; m + 1], vec![0.0; m]);
+    let (mut f, mut v, mut z, mut d) = (
+        vec![0.0; m],
+        vec![0usize; m],
+        vec![0.0; m + 1],
+        vec![0.0; m],
+    );
     for x in 0..width {
         for y in 0..height {
             f[y] = im[x + y * width];
@@ -1477,7 +1734,12 @@ struct Seg {
 
 impl Seg {
     fn new(p1: (f64, f64), p2: (f64, f64)) -> Seg {
-        let mut s = Seg { vertical: false, increasing: false, tangent: 0.0, length: 0.0 };
+        let mut s = Seg {
+            vertical: false,
+            increasing: false,
+            tangent: 0.0,
+            length: 0.0,
+        };
         if p1 == p2 {
             return s;
         }
@@ -1495,8 +1757,16 @@ impl Seg {
 
     /// Radians.
     fn angle(&self) -> f64 {
-        let a = if self.vertical { std::f64::consts::FRAC_PI_2 } else { self.tangent.atan() };
-        if self.increasing { a } else { a + std::f64::consts::PI }
+        let a = if self.vertical {
+            std::f64::consts::FRAC_PI_2
+        } else {
+            self.tangent.atan()
+        };
+        if self.increasing {
+            a
+        } else {
+            a + std::f64::consts::PI
+        }
     }
 
     fn diff_for_interval(&self, interval: f64) -> (f64, f64) {
@@ -1505,7 +1775,11 @@ impl Seg {
         }
         let alpha = self.tangent.atan();
         let (dx, dy) = (alpha.cos() * interval, alpha.sin() * interval);
-        if self.increasing { (dx, dy) } else { (-dx, -dy) }
+        if self.increasing {
+            (dx, dy)
+        } else {
+            (-dx, -dy)
+        }
     }
 }
 
@@ -1513,10 +1787,17 @@ impl Seg {
 /// the angle of the first / last non-degenerate segment, in degrees.
 fn end_angle(pts: &[(f64, f64)], first: bool) -> f64 {
     let seg = if first {
-        pts.iter().skip(1).find(|p| **p != pts[0]).map(|p| Seg::new(pts[0], *p))
+        pts.iter()
+            .skip(1)
+            .find(|p| **p != pts[0])
+            .map(|p| Seg::new(pts[0], *p))
     } else {
         let last = pts[pts.len() - 1];
-        pts.iter().rev().skip(1).find(|p| **p != last).map(|p| Seg::new(*p, last))
+        pts.iter()
+            .rev()
+            .skip(1)
+            .find(|p| **p != last)
+            .map(|p| Seg::new(*p, last))
     };
     seg.map_or(0.0, |s| s.angle().to_degrees())
 }
@@ -1611,7 +1892,12 @@ fn collect_offset_points(
 
 /// QgsTemplatedLineSymbolLayerBase::renderPolylineInterval: symbol positions along a pixel
 /// polyline with the line angle (degrees, clockwise) at each.
-fn interval_points(points: &[(f64, f64)], interval: f64, offset_along: f64, average_over: f64) -> Vec<((f64, f64), f64)> {
+fn interval_points(
+    points: &[(f64, f64)],
+    interval: f64,
+    offset_along: f64,
+    average_over: f64,
+) -> Vec<((f64, f64), f64)> {
     let mut out = vec![];
     if points.is_empty() || interval < 1e-5 {
         return out;
@@ -1619,7 +1905,11 @@ fn interval_points(points: &[(f64, f64)], interval: f64, offset_along: f64, aver
     let mut along = offset_along;
     if along.abs() > 4.0 * f64::EPSILON && points.first() == points.last() {
         let total: f64 = points.windows(2).map(|w| Seg::new(w[0], w[1]).length).sum();
-        along = if along > 0.0 { along % total } else { total - (-along % total) };
+        along = if along > 0.0 {
+            along % total
+        } else {
+            total - (-along % total)
+        };
     }
     let mut length_left = interval - along;
     if average_over > 0.0 && average_over.abs() > 4.0 * f64::EPSILON {
@@ -1633,13 +1923,36 @@ fn interval_points(points: &[(f64, f64)], interval: f64, offset_along: f64, aver
         }
         let (mut start, mut end) = (vec![], vec![]);
         if average_over <= along {
-            collect_offset_points(points, &mut start, interval, length_left + average_over, 0.0, sym.len());
+            collect_offset_points(
+                points,
+                &mut start,
+                interval,
+                length_left + average_over,
+                0.0,
+                sym.len(),
+            );
         } else {
-            collect_offset_points(points, &mut start, interval, 0.0, average_over - along, sym.len());
+            collect_offset_points(
+                points,
+                &mut start,
+                interval,
+                0.0,
+                average_over - along,
+                sym.len(),
+            );
         }
-        collect_offset_points(points, &mut end, interval, length_left - average_over, 0.0, sym.len());
+        collect_offset_points(
+            points,
+            &mut end,
+            interval,
+            length_left - average_over,
+            0.0,
+            sym.len(),
+        );
         for (i, pt) in sym.iter().enumerate() {
-            let (Some(a), Some(b)) = (start.get(i), end.get(i)) else { break };
+            let (Some(a), Some(b)) = (start.get(i), end.get(i)) else {
+                break;
+            };
             out.push((*pt, Seg::new(*a, *b).angle().to_degrees()));
         }
     } else {
@@ -2183,7 +2496,10 @@ mod tests {
         let p = interval_points(&bent, 20.0, 10.0, 0.0);
         let pts: Vec<(f64, f64)> = p.iter().map(|(pt, _)| *pt).collect();
         assert_eq!(pts.len(), 3, "{pts:?}");
-        assert!(near(pts[0].0, 10.0) && near(pts[1].1, 5.0) && near(pts[2].1, 25.0), "{pts:?}");
+        assert!(
+            near(pts[0].0, 10.0) && near(pts[1].1, 5.0) && near(pts[2].1, 25.0),
+            "{pts:?}"
+        );
     }
 
     #[test]

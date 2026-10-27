@@ -195,7 +195,10 @@ impl ConfigCache {
 
 impl ConfigCache {
     fn remote_project(&self, obj: &str) -> anyhow::Result<Arc<Project>> {
-        let ttl = std::env::var("RGIS_REMOTE_PROJECT_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
+        let ttl = std::env::var("RGIS_REMOTE_PROJECT_TTL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300u64);
         let cached = self.remote.lock().get(obj).cloned();
         if let Some((at, _, p)) = &cached
             && at.elapsed().as_secs() < ttl
@@ -209,26 +212,34 @@ impl ConfigCache {
             Ok(Some(fetched)) => fetched,
             Ok(None) => {
                 let (_, etag, p) = cached.expect("304 only with an ETag");
-                self.remote.lock().insert(obj.to_string(), (Instant::now(), etag, p.clone()));
+                self.remote
+                    .lock()
+                    .insert(obj.to_string(), (Instant::now(), etag, p.clone()));
                 return Ok(p);
             }
             // GCS unreachable: keep serving the project we have.
             Err(e) => match cached {
                 Some((_, etag, p)) => {
                     warn!("revalidating /vsigs/{obj} failed, keeping the cached project: {e:#}");
-                    self.remote.lock().insert(obj.to_string(), (Instant::now(), etag, p.clone()));
+                    self.remote
+                        .lock()
+                        .insert(obj.to_string(), (Instant::now(), etag, p.clone()));
                     return Ok(p);
                 }
                 None => return Err(e),
             },
         };
         // Project::read works on files (.qgs or .qgz); keep the object's file name.
-        let local = std::env::temp_dir().join("rgis-projects").join(obj.replace('/', "__"));
+        let local = std::env::temp_dir()
+            .join("rgis-projects")
+            .join(obj.replace('/', "__"));
         std::fs::create_dir_all(local.parent().expect("has parent"))?;
         std::fs::write(&local, bytes)?;
         let p = Arc::new(Project::read(&local)?);
         info!("loaded project /vsigs/{obj}");
-        self.remote.lock().insert(obj.to_string(), (Instant::now(), etag, p.clone()));
+        self.remote
+            .lock()
+            .insert(obj.to_string(), (Instant::now(), etag, p.clone()));
         Ok(p)
     }
 }
@@ -296,11 +307,17 @@ impl Server {
                     Err(e) => warn!("cannot list {dir_s} for RGIS_WARM_PROJECTS=*: {e}"),
                 }
             } else {
-                paths.push(PathBuf::from(format!("{dir_s}{sep}{}.qgs", n.trim_end_matches(".qgs"))));
+                paths.push(PathBuf::from(format!(
+                    "{dir_s}{sep}{}.qgs",
+                    n.trim_end_matches(".qgs")
+                )));
             }
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let (projects, layers) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+        let (projects, layers) = (
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        );
         // A few at a time: opening a remote file is one small range request each.
         std::thread::scope(|s| {
             for _ in 0..4 {
@@ -312,7 +329,11 @@ impl Server {
                                 for l in p.layers.values().filter(|l| l.kind == "vector") {
                                     match l.provider() {
                                         Ok(_) => _ = layers.fetch_add(1, Relaxed),
-                                        Err(e) => debug!("warm-up: layer {} of {}: {e:#}", l.name, path.display()),
+                                        Err(e) => debug!(
+                                            "warm-up: layer {} of {}: {e:#}",
+                                            l.name,
+                                            path.display()
+                                        ),
                                     }
                                 }
                             }
@@ -339,10 +360,18 @@ impl Server {
         if let Some(p) = &self.settings.fixed_project {
             return Ok(Some(p.clone()));
         }
-        if let (None, Some(dir), Some(name)) = (params.get("MAP"), &self.settings.projects_dir, req.path.strip_prefix("/qgis/QLR/")) {
+        if let (None, Some(dir), Some(name)) = (
+            params.get("MAP"),
+            &self.settings.projects_dir,
+            req.path.strip_prefix("/qgis/QLR/"),
+        ) {
             let name = name.trim_end_matches('/').trim_end_matches(".qgs");
             if name.is_empty() || name.contains('/') || name.contains("..") {
-                return Err(OwsError::new("ProjectFileError", format!("no project for path '{}'", req.path), 404));
+                return Err(OwsError::new(
+                    "ProjectFileError",
+                    format!("no project for path '{}'", req.path),
+                    404,
+                ));
             }
             let dir = dir.to_string_lossy();
             let sep = if dir.ends_with('/') { "" } else { "/" };
@@ -354,12 +383,21 @@ impl Server {
                 // A /vsigs/ projects "directory" is a prefix of the object key.
                 let dir_str = dir.to_string_lossy();
                 if !map.starts_with("/vsigs/") && !p.exists() {
-                    return Err(OwsError::new("ProjectFileError", format!("project '{map}' not found"), 404));
+                    return Err(OwsError::new(
+                        "ProjectFileError",
+                        format!("project '{map}' not found"),
+                        404,
+                    ));
                 }
                 let ok = if map.starts_with("/vsigs/") || dir_str.starts_with("/vsigs/") {
-                    dir_str.starts_with("/vsigs/") && map.starts_with(dir_str.as_ref()) && !map.contains("..")
+                    dir_str.starts_with("/vsigs/")
+                        && map.starts_with(dir_str.as_ref())
+                        && !map.contains("..")
                 } else {
-                    p.canonicalize().ok().zip(dir.canonicalize().ok()).is_some_and(|(p, d)| p.starts_with(d))
+                    p.canonicalize()
+                        .ok()
+                        .zip(dir.canonicalize().ok())
+                        .is_some_and(|(p, d)| p.starts_with(d))
                 };
                 if !ok {
                     return Err(OwsError::new(

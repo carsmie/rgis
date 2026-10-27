@@ -126,7 +126,13 @@ impl Provider {
     pub fn open(base_dir: &Path, provider_key: &str, datasource: &str) -> Result<Provider> {
         if provider_key == "postgres" {
             let (pg, fields, description) = crate::postgis::PgSource::open(datasource)?;
-            return Ok(Provider { kind: Kind::Pg(pg), fields, description, extent: None, filter: None });
+            return Ok(Provider {
+                kind: Kind::Pg(pg),
+                fields,
+                description,
+                extent: None,
+                filter: None,
+            });
         }
         if provider_key != "ogr" {
             bail!("provider '{provider_key}' is not supported (only 'ogr' and 'postgres')");
@@ -136,13 +142,16 @@ impl Provider {
         // QgsOgrProvider::setSubsetString → OGR_L_SetAttributeFilter. GeoPackage applies it
         // in SQL; the other sources filter here.
         if !matches!(p.kind, Kind::Gpkg(_)) {
-            p.filter = uri.subset.as_deref().and_then(|s| match crate::expression::Expr::parse(s) {
-                Ok(e) => Some(e),
-                Err(e) => {
-                    tracing::warn!("subset '{s}' not supported ({e}); ignored");
-                    None
-                }
-            });
+            p.filter =
+                uri.subset
+                    .as_deref()
+                    .and_then(|s| match crate::expression::Expr::parse(s) {
+                        Ok(e) => Some(e),
+                        Err(e) => {
+                            tracing::warn!("subset '{s}' not supported ({e}); ignored");
+                            None
+                        }
+                    });
         }
         Ok(p)
     }
@@ -209,7 +218,11 @@ impl Provider {
     /// Features in `bbox_filter` whose attributes pass `keep` (and the layer subset).
     /// FlatGeobuf checks `keep` right after decoding the properties, so rejected features
     /// never have their geometry decoded.
-    pub fn features_where(&self, bbox_filter: Option<Rect>, keep: Option<&dyn Fn(&Attrs) -> bool>) -> Result<Vec<Feature>> {
+    pub fn features_where(
+        &self,
+        bbox_filter: Option<Rect>,
+        keep: Option<&dyn Fn(&Attrs) -> bool>,
+    ) -> Result<Vec<Feature>> {
         let started = std::time::Instant::now();
         let out = match &self.kind {
             Kind::Fgb(FgbSource::File(p)) => fgb_features(
@@ -220,8 +233,15 @@ impl Provider {
                 None,
             ),
             Kind::Fgb(FgbSource::Http(f)) => {
-                let prefetch = |ranges: &[(u64, u64)], starts: &[u64]| f.prefetch_features(ranges, starts);
-                fgb_features(HttpReader::new(f.clone()), bbox_filter, &self.fields, keep, Some(&prefetch))
+                let prefetch =
+                    |ranges: &[(u64, u64)], starts: &[u64]| f.prefetch_features(ranges, starts);
+                fgb_features(
+                    HttpReader::new(f.clone()),
+                    bbox_filter,
+                    &self.fields,
+                    keep,
+                    Some(&prefetch),
+                )
             }
             Kind::Gpkg(g) => gpkg_features(g, &self.fields, bbox_filter),
             Kind::Pg(p) => p.features(bbox_filter, keep),
@@ -246,7 +266,10 @@ impl Provider {
             Some(b) => out
                 .into_iter()
                 .filter(|f| match &f.geometry {
-                    Some(g) => b.contains_rect(&crate::geom::bbox(g)) || crate::geom::clip_to_rect(g, &b).is_some(),
+                    Some(g) => {
+                        b.contains_rect(&crate::geom::bbox(g))
+                            || crate::geom::clip_to_rect(g, &b).is_some()
+                    }
                     None => true,
                 })
                 .collect(),
@@ -374,14 +397,19 @@ fn index_search<R: Read + Seek>(
             r.seek(SeekFrom::Start(base + a as u64 * ITEM))?;
             r.read_exact(&mut buf)?;
             for (i, item) in buf.as_chunks::<{ ITEM as usize }>().0.iter().enumerate() {
-                let f = |k: usize| f64::from_le_bytes(item[k * 8..k * 8 + 8].try_into().expect("8 bytes"));
+                let f = |k: usize| {
+                    f64::from_le_bytes(item[k * 8..k * 8 + 8].try_into().expect("8 bytes"))
+                };
                 // NodeItem::intersects (inclusive)
                 if f(2) < b.xmin || f(3) < b.ymin || f(0) > b.xmax || f(1) > b.ymax {
                     continue;
                 }
                 let offset = u64::from_le_bytes(item[32..40].try_into().expect("8 bytes")) as usize;
                 if level == 0 {
-                    hits.push(flatgeobuf::packed_r_tree::SearchResultItem { offset, index: a + i - leaf_start });
+                    hits.push(flatgeobuf::packed_r_tree::SearchResultItem {
+                        offset,
+                        index: a + i - leaf_start,
+                    });
                 } else {
                     next.push(offset);
                 }
@@ -449,7 +477,8 @@ fn fgb_features<R: Read + Seek>(
             if let Some(prefetch) = prefetch
                 && !hits.is_empty()
             {
-                let data_start = header_end + PackedRTree::index_size(count, PackedRTree::DEFAULT_NODE_SIZE) as u64;
+                let data_start = header_end
+                    + PackedRTree::index_size(count, PackedRTree::DEFAULT_NODE_SIZE) as u64;
                 // A feature's size is only in its own prefix: allow 64 KB after the last one of
                 // a run; consecutive hits less than 256 KB apart share a run.
                 const TAIL: u64 = 64 * 1024;
@@ -459,7 +488,9 @@ fn fgb_features<R: Read + Seek>(
                 for h in &hits {
                     let start = data_start + h.offset as u64;
                     match ranges.last_mut() {
-                        Some(last) if start <= last.1 + 256 * 1024 => last.1 = last.1.max(start + TAIL),
+                        Some(last) if start <= last.1 + 256 * 1024 => {
+                            last.1 = last.1.max(start + TAIL)
+                        }
                         _ => ranges.push((start, start + TAIL)),
                     }
                 }
@@ -531,7 +562,8 @@ impl BlockCache {
             // Below budget nothing pops stale entries: drop them once they dominate.
             if self.order.len() > 2 * self.blocks.len() + 1024 {
                 let blocks = &self.blocks;
-                self.order.retain(|(k, st)| blocks.get(k).is_some_and(|(_, s)| s == st));
+                self.order
+                    .retain(|(k, st)| blocks.get(k).is_some_and(|(_, s)| s == st));
             }
         }
         Some(data)
@@ -551,7 +583,9 @@ impl BlockCache {
         self.blocks.insert(key, (data, self.tick));
         self.order.push_back((key, self.tick));
         while self.bytes > self.budget {
-            let Some((k, stamp)) = self.order.pop_front() else { break };
+            let Some((k, stamp)) = self.order.pop_front() else {
+                break;
+            };
             if self.blocks.get(&k).is_some_and(|(_, s)| *s == stamp)
                 && let Some((b, _)) = self.blocks.remove(&k)
             {
@@ -601,16 +635,29 @@ pub struct HttpFile {
 }
 
 /// GDAL's /vsigs/ HMAC credentials (GS_ACCESS_KEY_ID / GS_SECRET_ACCESS_KEY), if set.
-static GCS_HMAC: LazyLock<Option<(String, String)>> =
-    LazyLock::new(|| Some((std::env::var("GS_ACCESS_KEY_ID").ok()?, std::env::var("GS_SECRET_ACCESS_KEY").ok()?)));
+static GCS_HMAC: LazyLock<Option<(String, String)>> = LazyLock::new(|| {
+    Some((
+        std::env::var("GS_ACCESS_KEY_ID").ok()?,
+        std::env::var("GS_SECRET_ACCESS_KEY").ok()?,
+    ))
+});
 
 /// URL and canonical resource of a /vsigs/ path (`bucket/object`), at CPL_GS_ENDPOINT.
 fn gcs_location(path: &str) -> Result<(String, String)> {
-    let (bucket, object) = path.split_once('/').ok_or_else(|| anyhow!("/vsigs/{path}: no object key"))?;
-    let object: Vec<String> = object.split('/').map(|s| urlencoding::encode(s).into_owned()).collect();
+    let (bucket, object) = path
+        .split_once('/')
+        .ok_or_else(|| anyhow!("/vsigs/{path}: no object key"))?;
+    let object: Vec<String> = object
+        .split('/')
+        .map(|s| urlencoding::encode(s).into_owned())
+        .collect();
     let resource = format!("/{bucket}/{}", object.join("/"));
-    let endpoint = std::env::var("CPL_GS_ENDPOINT").unwrap_or_else(|_| "https://storage.googleapis.com/".into());
-    Ok((format!("{}{}", endpoint.trim_end_matches('/'), resource), resource))
+    let endpoint = std::env::var("CPL_GS_ENDPOINT")
+        .unwrap_or_else(|_| "https://storage.googleapis.com/".into());
+    Ok((
+        format!("{}{}", endpoint.trim_end_matches('/'), resource),
+        resource,
+    ))
 }
 
 /// A GET, signed like GDAL's /vsigs/ with HMAC keys (legacy GOOG1 scheme: HMAC-SHA1 over
@@ -620,7 +667,10 @@ fn gcs_get(client: &reqwest::Client, url: &str, resource: Option<&str>) -> reqwe
     let Some(resource) = resource else { return req };
     let Some((key, secret)) = GCS_HMAC.as_ref() else {
         // GDAL_HTTP_HEADERS ("Name: value", one per line), e.g. a Bearer token.
-        for line in std::env::var("GDAL_HTTP_HEADERS").unwrap_or_default().split(['\r', '\n']) {
+        for line in std::env::var("GDAL_HTTP_HEADERS")
+            .unwrap_or_default()
+            .split(['\r', '\n'])
+        {
             if let Some((k, v)) = line.split_once(':') {
                 req = req.header(k.trim(), v.trim());
             }
@@ -630,17 +680,24 @@ fn gcs_get(client: &reqwest::Client, url: &str, resource: Option<&str>) -> reqwe
     use base64::Engine;
     use hmac::{KeyInit, Mac};
     let date = httpdate::fmt_http_date(std::time::SystemTime::now());
-    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("HMAC takes any key length");
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes())
+        .expect("HMAC takes any key length");
     mac.update(format!("GET\n\n\n{date}\n{resource}").as_bytes());
     let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
-    req.header("Date", date).header("Authorization", format!("GOOG1 {key}:{signature}"))
+    req.header("Date", date)
+        .header("Authorization", format!("GOOG1 {key}:{signature}"))
 }
 
 /// A /vsigs/ object only if its ETag differs from `etag` (If-None-Match; GCS answers 304
 /// when unchanged → Ok(None)). Returns the content and its ETag.
-pub fn fetch_vsigs_if_changed(path: &str, etag: Option<&str>) -> Result<Option<(Vec<u8>, Option<String>)>> {
+pub fn fetch_vsigs_if_changed(
+    path: &str,
+    etag: Option<&str>,
+) -> Result<Option<(Vec<u8>, Option<String>)>> {
     let (url, resource) = gcs_location(path)?;
-    let client = reqwest::Client::builder().user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION"))).build()?;
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION")))
+        .build()?;
     let etag = etag.map(str::to_string);
     run(async move {
         let mut req = gcs_get(&client, &url, Some(&resource));
@@ -652,7 +709,11 @@ pub fn fetch_vsigs_if_changed(path: &str, etag: Option<&str>) -> Result<Option<(
             return Ok(None);
         }
         let resp = resp.error_for_status()?;
-        let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string);
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         Ok(Some((resp.bytes().await?.to_vec(), etag)))
     })
     .with_context(|| format!("cannot read /vsigs/{path}"))
@@ -750,14 +811,20 @@ impl HttpFile {
             let cache = BLOCK_CACHE.lock();
             let mut wanted: Vec<u64> = ranges
                 .iter()
-                .flat_map(|&(a, b)| (a / BLOCK)..=(b.min(self.len.max(1) - 1) / BLOCK).min(last_block))
+                .flat_map(|&(a, b)| {
+                    (a / BLOCK)..=(b.min(self.len.max(1) - 1) / BLOCK).min(last_block)
+                })
                 .filter(|n| !cache.contains((self.id, *n)))
                 .collect();
             wanted.sort_unstable();
             wanted.dedup();
             for n in wanted {
                 match runs.last_mut() {
-                    Some((first, count)) if *first + *count == n && *count < MAX_READAHEAD_BLOCKS => *count += 1,
+                    Some((first, count))
+                        if *first + *count == n && *count < MAX_READAHEAD_BLOCKS =>
+                    {
+                        *count += 1
+                    }
                     _ => runs.push((n, 1)),
                 }
             }
@@ -767,7 +834,12 @@ impl HttpFile {
         }
         let started = std::time::Instant::now();
         let n_runs = runs.len();
-        let (c, u, r, len) = (self.client.clone(), self.url.clone(), self.gcs_resource.clone(), self.len);
+        let (c, u, r, len) = (
+            self.client.clone(),
+            self.url.clone(),
+            self.gcs_resource.clone(),
+            self.len,
+        );
         let fetched = run(async move {
             let limit = Arc::new(tokio::sync::Semaphore::new(8));
             let mut set = tokio::task::JoinSet::new();
@@ -802,7 +874,11 @@ impl HttpFile {
                 c.insert((self.id, first + i as u64), Arc::new(chunk.to_vec()));
             }
         }
-        debug!("vsicurl: prefetched {n_runs} range(s) of {} in {:?}", self.url, started.elapsed());
+        debug!(
+            "vsicurl: prefetched {n_runs} range(s) of {} in {:?}",
+            self.url,
+            started.elapsed()
+        );
     }
 
     fn block(&self, n: u64) -> Result<Arc<Vec<u8>>> {
@@ -815,20 +891,29 @@ impl HttpFile {
         // per 256 KB made a 200 km view of a national file take minutes at GCS latency.
         let window = {
             let mut ra = self.readahead.lock();
-            ra.1 = if n == ra.0 { (ra.1 * 2).min(MAX_READAHEAD_BLOCKS) } else { 1 };
+            ra.1 = if n == ra.0 {
+                (ra.1 * 2).min(MAX_READAHEAD_BLOCKS)
+            } else {
+                1
+            };
             ra.1
         };
         let last_block = (self.len - 1) / BLOCK;
         let mut count = 1;
         {
             let cache = BLOCK_CACHE.lock();
-            while count < window && n + count <= last_block && !cache.contains((self.id, n + count)) {
+            while count < window && n + count <= last_block && !cache.contains((self.id, n + count))
+            {
                 count += 1;
             }
         }
         let start = n * BLOCK;
         let end = ((n + count) * BLOCK).min(self.len) - 1;
-        let (c, u, r) = (self.client.clone(), self.url.clone(), self.gcs_resource.clone());
+        let (c, u, r) = (
+            self.client.clone(),
+            self.url.clone(),
+            self.gcs_resource.clone(),
+        );
         let data = run(async move {
             let resp = gcs_get(&c, &u, r.as_deref())
                 .header("Range", format!("bytes={start}-{end}"))
@@ -837,7 +922,10 @@ impl HttpFile {
                 .error_for_status()?;
             Ok(resp.bytes().await?.to_vec())
         })?;
-        debug!("vsicurl: fetched bytes {start}-{end} ({count} blocks) of {}", self.url);
+        debug!(
+            "vsicurl: fetched bytes {start}-{end} ({count} blocks) of {}",
+            self.url
+        );
         self.readahead.lock().0 = n + count;
         let mut first = None;
         let mut c = BLOCK_CACHE.lock();
@@ -1381,20 +1469,40 @@ mod tests {
     #[test]
     fn index_search_matches_stream_search() {
         for name in ["countries", "boundaries", "lakes"] {
-            let path = format!("{}/demo/natural_earth/{name}.fgb", env!("CARGO_MANIFEST_DIR"));
+            let path = format!(
+                "{}/demo/natural_earth/{name}.fgb",
+                env!("CARGO_MANIFEST_DIR")
+            );
             let mut r = BufReader::new(std::fs::File::open(&path).unwrap());
             let count = FgbReader::open(&mut r).unwrap().header().features_count() as usize;
             let start = r.stream_position().unwrap();
             for i in 0..12 {
                 for j in 0..6 {
-                    let (x, y, w) = (-180.0 + 30.0 * i as f64, -90.0 + 30.0 * j as f64, 7.0 + (i * j) as f64);
+                    let (x, y, w) = (
+                        -180.0 + 30.0 * i as f64,
+                        -90.0 + 30.0 * j as f64,
+                        7.0 + (i * j) as f64,
+                    );
                     let b = Rect::new(x, y, x + w, y + w);
                     r.seek(SeekFrom::Start(start)).unwrap();
-                    let ours = index_search(&mut r, count, PackedRTree::DEFAULT_NODE_SIZE, &b, None).unwrap();
+                    let ours =
+                        index_search(&mut r, count, PackedRTree::DEFAULT_NODE_SIZE, &b, None)
+                            .unwrap();
                     let ours_end = r.stream_position().unwrap();
                     r.seek(SeekFrom::Start(start)).unwrap();
-                    let theirs = PackedRTree::stream_search(&mut r, count, PackedRTree::DEFAULT_NODE_SIZE, b.xmin, b.ymin, b.xmax, b.ymax).unwrap();
-                    let pairs = |v: &[flatgeobuf::packed_r_tree::SearchResultItem]| v.iter().map(|h| (h.offset, h.index)).collect::<Vec<_>>();
+                    let theirs = PackedRTree::stream_search(
+                        &mut r,
+                        count,
+                        PackedRTree::DEFAULT_NODE_SIZE,
+                        b.xmin,
+                        b.ymin,
+                        b.xmax,
+                        b.ymax,
+                    )
+                    .unwrap();
+                    let pairs = |v: &[flatgeobuf::packed_r_tree::SearchResultItem]| {
+                        v.iter().map(|h| (h.offset, h.index)).collect::<Vec<_>>()
+                    };
                     assert_eq!(pairs(&ours), pairs(&theirs), "{name} {b:?}");
                     assert_eq!(ours_end, r.stream_position().unwrap());
                 }

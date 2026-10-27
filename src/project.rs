@@ -95,7 +95,10 @@ pub struct MapLayer {
 }
 
 /// When a layer's provider was opened, and the provider or why opening failed.
-type OpenedProvider = (std::time::Instant, std::result::Result<Arc<Provider>, String>);
+type OpenedProvider = (
+    std::time::Instant,
+    std::result::Result<Arc<Provider>, String>,
+);
 
 /// A failed open (database or network briefly unreachable, an egress rule not active yet)
 /// is retried after this, instead of the layer staying invalid for the life of the process.
@@ -118,7 +121,9 @@ impl MapLayer {
             *slot = Some((std::time::Instant::now(), opened));
         }
         let (_, opened) = slot.as_ref().expect("set above");
-        opened.clone().map_err(|e| anyhow!("layer '{}' is invalid: {e}", self.name))
+        opened
+            .clone()
+            .map_err(|e| anyhow!("layer '{}' is invalid: {e}", self.name))
     }
 
     pub fn crs(&self) -> Crs {

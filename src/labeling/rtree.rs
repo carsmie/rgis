@@ -31,7 +31,11 @@ struct Node {
 
 impl Node {
     fn new(level: i32) -> Node {
-        Node { count: 0, level, branch: [Branch::default(); MAXNODES] }
+        Node {
+            count: 0,
+            level,
+            branch: [Branch::default(); MAXNODES],
+        }
     }
 }
 
@@ -47,7 +51,12 @@ pub struct PalRtree {
 }
 
 fn combine(a: &Rect, b: &Rect) -> Rect {
-    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+    [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ]
 }
 
 /// RectSphericalVolume in f32, as compiled in QGIS.
@@ -113,7 +122,15 @@ impl PalRtree {
     pub fn insert(&mut self, data: usize, b: &BBox) {
         let rect = self.scale(b);
         let mut root = self.root;
-        self.insert_rect(Branch { rect, child: usize::MAX, data }, &mut root, 0);
+        self.insert_rect(
+            Branch {
+                rect,
+                child: usize::MAX,
+                data,
+            },
+            &mut root,
+            0,
+        );
         self.root = root;
     }
 
@@ -157,9 +174,17 @@ impl PalRtree {
     fn insert_rect(&mut self, branch: Branch, root: &mut usize, level: i32) -> bool {
         if let Some(new_node) = self.insert_rect_rec(branch, *root, level) {
             let new_root = self.alloc(self.nodes[*root].level + 1);
-            let b1 = Branch { rect: self.node_cover(*root), child: *root, data: 0 };
+            let b1 = Branch {
+                rect: self.node_cover(*root),
+                child: *root,
+                data: 0,
+            };
             self.add_branch(&b1, new_root);
-            let b2 = Branch { rect: self.node_cover(new_node), child: new_node, data: 0 };
+            let b2 = Branch {
+                rect: self.node_cover(new_node),
+                child: new_node,
+                data: 0,
+            };
             self.add_branch(&b2, new_root);
             *root = new_root;
             return true;
@@ -180,7 +205,11 @@ impl PalRtree {
                 }
                 Some(other) => {
                     self.nodes[node].branch[index].rect = self.node_cover(child);
-                    let b = Branch { rect: self.node_cover(other), child: other, data: 0 };
+                    let b = Branch {
+                        rect: self.node_cover(other),
+                        child: other,
+                        data: 0,
+                    };
                     self.add_branch(&b, node)
                 }
             }
@@ -267,7 +296,13 @@ impl PalRtree {
     }
 
     /// Returns true when not found.
-    fn remove_rect_rec(&mut self, rect: &Rect, data: usize, node: usize, reinsert: &mut Vec<usize>) -> bool {
+    fn remove_rect_rec(
+        &mut self,
+        rect: &Rect,
+        data: usize,
+        node: usize,
+        reinsert: &mut Vec<usize>,
+    ) -> bool {
         if self.nodes[node].level > 0 {
             for i in 0..self.nodes[node].count {
                 if overlap(rect, &self.nodes[node].branch[i].rect) {
@@ -304,7 +339,11 @@ fn disconnect(n: &mut Node, i: usize) {
 
 fn classify(i: usize, group: usize, pv: &mut PartitionVars) {
     pv.partition[i] = group as i32;
-    pv.cover[group] = if pv.count[group] == 0 { pv.buf[i].rect } else { combine(&pv.buf[i].rect, &pv.cover[group]) };
+    pv.cover[group] = if pv.count[group] == 0 {
+        pv.buf[i].rect
+    } else {
+        combine(&pv.buf[i].rect, &pv.cover[group])
+    };
     pv.area[group] = volume(&pv.cover[group]);
     pv.count[group] += 1;
 }
@@ -366,7 +405,11 @@ fn choose_partition(pv: &mut PartitionVars) {
         classify(chosen, better, pv);
     }
     if pv.count[0] + pv.count[1] < pv.total {
-        let group = if pv.count[0] >= pv.total - pv.min_fill { 1 } else { 0 };
+        let group = if pv.count[0] >= pv.total - pv.min_fill {
+            1
+        } else {
+            0
+        };
         for i in 0..pv.total {
             if pv.partition[i] == -1 {
                 classify(i, group, pv);
@@ -381,19 +424,59 @@ mod tests {
 
     #[test]
     fn insert_query_remove() {
-        let mut t = PalRtree::new(BBox { xmin: -1000.0, ymin: -1000.0, xmax: 1000.0, ymax: 1000.0 });
+        let mut t = PalRtree::new(BBox {
+            xmin: -1000.0,
+            ymin: -1000.0,
+            xmax: 1000.0,
+            ymax: 1000.0,
+        });
         for i in 0..100 {
             let x = (i % 10) as f64 * 10.0;
             let y = (i / 10) as f64 * 10.0;
-            t.insert(i, &BBox { xmin: x, ymin: y, xmax: x + 5.0, ymax: y + 5.0 });
+            t.insert(
+                i,
+                &BBox {
+                    xmin: x,
+                    ymin: y,
+                    xmax: x + 5.0,
+                    ymax: y + 5.0,
+                },
+            );
         }
-        let mut q = t.query(&BBox { xmin: 0.0, ymin: 0.0, xmax: 12.0, ymax: 12.0 });
+        let mut q = t.query(&BBox {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 12.0,
+            ymax: 12.0,
+        });
         q.sort();
         assert_eq!(q, vec![0, 1, 10, 11]);
-        t.remove(11, &BBox { xmin: 10.0, ymin: 10.0, xmax: 15.0, ymax: 15.0 });
-        let mut q = t.query(&BBox { xmin: 0.0, ymin: 0.0, xmax: 12.0, ymax: 12.0 });
+        t.remove(
+            11,
+            &BBox {
+                xmin: 10.0,
+                ymin: 10.0,
+                xmax: 15.0,
+                ymax: 15.0,
+            },
+        );
+        let mut q = t.query(&BBox {
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 12.0,
+            ymax: 12.0,
+        });
         q.sort();
         assert_eq!(q, vec![0, 1, 10]);
-        assert_eq!(t.query(&BBox { xmin: -1000.0, ymin: -1000.0, xmax: 1000.0, ymax: 1000.0 }).len(), 99);
+        assert_eq!(
+            t.query(&BBox {
+                xmin: -1000.0,
+                ymin: -1000.0,
+                xmax: 1000.0,
+                ymax: 1000.0
+            })
+            .len(),
+            99
+        );
     }
 }

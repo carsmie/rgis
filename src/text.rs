@@ -14,8 +14,8 @@
 //! Shaped runs and glyph outlines are cached per font and size, so repeated labels (the same
 //! names on every tile) cost no shaping or outline decoding.
 
-use std::collections::HashMap;
 use crate::render::FillNonEmpty;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use harfrust::{ShapeOptions, ShaperData, UnicodeBuffer};
@@ -36,12 +36,13 @@ enum Engine {
     FreeType,
 }
 
-static ENGINE: LazyLock<Engine> = LazyLock::new(|| match std::env::var("RGIS_TEXT_ENGINE").as_deref() {
-    Ok("coretext") => Engine::CoreText,
-    Ok("freetype") => Engine::FreeType,
-    _ if cfg!(target_os = "macos") => Engine::CoreText,
-    _ => Engine::FreeType,
-});
+static ENGINE: LazyLock<Engine> =
+    LazyLock::new(|| match std::env::var("RGIS_TEXT_ENGINE").as_deref() {
+        Ok("coretext") => Engine::CoreText,
+        Ok("freetype") => Engine::FreeType,
+        _ if cfg!(target_os = "macos") => Engine::CoreText,
+        _ => Engine::FreeType,
+    });
 
 /// A font as QgsTextFormat describes it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -118,7 +119,8 @@ impl Face {
 }
 
 static FACES: LazyLock<Mutex<HashMap<fontdb::ID, Arc<Face>>>> = LazyLock::new(Default::default);
-static FONTS: LazyLock<Mutex<HashMap<(FontRequest, i32), Arc<SizedFont>>>> = LazyLock::new(Default::default);
+static FONTS: LazyLock<Mutex<HashMap<(FontRequest, i32), Arc<SizedFont>>>> =
+    LazyLock::new(Default::default);
 
 fn query(db: &fontdb::Database, family: &str, req: &FontRequest) -> Option<fontdb::ID> {
     let families = [fontdb::Family::Name(family)];
@@ -126,7 +128,11 @@ fn query(db: &fontdb::Database, family: &str, req: &FontRequest) -> Option<fontd
         families: &families,
         weight: fontdb::Weight(req.weight),
         stretch: fontdb::Stretch::Normal,
-        style: if req.italic { fontdb::Style::Italic } else { fontdb::Style::Normal },
+        style: if req.italic {
+            fontdb::Style::Italic
+        } else {
+            fontdb::Style::Normal
+        },
     })
 }
 
@@ -135,11 +141,18 @@ fn query(db: &fontdb::Database, family: &str, req: &FontRequest) -> Option<fontd
 fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
     let db = crate::svg::fontdb();
     let fallback = std::env::var("RGIS_LABEL_FONT").unwrap_or_else(|_| {
-        if cfg!(target_os = "macos") { "System Font" } else { "DejaVu Sans" }.to_string()
+        if cfg!(target_os = "macos") {
+            "System Font"
+        } else {
+            "DejaVu Sans"
+        }
+        .to_string()
     });
-    let installed = db
-        .faces()
-        .any(|f| f.families.iter().any(|(n, _)| n.eq_ignore_ascii_case(&req.family)));
+    let installed = db.faces().any(|f| {
+        f.families
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(&req.family))
+    });
     let mut req = req.clone();
     if installed {
         if let Some((w, i)) = style_weight(&req.style) {
@@ -148,12 +161,19 @@ fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
         }
     }
     let req = &req;
-    let id = (if installed { query(db, &req.family, req) } else { None })
-        .or_else(|| query(db, &fallback, req))
-        .or_else(|| {
-            let families = [fontdb::Family::SansSerif];
-            db.query(&fontdb::Query { families: &families, ..Default::default() })
-        })?;
+    let id = (if installed {
+        query(db, &req.family, req)
+    } else {
+        None
+    })
+    .or_else(|| query(db, &fallback, req))
+    .or_else(|| {
+        let families = [fontdb::Family::SansSerif];
+        db.query(&fontdb::Query {
+            families: &families,
+            ..Default::default()
+        })
+    })?;
     if let Some(f) = FACES.lock().get(&id) {
         return Some((f.clone(), req.weight));
     }
@@ -174,14 +194,19 @@ fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
                         return None;
                     }
                 }
-                let name = font.localized_strings(ni.subfamily_name_id()).english_or_first()?.to_string();
+                let name = font
+                    .localized_strings(ni.subfamily_name_id())
+                    .english_or_first()?
+                    .to_string();
                 Some((coretext_instance_weight(&name)?, wght?))
             })
             .collect();
         Face {
             instances,
             shaper: ShaperData::new(&font),
-            upem: font.metrics(Size::unscaled(), skrifa::instance::LocationRef::default()).units_per_em as f64,
+            upem: font
+                .metrics(Size::unscaled(), skrifa::instance::LocationRef::default())
+                .units_per_em as f64,
             axes: font.axes().iter().map(|a| a.tag().to_string()).collect(),
             data: data.clone(),
             index,
@@ -198,12 +223,20 @@ fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
 fn trak_units(font: &FontRef, ptem: f32) -> f64 {
     use skrifa::raw::TableProvider;
     let Ok(trak) = font.trak() else { return 0.0 };
-    let Some(Ok(h)) = trak.horiz() else { return 0.0 };
+    let Some(Ok(h)) = trak.horiz() else {
+        return 0.0;
+    };
     let data = trak.offset_data();
-    let Ok(sizes) = h.size_table(data) else { return 0.0 };
+    let Ok(sizes) = h.size_table(data) else {
+        return 0.0;
+    };
     let n = sizes.len();
-    let Some(entry) = h.track_table().iter().find(|t| t.track().to_f32() == 0.0) else { return 0.0 };
-    let Ok(values) = entry.per_size_values(data, n as u16) else { return 0.0 };
+    let Some(entry) = h.track_table().iter().find(|t| t.track().to_f32() == 0.0) else {
+        return 0.0;
+    };
+    let Ok(values) = entry.per_size_values(data, n as u16) else {
+        return 0.0;
+    };
     let size = |i: usize| sizes[i].get().to_f32();
     let value = |i: usize| values[i].get() as f32;
     for i in 0..n.min(values.len()) {
@@ -267,7 +300,8 @@ impl OutlinePen for Pen {
     }
     fn curve_to(&mut self, a: f32, b: f32, c: f32, d: f32, x: f32, y: f32) {
         let s = self.s;
-        self.segs.push(Seg::Cubic(a * s, -b * s, c * s, -d * s, x * s, -y * s));
+        self.segs
+            .push(Seg::Cubic(a * s, -b * s, c * s, -d * s, x * s, -y * s));
     }
     fn close(&mut self) {
         self.segs.push(Seg::Close);
@@ -350,7 +384,10 @@ impl SizedFont {
             if let Ok(os2) = font.os2() {
                 let upem = face.upem;
                 let (a, d) = if os2.fs_selection().bits() & 0x80 != 0 {
-                    (os2.s_typo_ascender() as f64, -(os2.s_typo_descender() as f64))
+                    (
+                        os2.s_typo_ascender() as f64,
+                        -(os2.s_typo_descender() as f64),
+                    )
                 } else {
                     (os2.us_win_ascent() as f64, os2.us_win_descent() as f64)
                 };
@@ -359,7 +396,9 @@ impl SizedFont {
                     f.descent = q64(d * px as f64 / upem);
                 }
                 if let Some(cap) = os2.s_cap_height() {
-                    f.cap_height = ft_mul_fix(cap as i64, ft_div_fix(px as i64 * 64, upem as i64)) as f64 / 64.0;
+                    f.cap_height = ft_mul_fix(cap as i64, ft_div_fix(px as i64 * 64, upem as i64))
+                        as f64
+                        / 64.0;
                 }
             }
         }
@@ -379,10 +418,20 @@ impl SizedFont {
     /// the font engine (Qt's HarfBuzz font functions), else from the font's tables.
     /// Returns (glyph, x advance, x offset, cluster). `no_ligatures` as Qt shapes letter-spaced
     /// text (liga/clig/dlig/hlig off).
-    fn hb_shape(&self, text: &str, ptem: f64, engine: bool, no_ligatures: bool) -> Vec<(u32, f64, f64, u32)> {
+    fn hb_shape(
+        &self,
+        text: &str,
+        ptem: f64,
+        engine: bool,
+        no_ligatures: bool,
+    ) -> Vec<(u32, f64, f64, u32)> {
         struct EngineAdvances<'a>(&'a SizedFont);
         impl harfrust::font::FontFuncs for EngineAdvances<'_> {
-            fn advance_width(&mut self, _: &harfrust::font::BuiltinFontFuncs, glyph: GlyphId) -> i32 {
+            fn advance_width(
+                &mut self,
+                _: &harfrust::font::BuiltinFontFuncs,
+                glyph: GlyphId,
+            ) -> i32 {
                 self.0.engine_adv64(glyph.to_u32()) as i32
             }
         }
@@ -392,9 +441,15 @@ impl SizedFont {
         buf.push_str(text);
         buf.guess_segment_properties();
         let mut funcs = EngineAdvances(self);
-        static NO_LIGATURES: LazyLock<Vec<harfrust::Feature>> =
-            LazyLock::new(|| ["-liga", "-clig", "-dlig", "-hlig"].iter().filter_map(|f| f.parse().ok()).collect());
-        let mut opts = ShapeOptions::new().point_size(Some(ptem as f32)).scale(Some(self.px * 64));
+        static NO_LIGATURES: LazyLock<Vec<harfrust::Feature>> = LazyLock::new(|| {
+            ["-liga", "-clig", "-dlig", "-hlig"]
+                .iter()
+                .filter_map(|f| f.parse().ok())
+                .collect()
+        });
+        let mut opts = ShapeOptions::new()
+            .point_size(Some(ptem as f32))
+            .scale(Some(self.px * 64));
         if no_ligatures {
             opts = opts.features(&NO_LIGATURES);
         }
@@ -421,7 +476,11 @@ impl SizedFont {
                     .glyph_metrics(Size::unscaled(), skrifa::instance::LocationRef::default())
                     .advance_width(glyph)
                     .unwrap_or(0.0) as f64;
-                let units = match font.hvar().ok().and_then(|h| h.advance_width_delta(glyph, self.location.coords()).ok()) {
+                let units = match font
+                    .hvar()
+                    .ok()
+                    .and_then(|h| h.advance_width_delta(glyph, self.location.coords()).ok())
+                {
                     Some(delta) => base + delta.to_f64(),
                     None => font
                         .glyph_metrics(Size::unscaled(), &self.location)
@@ -474,7 +533,10 @@ impl SizedFont {
             glyphs.push((gid, (x64 + off64) / 64.0, 0.0));
             x64 += adv64;
         }
-        let run = Arc::new(Run { glyphs, width: x64 / 64.0 });
+        let run = Arc::new(Run {
+            glyphs,
+            width: x64 / 64.0,
+        });
         let mut runs = self.runs.lock();
         if runs.len() > 20_000 {
             runs.clear();
@@ -494,9 +556,15 @@ impl SizedFont {
             return g.clone();
         }
         let font = self.face.font();
-        let mut pen = Pen { s: (self.px as f64 / self.face.upem) as f32, segs: Vec::new() };
+        let mut pen = Pen {
+            s: (self.px as f64 / self.face.upem) as f32,
+            segs: Vec::new(),
+        };
         if let Some(g) = font.outline_glyphs().get(GlyphId::new(gid)) {
-            let _ = g.draw(DrawSettings::unhinted(Size::unscaled(), &self.location), &mut pen);
+            let _ = g.draw(
+                DrawSettings::unhinted(Size::unscaled(), &self.location),
+                &mut pen,
+            );
         }
         let g = Arc::new(pen.segs);
         self.glyphs.lock().insert(gid, g.clone());
@@ -512,18 +580,32 @@ impl SizedFont {
             return p.clone();
         }
         let mut pb = PathBuilder::new();
-        let run = Run { glyphs: vec![(gid, 0.0, 0.0)], width: 0.0 };
+        let run = Run {
+            glyphs: vec![(gid, 0.0, 0.0)],
+            width: 0.0,
+        };
         self.append_run(&mut pb, &run, Transform::identity());
-        let p = pb.finish().and_then(|p| p.stroke(stroke, 1.0)).map(Arc::new);
+        let p = pb
+            .finish()
+            .and_then(|p| p.stroke(stroke, 1.0))
+            .map(Arc::new);
         self.strokes.lock().insert(key, p.clone());
         p
     }
 
     /// Append a run's stroked glyph outlines (the buffer) mapped through `ts`.
-    pub fn append_run_stroked(&self, pb: &mut PathBuilder, run: &Run, ts: Transform, stroke: &tiny_skia::Stroke) {
+    pub fn append_run_stroked(
+        &self,
+        pb: &mut PathBuilder,
+        run: &Run,
+        ts: Transform,
+        stroke: &tiny_skia::Stroke,
+    ) {
         use tiny_skia::PathSegment;
         for &(gid, gx, gy) in &run.glyphs {
-            let Some(path) = self.stroked(gid, stroke) else { continue };
+            let Some(path) = self.stroked(gid, stroke) else {
+                continue;
+            };
             let t = ts.pre_translate(gx as f32, gy as f32);
             let map = |p: tiny_skia::Point| {
                 let mut q = [p];
@@ -610,10 +692,18 @@ pub struct LabelDocument {
 impl LabelDocument {
     /// `line_height` is QgsTextFormat::lineHeight as a fraction (multilineHeight);
     /// `letter_spacing` is the font's absolute letter spacing in pixels.
-    pub fn new(font: Arc<SizedFont>, lines: &[&str], line_height: f64, letter_spacing: f64) -> LabelDocument {
+    pub fn new(
+        font: Arc<SizedFont>,
+        lines: &[&str],
+        line_height: f64,
+        letter_spacing: f64,
+    ) -> LabelDocument {
         let n = lines.len().max(1);
         let line = font.ascent + font.descent;
-        let runs: Vec<Arc<Run>> = lines.iter().map(|l| font.shape_spaced(l, letter_spacing)).collect();
+        let runs: Vec<Arc<Run>> = lines
+            .iter()
+            .map(|l| font.shape_spaced(l, letter_spacing))
+            .collect();
         let width = runs.iter().map(|r| r.width).fold(0.0, f64::max);
         // First block: ascent + descent; following blocks: lineHeight · (ascent + descent).
         let height = line + (n - 1) as f64 * line_height * line;
@@ -624,18 +714,38 @@ impl LabelDocument {
             .enumerate()
             .map(|(i, r)| (r, last - (n - 1 - i) as f64 * line_height * line))
             .collect();
-        LabelDocument { font, lines, width, height }
+        LabelDocument {
+            font,
+            lines,
+            width,
+            height,
+        }
     }
 
     /// The text outline for a label whose bottom-left corner is at `origin` (pixels), rotated
     /// by `rotation` radians counter-clockwise (pal::LabelPosition::getAlpha).
-    pub fn path(&self, origin: (f64, f64), rotation: f64, align: HAlign) -> Option<tiny_skia::Path> {
-        self.build(origin, rotation, align, |f, pb, run, ts| f.append_run(pb, run, ts))
+    pub fn path(
+        &self,
+        origin: (f64, f64),
+        rotation: f64,
+        align: HAlign,
+    ) -> Option<tiny_skia::Path> {
+        self.build(origin, rotation, align, |f, pb, run, ts| {
+            f.append_run(pb, run, ts)
+        })
     }
 
     /// The buffer outline: the text path stroked with `stroke` (as a fillable path).
-    pub fn buffer_path(&self, origin: (f64, f64), rotation: f64, align: HAlign, stroke: &tiny_skia::Stroke) -> Option<tiny_skia::Path> {
-        self.build(origin, rotation, align, |f, pb, run, ts| f.append_run_stroked(pb, run, ts, stroke))
+    pub fn buffer_path(
+        &self,
+        origin: (f64, f64),
+        rotation: f64,
+        align: HAlign,
+        stroke: &tiny_skia::Stroke,
+    ) -> Option<tiny_skia::Path> {
+        self.build(origin, rotation, align, |f, pb, run, ts| {
+            f.append_run_stroked(pb, run, ts, stroke)
+        })
     }
 
     fn build(
@@ -673,7 +783,12 @@ pub struct Buffer {
 
 fn color_paint(c: Rgba, alpha: f64) -> Paint<'static> {
     let mut p = Paint::default();
-    p.set_color_rgba8(c.0, c.1, c.2, (alpha * 255.0).round().clamp(0.0, 255.0) as u8);
+    p.set_color_rgba8(
+        c.0,
+        c.1,
+        c.2,
+        (alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+    );
     p.anti_alias = true;
     p
 }
@@ -681,20 +796,39 @@ fn color_paint(c: Rgba, alpha: f64) -> Paint<'static> {
 /// Buffer pass: the text path filled with the buffer colour (unless "no fill") and stroked
 /// with a pen of the buffer width. Colour alpha is replaced by the buffer opacity
 /// (QColor::setAlphaF), as QGIS does.
-pub fn draw_buffer(pm: &mut Pixmap, doc: &LabelDocument, path: &tiny_skia::Path, origin: (f64, f64), rotation: f64, align: HAlign, b: &Buffer) {
+pub fn draw_buffer(
+    pm: &mut Pixmap,
+    doc: &LabelDocument,
+    path: &tiny_skia::Path,
+    origin: (f64, f64),
+    rotation: f64,
+    align: HAlign,
+    b: &Buffer,
+) {
     let paint = color_paint(b.color, b.opacity);
     if b.fill_interior {
         pm.fill_nonempty(path, &paint, FillRule::Winding, Transform::identity(), None);
     }
     if let Some(outline) = doc.buffer_path(origin, rotation, align, &b.stroke()) {
-        pm.fill_nonempty(&outline, &paint, FillRule::Winding, Transform::identity(), None);
+        pm.fill_nonempty(
+            &outline,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
 impl Buffer {
     /// The pen QgsTextRenderer::renderDeferredBuffer sets up (QPen default miter limit 2).
     pub fn stroke(&self) -> tiny_skia::Stroke {
-        tiny_skia::Stroke { width: self.width_px as f32, line_join: self.join, miter_limit: 2.0, ..Default::default() }
+        tiny_skia::Stroke {
+            width: self.width_px as f32,
+            line_join: self.join,
+            miter_limit: 2.0,
+            ..Default::default()
+        }
     }
 }
 
@@ -713,11 +847,21 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn matches_qt_coretext_layout() {
-        let req = FontRequest { family: "Sans Serif".into(), weight: 700, italic: false, style: String::new() };
+        let req = FontRequest {
+            family: "Sans Serif".into(),
+            weight: 700,
+            italic: false,
+            style: String::new(),
+        };
         let f = font(&req, 19).unwrap();
-        assert_eq!((f.ascent, f.descent, f.cap_height), (18.359375, 4.0, 13.375));
+        assert_eq!(
+            (f.ascent, f.descent, f.cap_height),
+            (18.359375, 4.0, 13.375)
+        );
         let run = f.shape("Velstove");
-        let qt = [0.0, 11.6406, 22.2969, 27.125, 37.1094, 43.875, 54.5, 64.4219];
+        let qt = [
+            0.0, 11.6406, 22.2969, 27.125, 37.1094, 43.875, 54.5, 64.4219,
+        ];
         for (g, q) in run.glyphs.iter().zip(qt) {
             assert!((g.1 - q).abs() < 0.02, "{} vs {q}", g.1);
         }
@@ -731,7 +875,12 @@ mod tests {
     fn print_widths() {
         let spec = std::env::var("RGIS_WIDTHS").unwrap();
         let p: Vec<&str> = spec.split(',').collect();
-        let req = FontRequest { family: p[0].into(), weight: p[1].parse().unwrap(), italic: false, style: String::new() };
+        let req = FontRequest {
+            family: p[0].into(),
+            weight: p[1].parse().unwrap(),
+            italic: false,
+            style: String::new(),
+        };
         let f = font(&req, p[2].parse().unwrap()).unwrap();
         for t in std::fs::read_to_string(p[3]).unwrap().lines() {
             println!("{t}\t{:.6}", f.horizontal_advance(t));
@@ -744,13 +893,37 @@ mod tests {
     fn print_metrics() {
         for spec in std::env::var("RGIS_PROBE").unwrap().split('|') {
             let p: Vec<&str> = spec.split(';').collect();
-            let req = FontRequest { family: p[0].into(), weight: 400, italic: false, style: p[1].into() };
+            let req = FontRequest {
+                family: p[0].into(),
+                weight: 400,
+                italic: false,
+                style: p[1].into(),
+            };
             let f = font(&req, p[2].parse().unwrap()).unwrap();
-            let adv: Vec<String> = "OSLOabcVika".chars().map(|c| format!("{:.4}", f.horizontal_advance(&c.to_string()))).collect();
-            println!("{spec}: ascent {} descent {} cap {}", f.ascent, f.descent, f.cap_height);
-            println!("  adv [{}] Vika {} AVATAR {}", adv.join(", "), f.horizontal_advance("Vika"), f.horizontal_advance("AVATAR"));
-            let ls: Vec<String> = "OSL".chars().map(|c| format!("{:.4}", f.shape_spaced(&c.to_string(), 1.3).width)).collect();
-            println!("  LS1.3 [{}] Vika {} fi {}", ls.join(", "), f.shape_spaced("Vika", 1.3).width, f.shape_spaced("fi", 1.3).width);
+            let adv: Vec<String> = "OSLOabcVika"
+                .chars()
+                .map(|c| format!("{:.4}", f.horizontal_advance(&c.to_string())))
+                .collect();
+            println!(
+                "{spec}: ascent {} descent {} cap {}",
+                f.ascent, f.descent, f.cap_height
+            );
+            println!(
+                "  adv [{}] Vika {} AVATAR {}",
+                adv.join(", "),
+                f.horizontal_advance("Vika"),
+                f.horizontal_advance("AVATAR")
+            );
+            let ls: Vec<String> = "OSL"
+                .chars()
+                .map(|c| format!("{:.4}", f.shape_spaced(&c.to_string(), 1.3).width))
+                .collect();
+            println!(
+                "  LS1.3 [{}] Vika {} fi {}",
+                ls.join(", "),
+                f.shape_spaced("Vika", 1.3).width,
+                f.shape_spaced("fi", 1.3).width
+            );
         }
     }
 
@@ -764,8 +937,17 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn legacy_weight_is_ultralight_in_qt6() {
-        let req = FontRequest { family: "Sans Serif".into(), weight: 75, italic: false, style: "Bold".into() };
+        let req = FontRequest {
+            family: "Sans Serif".into(),
+            weight: 75,
+            italic: false,
+            style: "Bold".into(),
+        };
         let f = font(&req, 19).unwrap();
-        assert!((f.horizontal_advance("Velstove") - 65.90625).abs() < 0.03, "{}", f.horizontal_advance("Velstove"));
+        assert!(
+            (f.horizontal_advance("Velstove") - 65.90625).abs() < 0.03,
+            "{}",
+            f.horizontal_advance("Velstove")
+        );
     }
 }

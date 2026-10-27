@@ -12,7 +12,9 @@ use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4, PI};
 use super::index::{BBox, GridIndex};
 use super::line::{self, Direction, TextMetrics};
 use super::rtree::PalRtree;
-use super::settings::{EngineSettings, ObstacleType, OverlapHandling, Placement, PointPosition, TextAnchor};
+use super::settings::{
+    EngineSettings, ObstacleType, OverlapHandling, Placement, PointPosition, TextAnchor,
+};
 use super::shape::{self, Pt, Shape};
 use super::stdsort::std_sort;
 
@@ -181,7 +183,18 @@ impl Part {
             xmax: x.iter().copied().fold(f64::MIN, f64::max),
             ymax: y.iter().copied().fold(f64::MIN, f64::max),
         };
-        Part { layer, feature, kind, shape, x, y, bbox, holes, is_hole: false, total_repeats: 1 }
+        Part {
+            layer,
+            feature,
+            kind,
+            shape,
+            x,
+            y,
+            bbox,
+            holes,
+            is_hole: false,
+            total_repeats: 1,
+        }
     }
 
     fn length(&self) -> f64 {
@@ -211,7 +224,10 @@ impl Part {
         match &self.shape {
             Shape::Point(q) => (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2),
             Shape::Line(l) => shape::min_dist2_to_line(l, p),
-            Shape::Polygon(r) => r.first().map(|e| shape::min_dist2_to_line(e, p)).unwrap_or(0.0),
+            Shape::Polygon(r) => r
+                .first()
+                .map(|e| shape::min_dist2_to_line(e, p))
+                .unwrap_or(0.0),
         }
     }
 }
@@ -258,7 +274,12 @@ pub struct SubPart {
 
 impl SubPart {
     fn quad(&self) -> [Pt; 4] {
-        [(self.x[0], self.y[0]), (self.x[1], self.y[1]), (self.x[2], self.y[2]), (self.x[3], self.y[3])]
+        [
+            (self.x[0], self.y[0]),
+            (self.x[1], self.y[1]),
+            (self.x[2], self.y[2]),
+            (self.x[3], self.y[3]),
+        ]
     }
 }
 
@@ -333,7 +354,12 @@ impl LabelPosition {
     }
 
     fn quad(&self) -> [Pt; 4] {
-        [(self.x[0], self.y[0]), (self.x[1], self.y[1]), (self.x[2], self.y[2]), (self.x[3], self.y[3])]
+        [
+            (self.x[0], self.y[0]),
+            (self.x[1], self.y[1]),
+            (self.x[2], self.y[2]),
+            (self.x[3], self.y[3]),
+        ]
     }
 
     /// LabelPosition::setNextPart: append a part, growing the bounding box.
@@ -344,7 +370,13 @@ impl LabelPosition {
             xmax: self.bbox.xmax.max(p.bbox.xmax),
             ymax: self.bbox.ymax.max(p.bbox.ymax),
         };
-        self.next.push(SubPart { x: p.x, y: p.y, alpha: p.alpha, part_id: p.part_id, bbox: p.bbox });
+        self.next.push(SubPart {
+            x: p.x,
+            y: p.y,
+            alpha: p.alpha,
+            part_id: p.part_id,
+            bbox: p.bbox,
+        });
         self.cbox = self.bbox;
     }
 
@@ -420,7 +452,8 @@ impl LabelPosition {
 
     /// Any part intersects the shape (crossesLine / intersectsWithPolygon).
     fn intersects_shape(&self, s: &Shape) -> bool {
-        self.all_quads().any(|(q, _, _)| shape::quad_intersects(&q, s))
+        self.all_quads()
+            .any(|(q, _, _)| shape::quad_intersects(&q, s))
     }
 
     /// LabelPosition::polygonIntersectionCost (0..12): the parts' average, rounded up.
@@ -438,7 +471,10 @@ impl LabelPosition {
                         if poly.contains_point(p) {
                             cost += 1.0;
                         }
-                        p = ((q[i].0 + q[(i + 1) % 4].0) / 2.0, (q[i].1 + q[(i + 1) % 4].1) / 2.0);
+                        p = (
+                            (q[i].0 + q[(i + 1) % 4].0) / 2.0,
+                            (q[i].1 + q[(i + 1) % 4].1) / 2.0,
+                        );
                     }
                 }
                 let c = ((q[0].0 + q[2].0) / 2.0, (q[0].1 + q[2].1) / 2.0);
@@ -532,7 +568,9 @@ impl PalLayer {
         let mut biggest: Option<(f64, Part)> = None;
         for s in &lf.parts {
             let part = Part::new(layer_index, fi, s.clone());
-            if (part.kind == Kind::Line && part.x.len() < 2) || (part.kind == Kind::Polygon && part.x.len() < 3) {
+            if (part.kind == Kind::Line && part.x.len() < 2)
+                || (part.kind == Kind::Polygon && part.x.len() < 3)
+            {
                 continue;
             }
             if lf.obstacle && geometry_is_obstacle {
@@ -543,7 +581,11 @@ impl PalLayer {
             }
             match part.kind {
                 Kind::Line | Kind::Polygon if !lf_label_every_part(&lf) => {
-                    let size = if part.kind == Kind::Line { part.length() } else { part.area() };
+                    let size = if part.kind == Kind::Line {
+                        part.length()
+                    } else {
+                        part.area()
+                    };
                     if biggest.as_ref().is_none_or(|(b, _)| size > *b) {
                         biggest = Some((size, part));
                     }
@@ -558,7 +600,9 @@ impl PalLayer {
             if let Some(obs) = &lf.obstacle_parts {
                 for s in obs {
                     let part = Part::new(layer_index, fi, s.clone());
-                    if (part.kind == Kind::Line && part.x.len() < 2) || (part.kind == Kind::Polygon && part.x.len() < 3) {
+                    if (part.kind == Kind::Line && part.x.len() < 2)
+                        || (part.kind == Kind::Polygon && part.x.len() < 3)
+                    {
                         continue;
                     }
                     self.obstacles.push(part);
@@ -571,7 +615,8 @@ impl PalLayer {
         }
         self.features.push(lf);
         if !added {
-            self.keys.remove(&(self.features[fi].fid, self.features[fi].sub_part));
+            self.keys
+                .remove(&(self.features[fi].fid, self.features[fi].sub_part));
         }
         added
     }
@@ -607,7 +652,10 @@ impl PalLayer {
     }
 
     fn is_curved(&self) -> bool {
-        matches!(self.arrangement, Placement::Curved | Placement::PerimeterCurved)
+        matches!(
+            self.arrangement,
+            Placement::Curved | Placement::PerimeterCurved
+        )
     }
 
     /// Layer::joinConnectedFeatures: merge line parts with the same label text that continue
@@ -627,16 +675,32 @@ impl PalLayer {
         let mut removed = vec![false; self.parts.len()];
         for (_, mut group) in groups {
             let parts = &self.parts;
-            std_sort(&mut group, &|&a: &usize, &b: &usize| parts[a].length() > parts[b].length());
+            std_sort(&mut group, &|&a: &usize, &b: &usize| {
+                parts[a].length() > parts[b].length()
+            });
             while group.len() > 1 {
                 let target = group.remove(0);
                 let mut left = group.clone();
-                while let Some(pos) = left.iter().position(|&o| is_connected(&self.parts[target], &self.parts[o])) {
+                while let Some(pos) = left
+                    .iter()
+                    .position(|&o| is_connected(&self.parts[target], &self.parts[o]))
+                {
                     let other = left.remove(pos);
-                    let a: Vec<Pt> = self.parts[target].x.iter().copied().zip(self.parts[target].y.iter().copied()).collect();
-                    let b: Vec<Pt> = self.parts[other].x.iter().copied().zip(self.parts[other].y.iter().copied()).collect();
+                    let a: Vec<Pt> = self.parts[target]
+                        .x
+                        .iter()
+                        .copied()
+                        .zip(self.parts[target].y.iter().copied())
+                        .collect();
+                    let b: Vec<Pt> = self.parts[other]
+                        .x
+                        .iter()
+                        .copied()
+                        .zip(self.parts[other].y.iter().copied())
+                        .collect();
                     if let Some(merged) = line_merge(&a, &b) {
-                        let (layer, feature) = (self.parts[target].layer, self.parts[target].feature);
+                        let (layer, feature) =
+                            (self.parts[target].layer, self.parts[target].feature);
                         self.parts[target] = Part::new(layer, feature, Shape::Line(merged));
                         removed[other] = true;
                         group.retain(|&g| g != other);
@@ -664,7 +728,11 @@ impl PalLayer {
         for part in std::mem::take(&mut self.parts) {
             let lf = &self.features[part.feature];
             let interval = lf.repeat_distance;
-            let len = if interval != 0.0 && part.kind == Kind::Line { part.length() } else { 0.0 };
+            let len = if interval != 0.0 && part.kind == Kind::Line {
+                part.length()
+            } else {
+                0.0
+            };
             if interval == 0.0 || part.kind != Kind::Line || len <= interval {
                 out.push(part);
                 continue;
@@ -696,7 +764,10 @@ impl PalLayer {
                     break;
                 }
                 let c = (lambda - cum[cur - 1]) / (cum[cur] - cum[cur - 1]);
-                let p = (pts[cur - 1].0 + c * (pts[cur].0 - pts[cur - 1].0), pts[cur - 1].1 + c * (pts[cur].1 - pts[cur - 1].1));
+                let p = (
+                    pts[cur - 1].0 + c * (pts[cur].0 - pts[cur - 1].0),
+                    pts[cur - 1].1 + c * (pts[cur].1 - pts[cur - 1].1),
+                );
                 piece.push(p);
                 pieces.push(std::mem::replace(&mut piece, vec![p]));
             }
@@ -719,7 +790,11 @@ fn same(a: Pt, b: Pt) -> bool {
 /// FeaturePart::isConnected: exactly one end of `b` touches an end of `a`, and b's other end
 /// is not on `a`.
 fn is_connected(a: &Part, b: &Part) -> bool {
-    let (Some(&ax0), Some(&ax1), Some(&bx0), Some(&bx1)) = (a.x.first(), a.x.last(), b.x.first(), b.x.last()) else { return false };
+    let (Some(&ax0), Some(&ax1), Some(&bx0), Some(&bx1)) =
+        (a.x.first(), a.x.last(), b.x.first(), b.x.last())
+    else {
+        return false;
+    };
     let (a0, a1) = ((ax0, a.y[0]), (ax1, *a.y.last().unwrap()));
     let (b0, b1) = ((bx0, b.y[0]), (bx1, *b.y.last().unwrap()));
     let start_touches = same(a0, b0) || same(a1, b0);
@@ -748,11 +823,20 @@ fn line_merge(a: &[Pt], b: &[Pt]) -> Option<Vec<Pt>> {
     let (mut m, reversed): (Vec<Pt>, [bool; 2]) = if same(a1, b0) {
         (a.iter().chain(&b[1..]).copied().collect(), [false, false])
     } else if same(a1, b1) {
-        (a.iter().copied().chain(b.iter().rev().skip(1).copied()).collect(), [false, true])
+        (
+            a.iter()
+                .copied()
+                .chain(b.iter().rev().skip(1).copied())
+                .collect(),
+            [false, true],
+        )
     } else if same(a0, b1) {
         (b.iter().chain(&a[1..]).copied().collect(), [false, false])
     } else if same(a0, b0) {
-        (b.iter().rev().chain(&a[1..]).copied().collect(), [true, false])
+        (
+            b.iter().rev().chain(&a[1..]).copied().collect(),
+            [true, false],
+        )
     } else {
         return None;
     };
@@ -789,7 +873,9 @@ fn quadrant_from_offset(q: (f64, f64)) -> Quadrant {
         (Some(std::cmp::Ordering::Less), Some(std::cmp::Ordering::Greater)) => Quadrant::BelowLeft,
         (Some(std::cmp::Ordering::Less), _) => Quadrant::Left,
         (Some(std::cmp::Ordering::Greater), Some(std::cmp::Ordering::Less)) => Quadrant::AboveRight,
-        (Some(std::cmp::Ordering::Greater), Some(std::cmp::Ordering::Greater)) => Quadrant::BelowRight,
+        (Some(std::cmp::Ordering::Greater), Some(std::cmp::Ordering::Greater)) => {
+            Quadrant::BelowRight
+        }
         (Some(std::cmp::Ordering::Greater), _) => Quadrant::Right,
         (_, Some(std::cmp::Ordering::Less)) => Quadrant::Above,
         (_, Some(std::cmp::Ordering::Greater)) => Quadrant::Below,
@@ -834,14 +920,31 @@ impl CandidateContext<'_> {
         self.lf.size.1
     }
 
-    fn pos(&self, x: f64, y: f64, w: f64, h: f64, alpha: f64, cost: f64, q: Quadrant) -> LabelPosition {
+    fn pos(
+        &self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        alpha: f64,
+        cost: f64,
+        q: Quadrant,
+    ) -> LabelPosition {
         LabelPosition::new(self.part, x, y, w, h, alpha, cost, q, self.upright_only)
     }
 
     /// FeaturePart::createCandidateCenteredOverPoint.
     fn centered_over_point(&self, x: f64, y: f64, out: &mut Vec<LabelPosition>, angle: f64) {
         let (w, h) = (self.width(), self.height());
-        out.push(self.pos(x - w / 2.0, y - h / 2.0, w, h, angle, 0.00005, Quadrant::Over));
+        out.push(self.pos(
+            x - w / 2.0,
+            y - h / 2.0,
+            w,
+            h,
+            angle,
+            0.00005,
+            Quadrant::Over,
+        ));
     }
 
     /// FeaturePart::createCandidatesOverPoint.
@@ -879,11 +982,26 @@ impl CandidateContext<'_> {
                 ydiff += lf.position_offset.1;
             }
         }
-        out.push(self.pos(x + xdiff, y + ydiff, w, h, angle, 0.0001, quadrant_from_offset(lf.quad_offset)));
+        out.push(self.pos(
+            x + xdiff,
+            y + ydiff,
+            w,
+            h,
+            angle,
+            0.0001,
+            quadrant_from_offset(lf.quad_offset),
+        ));
     }
 
     /// FeaturePart::createCandidatesAtOrderedPositionsOverPoint.
-    fn ordered_positions(&self, x: f64, y: f64, out: &mut Vec<LabelPosition>, angle: f64, max_point: usize) {
+    fn ordered_positions(
+        &self,
+        x: f64,
+        y: f64,
+        out: &mut Vec<LabelPosition>,
+        angle: f64,
+        max_point: usize,
+    ) {
         let lf = self.lf;
         let (w, h) = (self.width(), self.height());
         let dist = lf.dist_label;
@@ -903,7 +1021,8 @@ impl CandidateContext<'_> {
         let max_candidates = max_point * per_position;
         let mut created = 0;
         let mut add = |pos: PointPosition, distance: f64, out: &mut Vec<LabelPosition>| -> bool {
-            let (lx, ly, quadrant) = ordered_position(x, y, w, h, pos, distance, lf.visual_margin, sw, sh, angle);
+            let (lx, ly, quadrant) =
+                ordered_position(x, y, w, h, pos, distance, lf.visual_margin, sw, sh, angle);
             out.push(self.pos(lx, ly, w, h, angle, cost, quadrant));
             created += 1;
             cost += 0.001;
@@ -933,25 +1052,36 @@ impl CandidateContext<'_> {
     }
 
     /// FeaturePart::createCandidatesAroundPoint.
-    fn around_point(&self, x: f64, y: f64, out: &mut Vec<LabelPosition>, angle: f64, max_point: usize) {
+    fn around_point(
+        &self,
+        x: f64,
+        y: f64,
+        out: &mut Vec<LabelPosition>,
+        angle: f64,
+        max_point: usize,
+    ) {
         let lf = self.lf;
         let (w, h) = (self.width(), self.height());
         let dist = lf.dist_label;
         let ray_count = if max_point == 0 { 16 } else { max_point as i32 };
-        let (candidates_per_ray, ray_step) = if lf.max_distance > dist && !near(lf.max_distance, 0.0) {
-            let ray = lf.max_distance - dist;
-            let n = 2.max((self.line_per_unit * 1.5 * ray).ceil() as usize);
-            (n, ray / (n - 1) as f64)
-        } else {
-            (1, 0.0)
-        };
+        let (candidates_per_ray, ray_step) =
+            if lf.max_distance > dist && !near(lf.max_distance, 0.0) {
+                let ray = lf.max_distance - dist;
+                let n = 2.max((self.line_per_unit * 1.5 * ray).ceil() as usize);
+                (n, ray / (n - 1) as f64)
+            } else {
+                (1, 0.0)
+            };
         let increment = 2.0 * PI / ray_count as f64;
         let a90 = FRAC_PI_2;
         let a180 = PI;
         let a270 = a180 + a90;
         let a360 = 2.0 * PI;
         let (mut gamma1, mut gamma2) = if dist > 0.0 {
-            ((h / 2.0).atan2(dist + w / 2.0), (w / 2.0).atan2(dist + h / 2.0))
+            (
+                (h / 2.0).atan2(dist + w / 2.0),
+                (w / 2.0).atan2(dist + h / 2.0),
+            )
         } else {
             (a90 / 3.0, a90 / 3.0)
         };
@@ -1011,7 +1141,11 @@ impl CandidateContext<'_> {
                     quadrant = Quadrant::BelowRight;
                 }
                 let (rx, ry) = qt_rotate(angle, dx, dy);
-                let mut cost = if ray_count == 1 { 0.0001 } else { 0.0001 + scaled };
+                let mut cost = if ray_count == 1 {
+                    0.0001
+                } else {
+                    0.0001 + scaled
+                };
                 if j > 0 {
                     cost += j as f64 * 0.0020 + 0.0020 / ray_count as f64;
                 }
@@ -1070,7 +1204,11 @@ fn segment_distances(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>, f64) {
     let mut start = vec![0.0; n];
     let mut total = 0.0;
     for i in 0..n - 1 {
-        start[i] = if i == 0 { 0.0 } else { start[i - 1] + seg[i - 1] };
+        start[i] = if i == 0 {
+            0.0
+        } else {
+            start[i - 1] + seg[i - 1]
+        };
         seg[i] = (x[i + 1] - x[i]).hypot(y[i + 1] - y[i]);
         total += seg[i];
     }
@@ -1081,7 +1219,12 @@ fn segment_distances(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>, f64) {
 impl CandidateContext<'_> {
     /// FeaturePart::createCandidatesAlongLine (the near-straight-segments pass for hint-only
     /// anchors is not ported; those fall back to the midpoint candidates).
-    fn along_line(&self, out: &mut Vec<LabelPosition>, allow_overrun: bool, max_line_candidates: usize) {
+    fn along_line(
+        &self,
+        out: &mut Vec<LabelPosition>,
+        allow_overrun: bool,
+        max_line_candidates: usize,
+    ) {
         let lf = self.lf;
         let Some(ll) = &lf.line else { return };
         let w = lf.size.0;
@@ -1095,7 +1238,12 @@ impl CandidateContext<'_> {
     }
 
     /// FeaturePart::createCandidatesAlongLineNearMidpoint.
-    fn along_line_near_midpoint(&self, out: &mut Vec<LabelPosition>, initial_cost: f64, max_line_candidates: usize) {
+    fn along_line_near_midpoint(
+        &self,
+        out: &mut Vec<LabelPosition>,
+        initial_cost: f64,
+        max_line_candidates: usize,
+    ) {
         let lf = self.lf;
         let Some(ll) = &lf.line else { return };
         let (x, y) = (&self.part.x, &self.part.y);
@@ -1131,33 +1279,76 @@ impl CandidateContext<'_> {
         while along <= total - w || ll.anchor_strict {
             let (sx, sy) = point_by_distance(x, y, &seg, &start, along);
             let (ex, ey) = point_by_distance(x, y, &seg, &start, along + w);
-            let len = if along < 0.0 { (x[n - 1] - x[0]).hypot(y[n - 1] - y[0]) } else { (ex - sx).hypot(ey - sy) };
+            let len = if along < 0.0 {
+                (x[n - 1] - x[0]).hypot(y[n - 1] - y[0])
+            } else {
+                (ex - sx).hypot(ey - sy)
+            };
             let mut cost = len / w;
-            cost = if cost > 0.98 { 0.0001 } else { (1.0 - cost) / 100.0 };
+            cost = if cost > 0.98 {
+                0.0001
+            } else {
+                (1.0 - cost) / 100.0
+            };
             let text_anchor = match ll.text_point {
                 TextAnchor::Start | TextAnchor::Follow => along,
                 TextAnchor::Center => along + w / 2.0,
                 TextAnchor::End => along + w,
             };
-            cost += if total > 0.0 { (anchor - text_anchor).abs() / total } else { 0.0 } / 1000.0;
+            cost += if total > 0.0 {
+                (anchor - text_anchor).abs() / total
+            } else {
+                0.0
+            } / 1000.0;
             cost += initial_cost;
-            let angle = if near_eps(ey, sy, 4.0 * f64::EPSILON) && near_eps(ex, sx, 4.0 * f64::EPSILON) { 0.0 } else { (ey - sy).atan2(ex - sx) };
+            let angle =
+                if near_eps(ey, sy, 4.0 * f64::EPSILON) && near_eps(ex, sx, 4.0 * f64::EPSILON) {
+                    0.0
+                } else {
+                    (ey - sy).atan2(ex - sx)
+                };
             let beta = angle + FRAC_PI_2;
             if self.layer.arrangement == Placement::Line {
                 let rtl = angle > FRAC_PI_2 || angle <= -FRAC_PI_2;
                 let reversed = flags & MAP_ORIENTATION != 0 && rtl;
-                let above = (!reversed && flags & ABOVE_LINE != 0) || (reversed && flags & BELOW_LINE != 0);
-                let below = (!reversed && flags & BELOW_LINE != 0) || (reversed && flags & ABOVE_LINE != 0);
+                let above =
+                    (!reversed && flags & ABOVE_LINE != 0) || (reversed && flags & BELOW_LINE != 0);
+                let below =
+                    (!reversed && flags & BELOW_LINE != 0) || (reversed && flags & ABOVE_LINE != 0);
                 if above {
                     let c = cost + if reversed { 0.001 } else { 0.0 };
-                    out.push(self.pos(sx + beta.cos() * dist, sy + beta.sin() * dist, w, h, angle, c, Quadrant::Over));
+                    out.push(self.pos(
+                        sx + beta.cos() * dist,
+                        sy + beta.sin() * dist,
+                        w,
+                        h,
+                        angle,
+                        c,
+                        Quadrant::Over,
+                    ));
                 }
                 if below {
                     let c = cost + if reversed { 0.0 } else { 0.001 };
-                    out.push(self.pos(sx - beta.cos() * (dist + h), sy - beta.sin() * (dist + h), w, h, angle, c, Quadrant::Over));
+                    out.push(self.pos(
+                        sx - beta.cos() * (dist + h),
+                        sy - beta.sin() * (dist + h),
+                        w,
+                        h,
+                        angle,
+                        c,
+                        Quadrant::Over,
+                    ));
                 }
                 if flags & ON_LINE != 0 {
-                    out.push(self.pos(sx - h * beta.cos() / 2.0, sy - h * beta.sin() / 2.0, w, h, angle, cost + 0.002, Quadrant::Over));
+                    out.push(self.pos(
+                        sx - h * beta.cos() / 2.0,
+                        sy - h * beta.sin() / 2.0,
+                        w,
+                        h,
+                        angle,
+                        cost + 0.002,
+                        Quadrant::Over,
+                    ));
                 }
             }
             along += step;
@@ -1168,19 +1359,32 @@ impl CandidateContext<'_> {
     }
 
     /// FeaturePart::createHorizontalCandidatesAlongLine.
-    fn horizontal_along_line(&self, out: &mut Vec<LabelPosition>, angle: f64, max_line_candidates: usize) {
+    fn horizontal_along_line(
+        &self,
+        out: &mut Vec<LabelPosition>,
+        angle: f64,
+        max_line_candidates: usize,
+    ) {
         let lf = self.lf;
         let Some(ll) = &lf.line else { return };
         let (x, y) = (&self.part.x, &self.part.y);
         let (w, h) = lf.size;
         let (seg, start, total) = segment_distances(x, y);
         let anchor = total * ll.anchor_percent;
-        let (mut along, step) = if ll.anchor_strict { (anchor, -1.0) } else { (0.0, total / (max_line_candidates + 1) as f64) };
+        let (mut along, step) = if ll.anchor_strict {
+            (anchor, -1.0)
+        } else {
+            (0.0, total / (max_line_candidates + 1) as f64)
+        };
         let (c, s) = (angle.cos(), angle.sin());
         let (hx, hy) = (h / 2.0 * s, h / 2.0 * c);
         while along <= total {
             let (cx, cy) = point_by_distance(x, y, &seg, &start, along);
-            let cost = if total > 0.0 { (anchor - along).abs() / total } else { 0.0 } / 1000.0;
+            let cost = if total > 0.0 {
+                (anchor - along).abs() / total
+            } else {
+                0.0
+            } / 1000.0;
             let (lx, ly) = match ll.text_point {
                 TextAnchor::Start | TextAnchor::Follow => (cx + hx, cy - hy),
                 TextAnchor::Center => (cx - w / 2.0 * c + hx, cy - w / 2.0 * s - hy),
@@ -1209,7 +1413,12 @@ fn std_clamp(v: f64, lo: f64, hi: f64) -> f64 {
 impl CandidateContext<'_> {
     /// FeaturePart::createDefaultCurvedCandidatesAlongLine (default curved mode: no stretch to
     /// fit, no permissible zone, labels not repeated).
-    fn curved_along_line(&self, out: &mut Vec<LabelPosition>, allow_overrun: bool, max_line_candidates: usize) {
+    fn curved_along_line(
+        &self,
+        out: &mut Vec<LabelPosition>,
+        allow_overrun: bool,
+        max_line_candidates: usize,
+    ) {
         let lf = self.lf;
         let Some(ll) = &lf.line else { return };
         let Some(m) = &ll.metrics else { return };
@@ -1218,7 +1427,13 @@ impl CandidateContext<'_> {
             return;
         }
         let total_char_width: f64 = m.widths.iter().sum();
-        let mut shape: Vec<Pt> = self.part.x.iter().copied().zip(self.part.y.iter().copied()).collect();
+        let mut shape: Vec<Pt> = self
+            .part
+            .x
+            .iter()
+            .copied()
+            .zip(self.part.y.iter().copied())
+            .collect();
         let mut shape_len = line::length(&shape);
         // Overrun never exceeds the label (hint) or always fits it (strict).
         let overrun = if ll.anchor_strict {
@@ -1226,7 +1441,9 @@ impl CandidateContext<'_> {
         } else {
             ll.overrun.min(total_char_width * 0.95)
         };
-        if total_char_width > shape_len && (!allow_overrun || shape_len < total_char_width - 2.0 * overrun) {
+        if total_char_width > shape_len
+            && (!allow_overrun || shape_len < total_char_width - 2.0 * overrun)
+        {
             return;
         }
         // Anchor on the original line, before the overrun extension.
@@ -1290,7 +1507,11 @@ impl CandidateContext<'_> {
                 Some(p) => line::line_locate_point(current, p),
                 None => {
                     let a = total * ll.anchor_percent;
-                    if offset == PathOffset::Negative { total - a } else { a }
+                    if offset == PathOffset::Negative {
+                        total - a
+                    } else {
+                        a
+                    }
                 }
             };
             let mut delta = (m.heights[0] / 6.0).max(total / max_line_candidates.max(1) as f64);
@@ -1299,8 +1520,14 @@ impl CandidateContext<'_> {
             if ll.anchor_strict {
                 start = match ll.text_point {
                     TextAnchor::Start => std_clamp(line_anchor, 0.0, total * 0.999),
-                    TextAnchor::Center => std_clamp(line_anchor - label_width / 2.0, 0.0, total * 0.999 - label_width / 2.0),
-                    TextAnchor::End => std_clamp(line_anchor - label_width, 0.0, total * 0.999 - label_width),
+                    TextAnchor::Center => std_clamp(
+                        line_anchor - label_width / 2.0,
+                        0.0,
+                        total * 0.999 - label_width / 2.0,
+                    ),
+                    TextAnchor::End => {
+                        std_clamp(line_anchor - label_width, 0.0, total * 0.999 - label_width)
+                    }
                     TextAnchor::Follow => 0.0,
                 };
                 single = true;
@@ -1315,16 +1542,42 @@ impl CandidateContext<'_> {
                 tested = true;
                 let here = along;
                 along += delta;
-                let direction = if flags & MAP_ORIENTATION != 0 { Direction::RespectPainterOrientation } else { Direction::FollowLine };
+                let direction = if flags & MAP_ORIENTATION != 0 {
+                    Direction::RespectPainterOrientation
+                } else {
+                    Direction::FollowLine
+                };
                 let upright = self.upright_only && (!single || flags & MAP_ORIENTATION == 0);
-                let (max_in, max_out) = if single { (-1.0, -1.0) } else { (ll.max_angle_inside.abs(), ll.max_angle_outside.abs()) };
-                let placement = line::curved_text_placement(m, current, &dists, here, direction, max_in, max_out, upright, false);
+                let (max_in, max_out) = if single {
+                    (-1.0, -1.0)
+                } else {
+                    (ll.max_angle_inside.abs(), ll.max_angle_outside.abs())
+                };
+                let placement = line::curved_text_placement(
+                    m, current, &dists, here, direction, max_in, max_out, upright, false,
+                );
                 tracing::trace!(target: "rgis::label_cands", fid = lf.fid, ?offset, here, total, delta, placed = placement.graphemes.len(), flipped = placement.flipped, "curved candidate");
-                let mut rtl = if upright { placement.flipped } else { placement.right_to_left };
-                let Some(first) = placement.graphemes.first() else { continue };
+                let mut rtl = if upright {
+                    placement.flipped
+                } else {
+                    placement.right_to_left
+                };
+                let Some(first) = placement.graphemes.first() else {
+                    continue;
+                };
                 // FeaturePart::curvedPlacementAtOffset: one position per grapheme.
                 let mk = |g: &line::GraphemePlacement| {
-                    let mut p = LabelPosition::new(self.part, g.x, g.y, g.width, g.height, g.angle, 0.0001, Quadrant::Over, false);
+                    let mut p = LabelPosition::new(
+                        self.part,
+                        g.x,
+                        g.y,
+                        g.width,
+                        g.height,
+                        g.angle,
+                        0.0001,
+                        Quadrant::Over,
+                        false,
+                    );
                     p.part_id = g.index;
                     p
                 };
@@ -1338,7 +1591,9 @@ impl CandidateContext<'_> {
 
                 let mut backup_only = false;
                 if flags & MAP_ORIENTATION != 0 {
-                    if (offset == PathOffset::Positive && positive_has_negative) || (offset == PathOffset::Negative && negative_has_negative) {
+                    if (offset == PathOffset::Positive && positive_has_negative)
+                        || (offset == PathOffset::Negative && negative_has_negative)
+                    {
                         rtl = !rtl;
                     }
                     if offset != PathOffset::None && !rtl && flags & ABOVE_LINE == 0 {
@@ -1359,7 +1614,11 @@ impl CandidateContext<'_> {
                 backup = None;
 
                 let angle_diff = lp.angle_differential();
-                let angle_diff_avg = if count > 1 { angle_diff / (count - 1) as f64 } else { 0.0 };
+                let angle_diff_avg = if count > 1 {
+                    angle_diff / (count - 1) as f64
+                } else {
+                    0.0
+                };
                 let flexible = !single && ll.anchor_percent > 0.1 && ll.anchor_percent < 0.9;
                 let mut cost = (angle_diff_avg / 100.0).max(0.0001);
                 let text_anchor = match ll.text_point {
@@ -1406,18 +1665,53 @@ fn ordered_position(
     use PointPosition::*;
     let (left, top, right, bottom) = m;
     let (quadrant, alpha, dx, dy) = match position {
-        TopLeft => (Quadrant::AboveLeft, 3.0 * FRAC_PI_4, -w + right - sw, -bottom + sh),
-        TopSlightlyLeft => (Quadrant::AboveRight, FRAC_PI_2, -w / 4.0 - left, -bottom + sh),
+        TopLeft => (
+            Quadrant::AboveLeft,
+            3.0 * FRAC_PI_4,
+            -w + right - sw,
+            -bottom + sh,
+        ),
+        TopSlightlyLeft => (
+            Quadrant::AboveRight,
+            FRAC_PI_2,
+            -w / 4.0 - left,
+            -bottom + sh,
+        ),
         TopMiddle => (Quadrant::Above, FRAC_PI_2, -w / 2.0, -bottom + sh),
-        TopSlightlyRight => (Quadrant::AboveLeft, FRAC_PI_2, -w * 3.0 / 4.0 + right, -bottom + sh),
+        TopSlightlyRight => (
+            Quadrant::AboveLeft,
+            FRAC_PI_2,
+            -w * 3.0 / 4.0 + right,
+            -bottom + sh,
+        ),
         TopRight => (Quadrant::AboveRight, FRAC_PI_4, -left + sw, -bottom + sh),
         MiddleLeft => (Quadrant::Left, PI, -w + right - sw, -h / 2.0),
         MiddleRight => (Quadrant::Right, 0.0, -left + sw, -h / 2.0),
-        BottomLeft => (Quadrant::BelowLeft, 5.0 * FRAC_PI_4, -w + right - sw, -h + top - sh),
-        BottomSlightlyLeft => (Quadrant::BelowRight, 3.0 * FRAC_PI_2, -w / 4.0 - left, -h + top - sh),
+        BottomLeft => (
+            Quadrant::BelowLeft,
+            5.0 * FRAC_PI_4,
+            -w + right - sw,
+            -h + top - sh,
+        ),
+        BottomSlightlyLeft => (
+            Quadrant::BelowRight,
+            3.0 * FRAC_PI_2,
+            -w / 4.0 - left,
+            -h + top - sh,
+        ),
         BottomMiddle => (Quadrant::Below, 3.0 * FRAC_PI_2, -w / 2.0, -h + top - sh),
-        BottomSlightlyRight => (Quadrant::BelowLeft, 3.0 * FRAC_PI_2, -w * 3.0 / 4.0 + right, -h + top - sh),
-        BottomRight => (Quadrant::BelowRight, 7.0 * FRAC_PI_4, -left + sw, -h + top - sh),
+        BottomSlightlyRight => (
+            Quadrant::BelowLeft,
+            3.0 * FRAC_PI_2,
+            -w * 3.0 / 4.0 + right,
+            -h + top - sh,
+        ),
+        BottomRight => (
+            Quadrant::BelowRight,
+            7.0 * FRAC_PI_4,
+            -left + sw,
+            -h + top - sh,
+        ),
         OverPoint => {
             distance = 0.0;
             (Quadrant::Over, 0.0, -w / 2.0, -h / 2.0)
@@ -1439,7 +1733,12 @@ struct PriorityQueue {
 
 impl PriorityQueue {
     fn new(n: usize, max_id: usize) -> PriorityQueue {
-        PriorityQueue { heap: vec![0; n], p: vec![0.0; n], pos: vec![-1; max_id + 1], size: 0 }
+        PriorityQueue {
+            heap: vec![0; n],
+            p: vec![0.0; n],
+            pos: vec![-1; max_id + 1],
+            size: 0,
+        }
     }
     fn greater(l: f64, r: f64) -> bool {
         l > r
@@ -1567,7 +1866,12 @@ struct Problem {
 
 fn grid_extent(b: &BBox) -> BBox {
     let m = (b.xmax - b.xmin).max(b.ymax - b.ymin) * 0.5;
-    BBox { xmin: b.xmin - m, ymin: b.ymin - m, xmax: b.xmax + m, ymax: b.ymax + m }
+    BBox {
+        xmin: b.xmin - m,
+        ymin: b.ymin - m,
+        xmax: b.xmax + m,
+        ymax: b.ymax + m,
+    }
 }
 
 impl Problem {
@@ -1581,7 +1885,10 @@ impl Problem {
         let fb = &layers[lb.layer].features[lb.feature];
         let min_separation = fa.no_repeat_distance.max(fb.no_repeat_distance);
         let duplicate = min_separation > 0.0 && fa.label_text == fb.label_text;
-        if !duplicate && (fa.overlap == OverlapHandling::AllowOverlapAtNoCost || fb.overlap == OverlapHandling::AllowOverlapAtNoCost) {
+        if !duplicate
+            && (fa.overlap == OverlapHandling::AllowOverlapAtNoCost
+                || fb.overlap == OverlapHandling::AllowOverlapAtNoCost)
+        {
             return false;
         }
         let single = la.next.is_empty() && lb.next.is_empty();
@@ -1592,19 +1899,31 @@ impl Problem {
             // Corner to corner, as LabelPosition::isInConflict does for axis-parallel labels.
             let m2 = min_separation * min_separation;
             return duplicate
-                && la.quad().iter().any(|p| lb.quad().iter().any(|q| (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) < m2));
+                && la.quad().iter().any(|p| {
+                    lb.quad()
+                        .iter()
+                        .any(|q| (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) < m2)
+                });
         }
         if duplicate {
             // GEOSPreparedDistanceWithin over all parts.
-            return la.all_quads().any(|(qa, _, _)| lb.all_quads().any(|(qb, _, _)| shape::quad_distance(&qa, &qb) <= min_separation));
+            return la.all_quads().any(|(qa, _, _)| {
+                lb.all_quads()
+                    .any(|(qb, _, _)| shape::quad_distance(&qa, &qb) <= min_separation)
+            });
         }
-        let key = (la.global_id.min(lb.global_id), la.global_id.max(lb.global_id));
+        let key = (
+            la.global_id.min(lb.global_id),
+            la.global_id.max(lb.global_id),
+        );
         if let Some(r) = self.conflict_cache.get(&key) {
             return *r;
         }
         // LabelPosition::isInConflictMultiPart: any part against any part.
         let r = la.all_quads().any(|(qa, ba, _)| {
-            lb.all_quads().any(|(qb, bb, _)| ba.intersects(&bb) && shape::quad_intersects(&qb, &quad_ring(&qa)))
+            lb.all_quads().any(|(qb, bb, _)| {
+                ba.intersects(&bb) && shape::quad_intersects(&qb, &quad_ring(&qa))
+            })
         });
         self.conflict_cache.insert(key, r);
         r
@@ -1612,8 +1931,14 @@ impl Problem {
 
     fn conflicts_of(&mut self, layers: &[PalLayer], lp: usize, active: bool) -> Vec<usize> {
         let b = self.positions[lp].cbox;
-        let ids = if active { self.active_index.query(&b) } else { self.all_index.query(&b) };
-        ids.into_iter().filter(|&o| self.conflicting(layers, lp, o)).collect()
+        let ids = if active {
+            self.active_index.query(&b)
+        } else {
+            self.all_index.query(&b)
+        };
+        ids.into_iter()
+            .filter(|&o| self.conflicting(layers, lp, o))
+            .collect()
     }
 
     /// Problem::reduce.
@@ -1747,7 +2072,11 @@ impl Problem {
                     let d = delta + self.unlabeled_cost[seed];
                     if retained.is_none() || d < delta_best {
                         delta_best = d;
-                        let mut c = Chain { feat: Vec::new(), label: Vec::new(), delta: d };
+                        let mut c = Chain {
+                            feat: Vec::new(),
+                            label: Vec::new(),
+                            delta: d,
+                        };
                         for (f, _, n) in &current {
                             c.feat.push(*f);
                             c.label.push(*n);
@@ -1780,7 +2109,11 @@ impl Problem {
                 if conflicts.is_empty() {
                     if retained.is_none() || delta + lcost < delta_best {
                         delta_best = delta + lcost;
-                        let mut c = Chain { feat: Vec::new(), label: Vec::new(), delta: delta + lcost };
+                        let mut c = Chain {
+                            feat: Vec::new(),
+                            label: Vec::new(),
+                            delta: delta + lcost,
+                        };
                         for (f, _, n) in &current {
                             c.feat.push(*f);
                             c.label.push(*n);
@@ -1796,7 +2129,11 @@ impl Problem {
                         next_seed = Some(conflicts[0]);
                     }
                 } else {
-                    let mut c = Chain { feat: Vec::new(), label: Vec::new(), delta: delta + lcost };
+                    let mut c = Chain {
+                        feat: Vec::new(),
+                        label: Vec::new(),
+                        delta: delta + lcost,
+                    };
                     for (f, _, n) in &current {
                         c.feat.push(*f);
                         c.label.push(*n);
@@ -1821,7 +2158,8 @@ impl Problem {
             let old = tmpsol[seed];
             current.push((seed, old, retained_label));
             if old != -1 {
-                self.active_index.remove(old as usize, &self.positions[old as usize].cbox);
+                self.active_index
+                    .remove(old as usize, &self.positions[old as usize].cbox);
             }
             if retained_label != -1 {
                 let b = self.positions[retained_label as usize].cbox;
@@ -1833,7 +2171,8 @@ impl Problem {
         }
         for (_, old, new) in current {
             if new != -1 {
-                self.active_index.remove(new as usize, &self.positions[new as usize].cbox);
+                self.active_index
+                    .remove(new as usize, &self.positions[new as usize].cbox);
             }
             if old != -1 {
                 let b = self.positions[old as usize].cbox;
@@ -1892,13 +2231,20 @@ impl Problem {
 
 impl Pal {
     pub fn new(settings: EngineSettings, map_units_per_cm: f64) -> Pal {
-        Pal { layers: Vec::new(), settings, map_units_per_cm }
+        Pal {
+            layers: Vec::new(),
+            settings,
+            map_units_per_cm,
+        }
     }
 
     fn upright_only(layer: &PalLayer, lf: &LabelFeature) -> bool {
         match layer.upside_down {
             0 => true,
-            1 => lf.fixed_angle.is_none() || (lf.fixed_position.is_none() && lf.fixed_angle == Some(0.0)),
+            1 => {
+                lf.fixed_angle.is_none()
+                    || (lf.fixed_position.is_none() && lf.fixed_angle == Some(0.0))
+            }
             _ => false,
         }
     }
@@ -1955,18 +2301,34 @@ impl Pal {
                     }
                     Placement::OverPoint => ctx.over_point(cx, cy, &mut out, angle),
                     _ => {
-                        tracing::debug!("polygon label placement {:?} not implemented yet", layer.arrangement);
+                        tracing::debug!(
+                            "polygon label placement {:?} not implemented yet",
+                            layer.arrangement
+                        );
                     }
                 }
             }
             Kind::Line => match layer.arrangement {
                 Placement::Curved | Placement::PerimeterCurved => {
                     // createDefaultCurvedCandidatesAlongLine: no overrun on repeated labels.
-                    ctx.curved_along_line(&mut out, part.total_repeats <= 1, self.max_line_candidates(layer, part));
+                    ctx.curved_along_line(
+                        &mut out,
+                        part.total_repeats <= 1,
+                        self.max_line_candidates(layer, part),
+                    );
                 }
-                Placement::Horizontal => ctx.horizontal_along_line(&mut out, angle, self.max_line_candidates(layer, part)),
-                Placement::Line => ctx.along_line(&mut out, true, self.max_line_candidates(layer, part)),
-                _ => tracing::debug!("line label placement {:?} not implemented yet", layer.arrangement),
+                Placement::Horizontal => ctx.horizontal_along_line(
+                    &mut out,
+                    angle,
+                    self.max_line_candidates(layer, part),
+                ),
+                Placement::Line => {
+                    ctx.along_line(&mut out, true, self.max_line_candidates(layer, part))
+                }
+                _ => tracing::debug!(
+                    "line label placement {:?} not implemented yet",
+                    layer.arrangement
+                ),
             },
         }
         for c in &mut out {
@@ -1997,7 +2359,12 @@ impl Pal {
         }
         // Pal::extractProblem: index bounds = extent buffered by 1000 × its larger side.
         let buf = (extent.xmax - extent.xmin).max(extent.ymax - extent.ymin) * 1000.0;
-        let rtree_bounds = BBox { xmin: extent.xmin - buf, ymin: extent.ymin - buf, xmax: extent.xmax + buf, ymax: extent.ymax + buf };
+        let rtree_bounds = BBox {
+            xmin: extent.xmin - buf,
+            ymin: extent.ymin - buf,
+            xmax: extent.xmax + buf,
+            ymax: extent.ymax + buf,
+        };
         let mut first_round = GridIndex::new(gext, 64);
         let mut feats: Vec<Feats> = Vec::new();
         let mut first_round_positions: Vec<(usize, usize)> = Vec::new();
@@ -2025,9 +2392,13 @@ impl Pal {
                 // LabelPosition::intersects / within over all parts.
                 candidates.retain(|c| {
                     if partial {
-                        c.all_quads().any(|(q, b, a)| b.intersects(&extent) && (near(a, 0.0) || shape::quad_intersects(&q, &extent_ring)))
+                        c.all_quads().any(|(q, b, a)| {
+                            b.intersects(&extent)
+                                && (near(a, 0.0) || shape::quad_intersects(&q, &extent_ring))
+                        })
                     } else {
-                        c.all_quads().all(|(q, _, _)| shape::rect_contains_quad(map_rect, &q))
+                        c.all_quads()
+                            .all(|(q, _, _)| shape::rect_contains_quad(map_rect, &q))
                     }
                 });
                 let lf = &self.layers[li].features[part.feature];
@@ -2038,16 +2409,38 @@ impl Pal {
                         next_global += 1;
                         c.part = pi;
                     }
-                    std_sort(&mut candidates, &|a: &LabelPosition, b: &LabelPosition| a.cost < b.cost);
-                    feats.push(Feats { layer: li, part: pi, candidates, priority });
+                    std_sort(&mut candidates, &|a: &LabelPosition, b: &LabelPosition| {
+                        a.cost < b.cost
+                    });
+                    feats.push(Feats {
+                        layer: li,
+                        part: pi,
+                        candidates,
+                        priority,
+                    });
                 } else if lf.allow_degraded {
                     // FeaturePart::createCandidatePointOnSurface
                     if let Some(p) = point_on_surface(&part.shape) {
-                        let mut c = LabelPosition::new(part, p.0, p.1, lf.size.0, lf.size.1, 0.0, 0.0, Quadrant::Over, true);
+                        let mut c = LabelPosition::new(
+                            part,
+                            p.0,
+                            p.1,
+                            lf.size.0,
+                            lf.size.1,
+                            0.0,
+                            0.0,
+                            Quadrant::Over,
+                            true,
+                        );
                         c.global_id = next_global;
                         next_global += 1;
                         c.part = pi;
-                        feats.push(Feats { layer: li, part: pi, candidates: vec![c], priority });
+                        feats.push(Feats {
+                            layer: li,
+                            part: pi,
+                            candidates: vec![c],
+                            priority,
+                        });
                     }
                 } else {
                     unplaced += 1;
@@ -2076,8 +2469,13 @@ impl Pal {
                 let (cli, _) = (feats[fi].layer, feats[fi].part);
                 let lp = &feats[fi].candidates[ci];
                 let lf = &self.layers[cli].features[lp.feature];
-                let same = self.layers[cli].name == olayer.name && lf.fid == ofeat.fid && lf.sub_part == ofeat.sub_part;
-                if lf.overlap == OverlapHandling::AllowOverlapAtNoCost || (!obstacle.is_hole && same) || (obstacle.is_hole && !same) {
+                let same = self.layers[cli].name == olayer.name
+                    && lf.fid == ofeat.fid
+                    && lf.sub_part == ofeat.sub_part;
+                if lf.overlap == OverlapHandling::AllowOverlapAtNoCost
+                    || (!obstacle.is_hole && same)
+                    || (obstacle.is_hole && !same)
+                {
                     continue;
                 }
                 let n = match obstacle.kind {
@@ -2158,7 +2556,10 @@ impl Pal {
                 let first = cands.remove(0);
                 cands.retain(|c| !c.hard_conflict);
                 cands.insert(0, first);
-                if cands.len() == 1 && cands[0].hard_conflict && lf.overlap == OverlapHandling::PreventOverlap {
+                if cands.len() == 1
+                    && cands[0].hard_conflict
+                    && lf.overlap == OverlapHandling::PreventOverlap
+                {
                     cands.clear();
                     return true;
                 }
@@ -2172,7 +2573,9 @@ impl Pal {
                 continue;
             }
             finalize_costs(&mut cands, part, layer.arrangement, &bb, &bby);
-            std_sort(&mut cands, &|a: &LabelPosition, b: &LabelPosition| a.cost < b.cost);
+            std_sort(&mut cands, &|a: &LabelPosition, b: &LabelPosition| {
+                a.cost < b.cost
+            });
             if lf.overlap != OverlapHandling::PreventOverlap {
                 prune(&mut cands);
             }
@@ -2194,7 +2597,12 @@ impl Pal {
             for mut c in cands {
                 let d = self.layers[c.layer].features[c.feature].no_repeat_distance;
                 if d > 0.0 {
-                    c.cbox = BBox { xmin: c.bbox.xmin - d, ymin: c.bbox.ymin - d, xmax: c.bbox.xmax + d, ymax: c.bbox.ymax + d };
+                    c.cbox = BBox {
+                        xmin: c.bbox.xmin - d,
+                        ymin: c.bbox.ymin - d,
+                        xmax: c.bbox.xmax + d,
+                        ymax: c.bbox.ymax + d,
+                    };
                 }
                 c.prob_feat = fi;
                 c.id = next;
@@ -2236,7 +2644,9 @@ impl Pal {
             } else if found {
                 let lp = &prob.positions[start];
                 let lf = &self.layers[lp.layer].features[lp.feature];
-                (self.settings.use_all_labels || lf.overlap == OverlapHandling::AllowOverlapIfRequired || lf.always_show)
+                (self.settings.use_all_labels
+                    || lf.overlap == OverlapHandling::AllowOverlapIfRequired
+                    || lf.always_show)
                     .then_some(start)
             } else {
                 None
@@ -2288,8 +2698,16 @@ impl Pal {
 }
 
 /// CostCalculator::finalizeCandidatesCosts.
-fn finalize_costs(cands: &mut Vec<LabelPosition>, part: &Part, arrangement: Placement, bbx: &[f64; 4], bby: &[f64; 4]) {
-    std_sort(cands, &|a: &LabelPosition, b: &LabelPosition| a.cost < b.cost);
+fn finalize_costs(
+    cands: &mut Vec<LabelPosition>,
+    part: &Part,
+    arrangement: Placement,
+    bbx: &[f64; 4],
+    bby: &[f64; 4],
+) {
+    std_sort(cands, &|a: &LabelPosition, b: &LabelPosition| {
+        a.cost < b.cost
+    });
     let mut discrim = 0.0;
     let mut stop;
     loop {
@@ -2308,7 +2726,8 @@ fn finalize_costs(cands: &mut Vec<LabelPosition>, part: &Part, arrangement: Plac
         }
     }
     cands.truncate(stop);
-    if part.kind == Kind::Polygon && matches!(arrangement, Placement::Free | Placement::Horizontal) {
+    if part.kind == Kind::Polygon && matches!(arrangement, Placement::Free | Placement::Horizontal)
+    {
         // TODO: polygon ring/centroid distance costs (used with free/horizontal placement)
     }
     // FeaturePart::addSizePenalty

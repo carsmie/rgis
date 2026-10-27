@@ -36,20 +36,26 @@ impl PgUri {
                 uri.sql = (!sql.is_empty()).then(|| sql.to_string());
                 break;
             }
-            let (key, after) = rest.split_once('=').ok_or_else(|| anyhow!("bad postgres datasource near '{rest}'"))?;
+            let (key, after) = rest
+                .split_once('=')
+                .ok_or_else(|| anyhow!("bad postgres datasource near '{rest}'"))?;
             let key = key.trim().to_string();
             let after = after.trim_start();
             let (value, tail) = if key == "table" {
                 // "schema"."table" (geomcol)
                 let (schema, t) = quoted(after, '"')?;
-                let t = t.strip_prefix('.').ok_or_else(|| anyhow!("table without schema"))?;
+                let t = t
+                    .strip_prefix('.')
+                    .ok_or_else(|| anyhow!("table without schema"))?;
                 let (table, t) = quoted(t, '"')?;
                 uri.schema = schema;
                 uri.table = table;
                 let t = t.trim_start();
                 let t = match t.strip_prefix('(') {
                     Some(g) => {
-                        let (col, t) = g.split_once(')').ok_or_else(|| anyhow!("unclosed geometry column"))?;
+                        let (col, t) = g
+                            .split_once(')')
+                            .ok_or_else(|| anyhow!("unclosed geometry column"))?;
                         uri.geom = col.trim().trim_matches('"').to_string();
                         t
                     }
@@ -74,7 +80,10 @@ impl PgUri {
     }
 
     fn get(&self, k: &str) -> Option<&str> {
-        self.params.get(k).map(String::as_str).filter(|v| !v.is_empty())
+        self.params
+            .get(k)
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
     }
 
     /// tokio-postgres connection string; PGUSER / PGPASSWORD override the datasource's
@@ -93,8 +102,12 @@ impl PgUri {
                 parts.push(format!("{k}={}", esc(v)));
             }
         }
-        let user = std::env::var("PGUSER").ok().or_else(|| self.get("user").map(String::from));
-        let password = std::env::var("PGPASSWORD").ok().or_else(|| self.get("password").map(String::from));
+        let user = std::env::var("PGUSER")
+            .ok()
+            .or_else(|| self.get("user").map(String::from));
+        let password = std::env::var("PGPASSWORD")
+            .ok()
+            .or_else(|| self.get("password").map(String::from));
         if let Some(u) = user {
             parts.push(format!("user={}", esc(&u)));
         }
@@ -121,7 +134,9 @@ impl PgUri {
 
 /// `'…'` / `"…"` with backslash escapes; returns (unquoted, rest).
 fn quoted(s: &str, q: char) -> Result<(String, &str)> {
-    let s = s.strip_prefix(q).ok_or_else(|| anyhow!("expected {q} in '{s}'"))?;
+    let s = s
+        .strip_prefix(q)
+        .ok_or_else(|| anyhow!("expected {q} in '{s}'"))?;
     let mut out = String::new();
     let mut chars = s.char_indices();
     while let Some((i, c)) = chars.next() {
@@ -161,7 +176,9 @@ fn client(conninfo: &str, name: &str) -> Result<Arc<tokio_postgres::Client>> {
             }
         });
         // A runaway query must not hold a render slot forever.
-        client.batch_execute("SET statement_timeout = 30000").await?;
+        client
+            .batch_execute("SET statement_timeout = 30000")
+            .await?;
         Ok(Arc::new(client))
     })
     .with_context(|| format!("cannot connect to postgres {name}"))?;
@@ -218,14 +235,20 @@ impl PgSource {
         .with_context(|| format!("cannot read columns of {display}"))?;
         let columns: Vec<Field> = rows
             .iter()
-            .map(|r| Field { name: r.get::<_, String>(0), kind: kind_of(&r.get::<_, String>(1)) })
+            .map(|r| Field {
+                name: r.get::<_, String>(0),
+                kind: kind_of(&r.get::<_, String>(1)),
+            })
             .collect();
         if columns.is_empty() {
             bail!("postgres table {display} not found or has no columns");
         }
         let srid = uri.get("srid").and_then(|s| s.parse().ok()).unwrap_or(0);
         let key = uri.get("key").map(|k| k.trim_matches('"').to_string());
-        let cols: Vec<String> = columns.iter().map(|f| format!("{}::text", ident(&f.name))).collect();
+        let cols: Vec<String> = columns
+            .iter()
+            .map(|f| format!("{}::text", ident(&f.name)))
+            .collect();
         let select = format!(
             "SELECT ST_AsBinary({g}), {cols} FROM {s}.{t}",
             g = ident(&uri.geom),
@@ -236,13 +259,26 @@ impl PgSource {
         let fields = columns.clone();
         let description = format!("PostGIS {display}");
         Ok((
-            PgSource { conninfo, display, select, geom: uri.geom.clone(), srid, sql: uri.sql.clone(), columns, key },
+            PgSource {
+                conninfo,
+                display,
+                select,
+                geom: uri.geom.clone(),
+                srid,
+                sql: uri.sql.clone(),
+                columns,
+                key,
+            },
             fields,
             description,
         ))
     }
 
-    pub fn features(&self, bbox: Option<Rect>, keep: Option<&dyn Fn(&Attrs) -> bool>) -> Result<Vec<Feature>> {
+    pub fn features(
+        &self,
+        bbox: Option<Rect>,
+        keep: Option<&dyn Fn(&Attrs) -> bool>,
+    ) -> Result<Vec<Feature>> {
         let mut conds = vec![];
         if let Some(b) = bbox {
             // QgsPostgresFeatureIterator::whereClauseRect: bbox only, as QGIS renders.
@@ -267,8 +303,13 @@ impl PgSource {
         let c = client(&self.conninfo, &self.display)?;
         let started = std::time::Instant::now();
         let rows = run(async move { Ok(c.query(query.as_str(), &[]).await?) })
-        .with_context(|| format!("postgres query on {} failed", self.display))?;
-        debug!("postgres {}: {} rows in {:?}", self.display, rows.len(), started.elapsed());
+            .with_context(|| format!("postgres query on {} failed", self.display))?;
+        debug!(
+            "postgres {}: {} rows in {:?}",
+            self.display,
+            rows.len(),
+            started.elapsed()
+        );
         let mut out = Vec::with_capacity(rows.len());
         for (i, row) in rows.iter().enumerate() {
             let mut attrs = Attrs::default();
@@ -277,8 +318,14 @@ impl PgSource {
                 let v = match raw {
                     None => Value::Null,
                     Some(s) => match f.kind {
-                        FieldKind::Int => s.parse::<i64>().map(|n| json!(n)).unwrap_or(Value::String(s)),
-                        FieldKind::Real => s.parse::<f64>().map(|n| json!(n)).unwrap_or(Value::String(s)),
+                        FieldKind::Int => s
+                            .parse::<i64>()
+                            .map(|n| json!(n))
+                            .unwrap_or(Value::String(s)),
+                        FieldKind::Real => s
+                            .parse::<f64>()
+                            .map(|n| json!(n))
+                            .unwrap_or(Value::String(s)),
                         FieldKind::Bool => json!(s == "true" || s == "t"),
                         _ => Value::String(s),
                     },
@@ -296,7 +343,11 @@ impl PgSource {
                 .unwrap_or(i as i64);
             let wkb: Option<Vec<u8>> = row.get(0);
             let geometry = wkb.and_then(|b| geozero::wkb::Wkb(b).to_geo().ok());
-            out.push(Feature { fid, geometry, attrs });
+            out.push(Feature {
+                fid,
+                geometry,
+                attrs,
+            });
         }
         Ok(out)
     }
@@ -314,11 +365,17 @@ mod tests {
              sql=ST_GeometryType(\"tekstplassering\") IN ('ST_Point','ST_MultiPoint')",
         )
         .unwrap();
-        assert_eq!((u.schema.as_str(), u.table.as_str(), u.geom.as_str()), ("import2", "presentasjonsdata", "tekstplassering"));
+        assert_eq!(
+            (u.schema.as_str(), u.table.as_str(), u.geom.as_str()),
+            ("import2", "presentasjonsdata", "tekstplassering")
+        );
         assert_eq!(u.get("dbname"), Some("fkb5"));
         assert_eq!(u.get("password"), Some("p'w"));
         assert_eq!(u.get("srid"), Some("25833"));
-        assert_eq!(u.sql.as_deref(), Some("ST_GeometryType(\"tekstplassering\") IN ('ST_Point','ST_MultiPoint')"));
+        assert_eq!(
+            u.sql.as_deref(),
+            Some("ST_GeometryType(\"tekstplassering\") IN ('ST_Point','ST_MultiPoint')")
+        );
         assert!(!u.display().contains("p'w"));
     }
 }

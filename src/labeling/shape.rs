@@ -34,7 +34,9 @@ pub fn segments_intersect(a: Pt, b: Pt, c: Pt, d: Pt) -> bool {
     let d2 = orient(c, d, b);
     let d3 = orient(a, b, c);
     let d4 = orient(a, b, d);
-    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0)) {
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    {
         return true;
     }
     (d1 == 0.0 && on_segment(c, d, a))
@@ -114,7 +116,11 @@ pub fn quad_distance(a: &[Pt; 4], b: &[Pt; 4]) -> f64 {
     }
     let ring = |q: &[Pt; 4]| [q[0], q[1], q[2], q[3], q[0]];
     let (ra, rb) = (ring(a), ring(b));
-    let d2 = a.iter().map(|p| min_dist2_to_line(&rb, *p)).chain(b.iter().map(|p| min_dist2_to_line(&ra, *p))).fold(f64::MAX, f64::min);
+    let d2 = a
+        .iter()
+        .map(|p| min_dist2_to_line(&rb, *p))
+        .chain(b.iter().map(|p| min_dist2_to_line(&ra, *p)))
+        .fold(f64::MAX, f64::min);
     d2.sqrt()
 }
 
@@ -139,7 +145,8 @@ pub fn quad_intersects(q: &[Pt; 4], shape: &Shape) -> bool {
                 if ring.first().is_some_and(|p| quad_covers(q, *p)) {
                     return true;
                 }
-                if edges(ring).any(|(a, b)| edges(&qr).any(|(c, d)| segments_intersect(a, b, c, d))) {
+                if edges(ring).any(|(a, b)| edges(&qr).any(|(c, d)| segments_intersect(a, b, c, d)))
+                {
                     return true;
                 }
             }
@@ -168,7 +175,8 @@ pub fn polygon_contains_quad(rings: &[Vec<Pt>], q: &[Pt; 4]) -> bool {
 
 /// Axis-aligned rectangle contains the quad (inclusive), for map boundaries.
 pub fn rect_contains_quad(r: (f64, f64, f64, f64), q: &[Pt; 4]) -> bool {
-    q.iter().all(|p| p.0 >= r.0 && p.0 <= r.2 && p.1 >= r.1 && p.1 <= r.3)
+    q.iter()
+        .all(|p| p.0 >= r.0 && p.0 <= r.2 && p.1 >= r.1 && p.1 <= r.3)
 }
 
 fn seg_dist2(p: Pt, a: Pt, b: Pt) -> f64 {
@@ -188,7 +196,9 @@ pub fn min_dist2_to_line(line: &[Pt], p: Pt) -> f64 {
     if line.len() == 1 {
         return (p.0 - line[0].0).powi(2) + (p.1 - line[0].1).powi(2);
     }
-    edges(line).map(|(a, b)| seg_dist2(p, a, b)).fold(f64::MAX, f64::min)
+    edges(line)
+        .map(|(a, b)| seg_dist2(p, a, b))
+        .fold(f64::MAX, f64::min)
 }
 
 /// Centroid like GEOSGetCentroid: area-weighted for polygons (holes subtract), length-weighted
@@ -218,11 +228,13 @@ pub fn centroid(shape: &Shape) -> Pt {
             let (mut cx, mut cy, mut area) = (0.0, 0.0, 0.0);
             for (i, ring) in rings.iter().enumerate() {
                 // Exterior counted clockwise-positive, holes with the opposite sign.
-                let ring_area: f64 = edges(ring).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum::<f64>() / 2.0;
+                let ring_area: f64 =
+                    edges(ring).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum::<f64>() / 2.0;
                 let is_cw = ring_area < 0.0;
                 let sign = if (i == 0) == is_cw { 1.0 } else { -1.0 };
                 for (a, b) in edges(ring) {
-                    let a2 = sign * ((a.0 - base.0) * (b.1 - base.1) - (b.0 - base.0) * (a.1 - base.1));
+                    let a2 =
+                        sign * ((a.0 - base.0) * (b.1 - base.1) - (b.0 - base.0) * (a.1 - base.1));
                     cx += a2 * (base.0 + a.0 + b.0);
                     cy += a2 * (base.1 + a.1 + b.1);
                     area += a2;
@@ -238,7 +250,8 @@ pub fn centroid(shape: &Shape) -> Pt {
 
 /// |area| of the exterior ring minus holes.
 pub fn polygon_area(rings: &[Vec<Pt>]) -> f64 {
-    let ring = |r: &Vec<Pt>| (edges(r).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum::<f64>() / 2.0).abs();
+    let ring =
+        |r: &Vec<Pt>| (edges(r).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum::<f64>() / 2.0).abs();
     let mut a = rings.first().map(ring).unwrap_or(0.0);
     for h in rings.iter().skip(1) {
         a -= ring(h);
@@ -247,7 +260,9 @@ pub fn polygon_area(rings: &[Vec<Pt>]) -> f64 {
 }
 
 pub fn line_length(l: &[Pt]) -> f64 {
-    edges(l).map(|(a, b)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()).sum()
+    edges(l)
+        .map(|(a, b)| ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt())
+        .sum()
 }
 
 #[cfg(test)]
@@ -256,7 +271,13 @@ mod tests {
 
     #[test]
     fn predicates() {
-        let sq = vec![vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]];
+        let sq = vec![vec![
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ]];
         assert!(polygon_contains_properly(&sq, (5.0, 5.0)));
         assert!(!polygon_contains_properly(&sq, (10.0, 5.0)));
         let q = [(9.0, 9.0), (12.0, 9.0), (12.0, 12.0), (9.0, 12.0)];
@@ -266,6 +287,9 @@ mod tests {
         assert!(polygon_contains_quad(&sq, &inner));
         assert_eq!(centroid(&Shape::Polygon(sq)), (5.0, 5.0));
         assert!(quad_intersects(&q, &Shape::Point((10.0, 10.0))));
-        assert!(!quad_intersects(&q, &Shape::Line(vec![(0.0, 0.0), (5.0, 5.0)])));
+        assert!(!quad_intersects(
+            &q,
+            &Shape::Line(vec![(0.0, 0.0), (5.0, 5.0)])
+        ));
     }
 }

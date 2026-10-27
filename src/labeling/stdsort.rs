@@ -12,7 +12,13 @@ pub fn std_sort<T>(v: &mut [T], less: &impl Fn(&T, &T) -> bool) {
     }
 }
 
-fn introsort_loop<T>(v: &mut [T], first: usize, mut last: usize, mut depth: usize, less: &impl Fn(&T, &T) -> bool) {
+fn introsort_loop<T>(
+    v: &mut [T],
+    first: usize,
+    mut last: usize,
+    mut depth: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) {
     while last - first > THRESHOLD {
         if depth == 0 {
             heap_sort(&mut v[first..last], less);
@@ -25,13 +31,25 @@ fn introsort_loop<T>(v: &mut [T], first: usize, mut last: usize, mut depth: usiz
     }
 }
 
-fn partition_pivot<T>(v: &mut [T], first: usize, last: usize, less: &impl Fn(&T, &T) -> bool) -> usize {
+fn partition_pivot<T>(
+    v: &mut [T],
+    first: usize,
+    last: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) -> usize {
     let mid = first + (last - first) / 2;
     move_median_to_first(v, first, first + 1, mid, last - 1, less);
     unguarded_partition(v, first + 1, last, first, less)
 }
 
-fn move_median_to_first<T>(v: &mut [T], result: usize, a: usize, b: usize, c: usize, less: &impl Fn(&T, &T) -> bool) {
+fn move_median_to_first<T>(
+    v: &mut [T],
+    result: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) {
     let pick = if less(&v[a], &v[b]) {
         if less(&v[b], &v[c]) {
             b
@@ -50,7 +68,13 @@ fn move_median_to_first<T>(v: &mut [T], result: usize, a: usize, b: usize, c: us
     v.swap(result, pick);
 }
 
-fn unguarded_partition<T>(v: &mut [T], mut first: usize, mut last: usize, pivot: usize, less: &impl Fn(&T, &T) -> bool) -> usize {
+fn unguarded_partition<T>(
+    v: &mut [T],
+    mut first: usize,
+    mut last: usize,
+    pivot: usize,
+    less: &impl Fn(&T, &T) -> bool,
+) -> usize {
     loop {
         while less(&v[first], &v[pivot]) {
             first += 1;
@@ -155,6 +179,9 @@ mod tests {
         // Small inputs are insertion sorted: stable.
         let mut s: Vec<(i32, usize)> = (0..10).map(|i| ((i % 3) as i32, i)).collect();
         std_sort(&mut s, &|a, b| a.0 < b.0);
-        assert_eq!(s.iter().map(|x| x.1).collect::<Vec<_>>(), [0, 3, 6, 9, 1, 4, 7, 2, 5, 8]);
+        assert_eq!(
+            s.iter().map(|x| x.1).collect::<Vec<_>>(),
+            [0, 3, 6, 9, 1, 4, 7, 2, 5, 8]
+        );
     }
 }

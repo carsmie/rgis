@@ -288,7 +288,11 @@ fn get_map(ctx: &Context, version: &str) -> Result<Response, OwsError> {
     }
     // QgsWmsRenderContext::mapTileBuffer: only for TILED requests.
     if ctx.params.bool("TILED") {
-        let tile_buffer: f64 = ctx.project.text_prop("WMSTileBuffer").and_then(|v| v.trim().parse().ok()).unwrap_or(0.0);
+        let tile_buffer: f64 = ctx
+            .project
+            .text_prop("WMSTileBuffer")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0.0);
         ms.extent_buffer = tile_buffer * ms.extent.width() / ms.width as f64;
     }
     let opacities: Vec<f64> = ctx
@@ -585,7 +589,10 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
         // only) gets an empty image, not a 400: tnt-mapproxy's legend builder fetches every
         // project and treats tiny images as "no legend", errors as failures.
         if rule.is_some() {
-            return Err(OwsError::bad("InvalidParameterValue", "No legend items found"));
+            return Err(OwsError::bad(
+                "InvalidParameterValue",
+                "No legend items found",
+            ));
         }
         let empty = tiny_skia::Pixmap::new(1, 1).expect("1x1");
         return Ok(Response::ok("image/png", render::encode_png(&empty)?));

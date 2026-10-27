@@ -14,13 +14,13 @@ mod rtree;
 mod shape;
 mod stdsort;
 
-use std::f64::consts::PI;
 use crate::render::FillNonEmpty;
 use geo_types::{Coord, Geometry};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::f64::consts::PI;
 use tiny_skia::Pixmap;
 
-use crate::expression::{num, to_str, truthy, Attrs};
+use crate::expression::{Attrs, num, to_str, truthy};
 use crate::geom::{self, Rect};
 use crate::project::MapLayer;
 use crate::render::MapSettings;
@@ -29,7 +29,9 @@ use crate::text::{self, HAlign, LabelDocument};
 
 use index::BBox;
 use pal::{LabelFeature, LineLabel, Pal, PalLayer, Quadrant};
-use settings::{EngineSettings, LabelingRule, MultiLineAlign, ObstacleType, PalSettings, Placement, TextAnchor};
+use settings::{
+    EngineSettings, LabelingRule, MultiLineAlign, ObstacleType, PalSettings, Placement, TextAnchor,
+};
 use shape::Shape;
 
 /// What is needed to draw a placed label.
@@ -110,21 +112,31 @@ impl Engine {
     /// settings' scale visibility (hidden labels still register as obstacles).
     pub fn rule_active(&self, rule: &LabelingRule) -> bool {
         if let Some((mindenom, maxdenom)) = rule.scale_range
-            && ((mindenom > 0.0 && self.scale < mindenom) || (maxdenom > 0.0 && self.scale > maxdenom))
+            && ((mindenom > 0.0 && self.scale < mindenom)
+                || (maxdenom > 0.0 && self.scale > maxdenom))
         {
             return false;
         }
         let s = &rule.settings;
         let visible = !s.scale_visibility
-            || !((s.minimum_scale > 0.0 && self.scale >= s.minimum_scale) || (s.maximum_scale > 0.0 && self.scale < s.maximum_scale));
+            || !((s.minimum_scale > 0.0 && self.scale >= s.minimum_scale)
+                || (s.maximum_scale > 0.0 && self.scale < s.maximum_scale));
         visible || s.obstacle
     }
 
     /// Register a layer's labels (QgsVectorLayerLabelProvider per labeling rule).
-    pub fn register_layer(&mut self, layer: &MapLayer, features: &[LabelSource], vars: &Attrs, render_order: usize) {
+    pub fn register_layer(
+        &mut self,
+        layer: &MapLayer,
+        features: &[LabelSource],
+        vars: &Attrs,
+        render_order: usize,
+    ) {
         for rule in &layer.labeling {
             if let Some((mindenom, maxdenom)) = rule.scale_range {
-                if (mindenom > 0.0 && self.scale < mindenom) || (maxdenom > 0.0 && self.scale > maxdenom) {
+                if (mindenom > 0.0 && self.scale < mindenom)
+                    || (maxdenom > 0.0 && self.scale > maxdenom)
+                {
                     continue;
                 }
             }
@@ -144,7 +156,11 @@ impl Engine {
         let is_point_layer = layer.geometry == "Point";
         let has_renderer = !matches!(layer.renderer, crate::symbology::Renderer::Null);
         // QgsVectorLayerLabelProvider::init
-        let obstacle_type = if is_point_layer && has_renderer { ObstacleType::PolygonWhole } else { s.obstacle_type };
+        let obstacle_type = if is_point_layer && has_renderer {
+            ObstacleType::PolygonWhole
+        } else {
+            s.obstacle_type
+        };
         let mut pl = PalLayer::new(
             layer.id.clone(),
             s.placement,
@@ -202,7 +218,10 @@ impl Engine {
         visible: bool,
         render_order: usize,
     ) -> Option<LabelFeature> {
-        let obstacle = self.dd(s, "IsObstacle", ctx).map(|v| truthy(&v)).unwrap_or(s.obstacle);
+        let obstacle = self
+            .dd(s, "IsObstacle", ctx)
+            .map(|v| truthy(&v))
+            .unwrap_or(s.obstacle);
         if !s.draw_labels && !obstacle {
             return None;
         }
@@ -222,31 +241,56 @@ impl Engine {
         if px < 1 {
             return None;
         }
-        if size.unit == Unit::MapUnit && s.font_limit_pixel_size && (s.font_min_pixel_size > px as i64 || px as i64 > s.font_max_pixel_size) {
+        if size.unit == Unit::MapUnit
+            && s.font_limit_pixel_size
+            && (s.font_min_pixel_size > px as i64 || px as i64 > s.font_max_pixel_size)
+        {
             return None;
         }
         let font = text::font(&s.format.font, px)?;
 
         // evaluateLabelContent
-        let mut label = s.expression.as_ref().map(|e| e.eval(ctx)).map(|v| to_str(&v)).unwrap_or_default();
+        let mut label = s
+            .expression
+            .as_ref()
+            .map(|e| e.eval(ctx))
+            .map(|v| to_str(&v))
+            .unwrap_or_default();
         match s.format.capitalization {
             1 => label = label.to_uppercase(),
             2 => label = label.to_lowercase(),
             _ => {}
         }
-        let wrap = if s.wrap_char.is_empty() { "\n" } else { s.wrap_char.as_str() };
+        let wrap = if s.wrap_char.is_empty() {
+            "\n"
+        } else {
+            s.wrap_char.as_str()
+        };
         let lines: Vec<&str> = label.split(wrap).flat_map(|l| l.split('\n')).collect();
         // QgsPalLayerSettings::dataDefinedValEval FontLetterSpacing: in the font size unit,
         // converted to painter units (QFont::AbsoluteSpacing).
-        let letter_spacing = self.dd(s, "FontLetterSpacing", ctx).and_then(|v| num(&v)).unwrap_or(s.format.letter_spacing);
-        let letter_spacing = self.px(&Size { value: letter_spacing, ..s.format.size });
+        let letter_spacing = self
+            .dd(s, "FontLetterSpacing", ctx)
+            .and_then(|v| num(&v))
+            .unwrap_or(s.format.letter_spacing);
+        let letter_spacing = self.px(&Size {
+            value: letter_spacing,
+            ..s.format.size
+        });
         let doc = LabelDocument::new(font.clone(), &lines, s.format.line_height, letter_spacing);
         let curved = matches!(s.placement, Placement::Curved | Placement::PerimeterCurved);
         // QgsTextLabelFeature::calculateTextMetrics: each grapheme's own advance (letter
         // spacing included, no kerning between graphemes) and the font's height and descent.
-        let graphemes: Vec<String> = if curved { lines.iter().flat_map(|l| split_graphemes(l)).collect() } else { Vec::new() };
+        let graphemes: Vec<String> = if curved {
+            lines.iter().flat_map(|l| split_graphemes(l)).collect()
+        } else {
+            Vec::new()
+        };
         let metrics = curved.then(|| line::TextMetrics {
-            widths: graphemes.iter().map(|g| font.shape_spaced(g, letter_spacing).width * self.mupp).collect(),
+            widths: graphemes
+                .iter()
+                .map(|g| font.shape_spaced(g, letter_spacing).width * self.mupp)
+                .collect(),
             heights: vec![(font.ascent + font.descent) * self.mupp; graphemes.len()],
             descents: vec![font.descent * self.mupp; graphemes.len()],
             graphemes: graphemes.clone(),
@@ -258,7 +302,8 @@ impl Engine {
             && matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
         let is_line = matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_));
         // UseEntireLine: the whole (unclipped) line, so anchors follow the full feature.
-        let do_clip = (!centroid_poly || !s.centroid_whole) && !(is_line && s.line_anchor_entire_line);
+        let do_clip =
+            (!centroid_poly || !s.centroid_whole) && !(is_line && s.line_anchor_entire_line);
         let g = if do_clip && !self.extent.contains_rect(&geom::bbox(g)) {
             geom::clip_to_rect(g, &self.extent)?
         } else {
@@ -307,7 +352,10 @@ impl Engine {
             8 => (1.0, -1.0),
             _ => (0.0, 0.0),
         };
-        let position_offset = (self.map_units(s.x_offset, s.offset_unit), self.map_units(-s.y_offset, s.offset_unit));
+        let position_offset = (
+            self.map_units(s.x_offset, s.offset_unit),
+            self.map_units(-s.y_offset, s.offset_unit),
+        );
         let mut angle = 0.0;
         let layer_rotation = s.angle_offset.abs() > 1e-12;
         if layer_rotation {
@@ -327,12 +375,20 @@ impl Engine {
                 angle = 0.0;
             }
             let (mut xd, mut yd) = (0.0, 0.0);
-            match self.dd(s, "Hali", ctx).map(|v| to_str(&v).to_ascii_lowercase()).as_deref() {
+            match self
+                .dd(s, "Hali", ctx)
+                .map(|v| to_str(&v).to_ascii_lowercase())
+                .as_deref()
+            {
                 Some("center") => xd -= w / 2.0,
                 Some("right") => xd -= w,
                 _ => {}
             }
-            match self.dd(s, "Vali", ctx).map(|v| to_str(&v).to_ascii_lowercase()).as_deref() {
+            match self
+                .dd(s, "Vali", ctx)
+                .map(|v| to_str(&v).to_ascii_lowercase())
+                .as_deref()
+            {
                 Some("top") => yd -= h,
                 Some("base") => yd -= h * font.descent / (font.ascent + font.descent),
                 Some(v @ ("cap" | "half")) => {
@@ -352,7 +408,8 @@ impl Engine {
             }
             fixed_position = Some((x + xd, y + yd));
         }
-        let fixed_angle = (dd_rotation || (fixed_position.is_none() && angle.abs() > 1e-12)).then_some(angle);
+        let fixed_angle =
+            (dd_rotation || (fixed_position.is_none() && angle.abs() > 1e-12)).then_some(angle);
 
         let mut distance = self.px(&s.dist);
         if let Some(d) = self.dd(s, "LabelDistance", ctx).and_then(|v| num(&v)) {
@@ -366,23 +423,38 @@ impl Engine {
                     distance = 1.0;
                 }
             }
-            Placement::AroundPoint | Placement::OverPoint | Placement::Horizontal | Placement::Free if outside => {
+            Placement::AroundPoint
+            | Placement::OverPoint
+            | Placement::Horizontal
+            | Placement::Free
+                if outside =>
+            {
                 distance = distance.max(2.0);
             }
             Placement::OutsidePolygons => distance = distance.max(2.0),
             _ => {}
         }
-        let dist_label = if distance.abs() > 1e-12 { self.mupp * distance } else { 0.0 };
+        let dist_label = if distance.abs() > 1e-12 {
+            self.mupp * distance
+        } else {
+            0.0
+        };
         let priority = self
             .dd(s, "Priority", ctx)
             .and_then(|v| num(&v))
             .map(|p| 1.0 - p.clamp(0.0, 10.0) / 10.0);
-        let z_index = self.dd(s, "ZIndex", ctx).and_then(|v| num(&v)).unwrap_or(s.z_index);
+        let z_index = self
+            .dd(s, "ZIndex", ctx)
+            .and_then(|v| num(&v))
+            .unwrap_or(s.z_index);
         let always_show = self.dd(s, "AlwaysShow", ctx).is_some_and(|v| truthy(&v));
 
         // Drawing payload (the document metrics and the evaluated text format).
         let mut color = s.format.color;
-        if let Some(c) = self.dd(s, "Color", ctx).and_then(|v| crate::symbology::Rgba::parse(&to_str(&v))) {
+        if let Some(c) = self
+            .dd(s, "Color", ctx)
+            .and_then(|v| crate::symbology::Rgba::parse(&to_str(&v)))
+        {
             color = c;
         }
         let buffer = s.format.buffer.as_ref().map(|b| text::Buffer {
@@ -406,12 +478,20 @@ impl Engine {
             background: s.format.background.clone(),
         });
 
-        let visual_margin = (0.0, (0.25 * font.ascent).max(0.0) * self.mupp, 0.0, (1.0 + font.descent) * self.mupp);
+        let visual_margin = (
+            0.0,
+            (0.25 * font.ascent).max(0.0) * self.mupp,
+            0.0,
+            (1.0 + font.descent) * self.mupp,
+        );
         let _ = layer;
         // generateLabelFeature: curved angle limits (degrees in, radians out), line anchor and
         // overrun (smoothed over a fixed 1 mm).
         let (angle_in, angle_out) = if curved {
-            (s.max_curved_char_angle_in, -s.max_curved_char_angle_out.abs())
+            (
+                s.max_curved_char_angle_in,
+                -s.max_curved_char_angle_out.abs(),
+            )
         } else {
             (20.0, -20.0)
         };
@@ -419,12 +499,20 @@ impl Engine {
             .dd(s, "LineAnchorTextPoint", ctx)
             .and_then(|v| TextAnchor::from_dd(&to_str(&v)))
             .unwrap_or(s.line_anchor_text_point);
-        let line = matches!(f.geometry, Geometry::LineString(_) | Geometry::MultiLineString(_)).then(|| LineLabel {
+        let line = matches!(
+            f.geometry,
+            Geometry::LineString(_) | Geometry::MultiLineString(_)
+        )
+        .then(|| LineLabel {
             flags: s.line_flags,
             anchor_percent: s.line_anchor_percent,
             anchor_strict: s.line_anchor_strict,
             text_point: text_point.resolve(s.line_anchor_percent),
-            overrun: if s.overrun_distance.value != 0.0 { self.map_units(s.overrun_distance.value, s.overrun_distance.unit) } else { 0.0 },
+            overrun: if s.overrun_distance.value != 0.0 {
+                self.map_units(s.overrun_distance.value, s.overrun_distance.unit)
+            } else {
+                0.0
+            },
             overrun_smooth: self.map_units(1.0, Unit::Mm),
             max_angle_inside: angle_in.clamp(20.0, 60.0) * PI / 180.0,
             max_angle_outside: angle_out.clamp(-95.0, -20.0) * PI / 180.0,
@@ -459,9 +547,22 @@ impl Engine {
             z_index,
             payload,
             line,
-            repeat_distance: if s.repeat_distance.value != 0.0 { self.map_units(s.repeat_distance.value, s.repeat_distance.unit) } else { 0.0 },
-            no_repeat_distance: s.min_distance_to_duplicates.filter(|d| d.value > 0.0).map(|d| self.map_units(d.value, d.unit)).unwrap_or(0.0),
-            min_size: if s.merge_lines && s.min_feature_size > 0.0 && matches!(f.geometry, Geometry::LineString(_) | Geometry::MultiLineString(_)) {
+            repeat_distance: if s.repeat_distance.value != 0.0 {
+                self.map_units(s.repeat_distance.value, s.repeat_distance.unit)
+            } else {
+                0.0
+            },
+            no_repeat_distance: s
+                .min_distance_to_duplicates
+                .filter(|d| d.value > 0.0)
+                .map(|d| self.map_units(d.value, d.unit))
+                .unwrap_or(0.0),
+            min_size: if s.merge_lines
+                && s.min_feature_size > 0.0
+                && matches!(
+                    f.geometry,
+                    Geometry::LineString(_) | Geometry::MultiLineString(_)
+                ) {
                 self.map_units(s.min_feature_size, Unit::Mm)
             } else {
                 0.0
@@ -479,7 +580,12 @@ impl Engine {
             let mut bounds: Option<(f64, f64, f64, f64)> = None;
             for sym in symbols {
                 for l in &sym.layers {
-                    let Some(b) = l.resolve(ctx).and_then(|k| marker_bounds(&k, px, py, &self.units)) else { continue };
+                    let Some(b) = l
+                        .resolve(ctx)
+                        .and_then(|k| marker_bounds(&k, px, py, &self.units))
+                    else {
+                        continue;
+                    };
                     bounds = Some(match bounds {
                         None => b,
                         Some(a) => (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
@@ -503,9 +609,19 @@ impl Engine {
     /// QgsTextRenderer::drawBackground for a placed label part (shape backgrounds): the
     /// label rectangle grown by the buffer size (or a fixed size), centred on the label and
     /// rotated with it, filled with the background's fill symbol.
-    fn draw_background(&self, pm: &mut Pixmap, bg: &settings::BackgroundSettings, xs: &[f64; 4], ys: &[f64; 4], alpha: f64) {
+    fn draw_background(
+        &self,
+        pm: &mut Pixmap,
+        bg: &settings::BackgroundSettings,
+        xs: &[f64; 4],
+        ys: &[f64; 4],
+        alpha: f64,
+    ) {
         let c: Vec<(f64, f64)> = (0..4).map(|i| self.to_px(xs[i], ys[i])).collect();
-        let (lw, lh) = ((c[1].0 - c[0].0).hypot(c[1].1 - c[0].1), (c[3].0 - c[0].0).hypot(c[3].1 - c[0].1));
+        let (lw, lh) = (
+            (c[1].0 - c[0].0).hypot(c[1].1 - c[0].1),
+            (c[3].0 - c[0].0).hypot(c[3].1 - c[0].1),
+        );
         let center = ((c[0].0 + c[2].0) / 2.0, (c[0].1 + c[2].1) / 2.0);
         let (sx, sy) = (self.px(&bg.size.0), self.px(&bg.size.1));
         let (mut w, mut h) = (lw, lh);
@@ -554,28 +670,51 @@ impl Engine {
                     geo_types::Coord { x, y }
                 })
                 .collect(),
-            _ => [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0)]
-                .iter()
-                .map(|(a, b)| {
-                    let (x, y) = local(a * w / 2.0, b * h / 2.0);
-                    geo_types::Coord { x, y }
-                })
-                .collect(),
+            _ => [
+                (-1.0, -1.0),
+                (1.0, -1.0),
+                (1.0, 1.0),
+                (-1.0, 1.0),
+                (-1.0, -1.0),
+            ]
+            .iter()
+            .map(|(a, b)| {
+                let (x, y) = local(a * w / 2.0, b * h / 2.0);
+                geo_types::Coord { x, y }
+            })
+            .collect(),
         };
         let poly = Geometry::Polygon(geo_types::Polygon::new(geo_types::LineString(ring), vec![]));
         let mut sym = bg.fill.clone();
         sym.opacity *= bg.opacity;
         let attrs = Attrs::default();
-        crate::render::draw_symbol(pm, &sym, &poly, &|c| (c.x as f32, c.y as f32), &self.units, &attrs, None);
+        crate::render::draw_symbol(
+            pm,
+            &sym,
+            &poly,
+            &|c| (c.x as f32, c.y as f32),
+            &self.units,
+            &attrs,
+            None,
+        );
     }
 
     /// Solve and draw (QgsLabelingEngine::solve + drawLabels).
     pub fn draw(mut self, pm: &mut Pixmap) {
         let e = &self.extent;
         let t0 = std::time::Instant::now();
-        let placed = self.pal.solve(BBox { xmin: e.xmin, ymin: e.ymin, xmax: e.xmax, ymax: e.ymax });
+        let placed = self.pal.solve(BBox {
+            xmin: e.xmin,
+            ymin: e.ymin,
+            xmax: e.xmax,
+            ymax: e.ymax,
+        });
         let solve_time = t0.elapsed();
-        let (mut t_path, mut t_buffer, mut t_text) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut t_path, mut t_buffer, mut t_text) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
         let mut placed: Vec<_> = placed.into_iter().collect();
         // QgsLabelSorter: z-index, then layer order (lower layers first), then larger labels first.
         placed.sort_by(|a, b| {
@@ -584,7 +723,11 @@ impl Engine {
                 .partial_cmp(&pb.z_index)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(pa.render_order.cmp(&pb.render_order))
-                .then(pb.area.partial_cmp(&pa.area).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    pb.area
+                        .partial_cmp(&pa.area)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
         });
         let rects_only = std::env::var("RGIS_LABEL_RECTS").is_ok();
         for p in placed {
@@ -601,7 +744,9 @@ impl Engine {
                     }
                 }
                 let lf = self.pal.layers[p.layer].feature(p.feature);
-                let origins: Vec<[f64; 3]> = std::iter::once([p.x[0], p.y[0], p.alpha]).chain(p.parts.iter().map(|q| [q.x[0], q.y[0], q.alpha])).collect();
+                let origins: Vec<[f64; 3]> = std::iter::once([p.x[0], p.y[0], p.alpha])
+                    .chain(p.parts.iter().map(|q| [q.x[0], q.y[0], q.alpha]))
+                    .collect();
                 tracing::debug!(target: "rgis::labels", "{}", json!({"layer": self.pal.layers[p.layer].name, "fid": lf.fid, "text": lf.label_text, "bbox": [b0.0, b0.1, b1.0, b1.1], "origins": origins}));
             }
             let align = match pay.align {
@@ -636,29 +781,44 @@ impl Engine {
                     };
                     let mut paint = tiny_skia::Paint::default();
                     paint.set_color_rgba8(fill.0, fill.1, fill.2, fill.3);
-                    pm.fill_nonempty(&path, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+                    pm.fill_nonempty(
+                        &path,
+                        &paint,
+                        tiny_skia::FillRule::Winding,
+                        tiny_skia::Transform::identity(),
+                        None,
+                    );
                     paint.set_color_rgba8(stroke.0, stroke.1, stroke.2, stroke.3);
-                    pm.stroke_path(&path, &paint, &tiny_skia::Stroke::default(), tiny_skia::Transform::identity(), None);
+                    pm.stroke_path(
+                        &path,
+                        &paint,
+                        &tiny_skia::Stroke::default(),
+                        tiny_skia::Transform::identity(),
+                        None,
+                    );
                 }
                 continue;
             }
             // drawLabelPrivate(Background) for every part, before buffers and text.
             if let Some(bg) = &pay.background {
-                let quads = std::iter::once((p.x, p.y, p.alpha)).chain(p.parts.iter().map(|q| (q.x, q.y, q.alpha)));
+                let quads = std::iter::once((p.x, p.y, p.alpha))
+                    .chain(p.parts.iter().map(|q| (q.x, q.y, q.alpha)));
                 for (xs, ys, a) in quads {
                     self.draw_background(pm, bg, &xs, &ys, a);
                 }
             }
             if let Some((graphemes, spacing)) = &pay.graphemes {
                 // drawLabelPrivate per part: every grapheme's buffer, then every grapheme's text.
-                let parts: Vec<(f64, f64, f64, usize)> = std::iter::once((p.x[0], p.y[0], p.alpha, p.part_id))
-                    .chain(p.parts.iter().map(|q| (q.x[0], q.y[0], q.alpha, q.part_id)))
-                    .collect();
+                let parts: Vec<(f64, f64, f64, usize)> =
+                    std::iter::once((p.x[0], p.y[0], p.alpha, p.part_id))
+                        .chain(p.parts.iter().map(|q| (q.x[0], q.y[0], q.alpha, q.part_id)))
+                        .collect();
                 let docs: Vec<_> = parts
                     .iter()
                     .filter_map(|&(x, y, a, i)| {
                         let g = graphemes.get(i)?;
-                        let doc = LabelDocument::new(pay.doc.font.clone(), &[g.as_str()], 1.0, *spacing);
+                        let doc =
+                            LabelDocument::new(pay.doc.font.clone(), &[g.as_str()], 1.0, *spacing);
                         let o = self.to_px(x, y);
                         let path = doc.path(o, a, align)?;
                         Some((doc, path, o, a))
@@ -675,7 +835,9 @@ impl Engine {
                 continue;
             }
             let t = std::time::Instant::now();
-            let Some(path) = pay.doc.path(origin, p.alpha, align) else { continue };
+            let Some(path) = pay.doc.path(origin, p.alpha, align) else {
+                continue;
+            };
             t_path += t.elapsed();
             let t = std::time::Instant::now();
             if let Some(b) = &pay.buffer {
@@ -693,9 +855,7 @@ impl Engine {
 /// QgsPalLabeling::splitToGraphemes for the scripts used here: each character with the
 /// combining marks, joiners and variation selectors that follow it.
 fn split_graphemes(s: &str) -> Vec<String> {
-    let extends = |c: char| {
-        matches!(c as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F | 0x200D | 0xFE00..=0xFE0F)
-    };
+    let extends = |c: char| matches!(c as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F | 0x200D | 0xFE00..=0xFE0F);
     let mut out: Vec<String> = Vec::new();
     let mut join_next = false;
     for c in s.chars() {
@@ -717,21 +877,39 @@ fn shapes(g: &Geometry<f64>) -> Vec<Shape> {
         Geometry::LineString(l) => vec![Shape::Line(ring(l))],
         Geometry::MultiLineString(ml) => ml.0.iter().map(|l| Shape::Line(ring(l))).collect(),
         Geometry::Polygon(p) => vec![Shape::Polygon(geom::polygon_rings(p).map(ring).collect())],
-        Geometry::MultiPolygon(mp) => mp.0.iter().map(|p| Shape::Polygon(geom::polygon_rings(p).map(ring).collect())).collect(),
+        Geometry::MultiPolygon(mp) => {
+            mp.0.iter()
+                .map(|p| Shape::Polygon(geom::polygon_rings(p).map(ring).collect()))
+                .collect()
+        }
         Geometry::GeometryCollection(gc) => gc.0.iter().flat_map(shapes).collect(),
         _ => Vec::new(),
     }
 }
 
 /// QgsMarkerSymbolLayer::bounds in pixels (left, top, right, bottom).
-fn marker_bounds(l: &SymbolLayer, px: f64, py: f64, u: &RenderUnits) -> Option<(f64, f64, f64, f64)> {
+fn marker_bounds(
+    l: &SymbolLayer,
+    px: f64,
+    py: f64,
+    u: &RenderUnits,
+) -> Option<(f64, f64, f64, f64)> {
     let rect = |w: f64, h: f64, off: (f64, f64), angle: f64| {
         let (cx, cy) = (px + off.0, py + off.1);
-        let pts = [(-w / 2.0, -h / 2.0), (w / 2.0, -h / 2.0), (w / 2.0, h / 2.0), (-w / 2.0, h / 2.0)];
+        let pts = [
+            (-w / 2.0, -h / 2.0),
+            (w / 2.0, -h / 2.0),
+            (w / 2.0, h / 2.0),
+            (-w / 2.0, h / 2.0),
+        ];
         let (s, c) = angle.to_radians().sin_cos();
         let (mut l, mut t, mut r, mut b) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for (x, y) in pts {
-            let (x, y) = if angle != 0.0 { (x * c - y * s, x * s + y * c) } else { (x, y) };
+            let (x, y) = if angle != 0.0 {
+                (x * c - y * s, x * s + y * c)
+            } else {
+                (x, y)
+            };
             l = l.min(cx + x);
             r = r.max(cx + x);
             t = t.min(cy + y);
@@ -762,14 +940,38 @@ fn marker_bounds(l: &SymbolLayer, px: f64, py: f64, u: &RenderUnits) -> Option<(
         }
     };
     match l {
-        SymbolLayer::Marker { width, height, stroke, angle, offset, anchor, .. } => {
+        SymbolLayer::Marker {
+            width,
+            height,
+            stroke,
+            angle,
+            offset,
+            anchor,
+            ..
+        } => {
             let (w, h) = (width.px(u), height.px(u));
-            let off = rotated(anchored((offset.0.px(u), offset.1.px(u)), *anchor, w, h), *angle);
+            let off = rotated(
+                anchored((offset.0.px(u), offset.1.px(u)), *anchor, w, h),
+                *angle,
+            );
             let (l, t, r, b) = rect(w, h, off, *angle);
-            let pen = if stroke.visible { stroke.width.px(u) } else { 0.0 } + 1.0;
+            let pen = if stroke.visible {
+                stroke.width.px(u)
+            } else {
+                0.0
+            } + 1.0;
             Some((l - pen / 2.0, t - pen / 2.0, r + pen / 2.0, b + pen / 2.0))
         }
-        SymbolLayer::SvgMarker { size, fixed_aspect, path, stroke_width, angle, offset, anchor, .. } => {
+        SymbolLayer::SvgMarker {
+            size,
+            fixed_aspect,
+            path,
+            stroke_width,
+            angle,
+            offset,
+            anchor,
+            ..
+        } => {
             let w = size.px(u);
             if (w as i64) < 1 || w > 10_000.0 {
                 return None;
@@ -780,17 +982,37 @@ fn marker_bounds(l: &SymbolLayer, px: f64, py: f64, u: &RenderUnits) -> Option<(
                 path.as_deref().and_then(crate::svg::aspect).unwrap_or(1.0)
             };
             let h = w * aspect;
-            let off = rotated(anchored((offset.0.px(u), offset.1.px(u)), *anchor, w, h), *angle);
+            let off = rotated(
+                anchored((offset.0.px(u), offset.1.px(u)), *anchor, w, h),
+                *angle,
+            );
             let (l, t, r, b) = rect(w, h, off, *angle);
             let sw = stroke_width.px(u) + 0.5;
             Some((l - sw / 2.0, t - sw / 2.0, r + sw / 2.0, b + sw / 2.0))
         }
         // QgsFontMarkerSymbolLayer::bounds: character advance × symbol size.
-        SymbolLayer::FontMarker { font, style, chr, size, angle, offset, anchor, .. } => {
+        SymbolLayer::FontMarker {
+            font,
+            style,
+            chr,
+            size,
+            angle,
+            offset,
+            anchor,
+            ..
+        } => {
             let px = size.px(u);
-            let req = crate::text::FontRequest { family: font.clone(), weight: 400, italic: false, style: style.clone() };
+            let req = crate::text::FontRequest {
+                family: font.clone(),
+                weight: 400,
+                italic: false,
+                style: style.clone(),
+            };
             let w = crate::text::font(&req, (px.round() as i32).max(2))?.horizontal_advance(chr);
-            let off = rotated(anchored((offset.0.px(u), offset.1.px(u)), *anchor, px, px), *angle);
+            let off = rotated(
+                anchored((offset.0.px(u), offset.1.px(u)), *anchor, px, px),
+                *angle,
+            );
             Some(rect(w, px, off, *angle))
         }
         _ => None,

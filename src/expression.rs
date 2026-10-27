@@ -399,7 +399,8 @@ impl Expr {
             Expr::Binary(_, l, r) => l.fields(out) & r.fields(out),
             Expr::In(e, list, _) => list.iter().fold(e.fields(out), |ok, x| x.fields(out) & ok),
             Expr::Call(f, args) => {
-                let pure = !matches!(f.as_str(), "attribute" | "now" | "uuid" | "$uuid") && !f.starts_with("rand");
+                let pure = !matches!(f.as_str(), "attribute" | "now" | "uuid" | "$uuid")
+                    && !f.starts_with("rand");
                 args.iter().fold(pure, |ok, x| x.fields(out) & ok)
             }
         }
@@ -588,7 +589,11 @@ static NULL: Value = Value::Null;
 /// A field by name, falling back to a case-insensitive match (QGIS field names are).
 pub(crate) fn field_value<'a>(a: &'a Attrs, f: &str) -> &'a Value {
     a.get(f)
-        .or_else(|| a.iter().find(|(k, _)| k.eq_ignore_ascii_case(f)).map(|(_, v)| v))
+        .or_else(|| {
+            a.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(f))
+                .map(|(_, v)| v)
+        })
         .unwrap_or(&NULL)
 }
 
