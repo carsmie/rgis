@@ -1,5 +1,6 @@
-//! rGIS against responses captured from QGIS Server (`evidence/qgis-reference/`) for the
-//! same project: `demo/earth_local*.qgs` is `earth.qgs` with its FlatGeobuf data local.
+//! rGIS against responses captured from QGIS Server 4.3 (`tests/qgis-reference/`, copied
+//! from the local `evidence/qgis-reference/`, which is not in the repository) for the same
+//! project: `demo/earth_local*.qgs` is `earth.qgs` with its FlatGeobuf data local.
 //! Tools in `tools/` compare against a live QGIS Server; these run anywhere, including CI.
 
 use std::path::PathBuf;
@@ -31,7 +32,7 @@ fn wfs_map() -> String {
 }
 
 fn reference(name: &str) -> Vec<u8> {
-    std::fs::read(root().join("evidence/qgis-reference").join(name)).unwrap()
+    std::fs::read(root().join("tests/qgis-reference").join(name)).unwrap()
 }
 
 fn json(bytes: &[u8]) -> serde_json::Value {

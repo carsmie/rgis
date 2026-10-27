@@ -1,0 +1,6 @@
+{"type": "FeatureCollection",
+ "bbox": [ 5, 58, 10, 62],
+ "features": [
+  {"geometry":null,"id":"ne_10m_admin_0_countries.137","properties":{"NAME":"Norway"},"type":"Feature"}
+ ]
+}

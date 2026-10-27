@@ -1,0 +1,7 @@
+{"type": "FeatureCollection",
+ "bbox": [ -9.597058, 30.528063, 60.190899, 69.517273],
+ "features": [
+  {"bbox":[49.278706,37.445623,49.413083,37.52236],"geometry":{"coordinates":[[[[49.329221,37.509528],[49.295401,37.52236],[49.278706,37.517897],[49.281367,37.502704],[49.323856,37.477168],[49.352654,37.462876],[49.380851,37.451932],[49.413083,37.445623],[49.401151,37.459314],[49.371366,37.482189],[49.329221,37.509528]]]],"type":"MultiPolygon"},"id":"ne_10m_lakes.0","properties":{"altitude":-31,"feature::id":723,"featurecla":"Lake","funkyname":0,"id":135945,"lge_id":null,"line::hidden":null,"lke_type":null,"name":null,"note":"_untitled_84915","objectid":84915,"pfafstette":23,"scalerank":11},"type":"Feature"}
+ ,{"bbox":[48.189448,40.019585,48.292967,40.078211],"geometry":{"coordinates":[[[[48.189448,40.060614],[48.201165,40.047782],[48.216787,40.052803],[48.234384,40.048898],[48.250006,40.033276],[48.263697,40.019585],[48.278332,40.021302],[48.292967,40.037181],[48.291035,40.051945],[48.265628,40.05864],[48.232452,40.078211],[48.205071,40.076237],[48.189448,40.060614]]]],"type":"MultiPolygon"},"id":"ne_10m_lakes.1","properties":{"altitude":-14,"feature::id":717,"featurecla":"Lake","funkyname":0,"id":132921,"lge_id":null,"line::hidden":null,"lke_type":null,"name":null,"note":"_untitled_82053","objectid":82053,"pfafstette":37,"scalerank":12},"type":"Feature"}
+ ]
+}
