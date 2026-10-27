@@ -11,6 +11,9 @@ use super::index::BBox;
 
 const MAXNODES: usize = 8;
 const MINNODES: usize = 4;
+// PAL's own f32 literal, not PI: it scales every volume, and tie-breaks between equal
+// volumes have to come out exactly as in QGIS.
+#[allow(clippy::approx_constant)]
 const UNIT_SPHERE_VOLUME: f32 = 3.141593;
 
 type Rect = [f32; 4]; // min x, min y, max x, max y
@@ -350,8 +353,8 @@ fn classify(i: usize, group: usize, pv: &mut PartitionVars) {
 
 fn pick_seeds(pv: &mut PartitionVars) {
     let mut area = [0f32; MAXNODES + 1];
-    for i in 0..pv.total {
-        area[i] = volume(&pv.buf[i].rect);
+    for (a, b) in area.iter_mut().zip(&pv.buf[..pv.total]) {
+        *a = volume(&b.rect);
     }
     let mut first = true;
     let (mut worst, mut seed0, mut seed1) = (0f32, 0, 0);

@@ -1609,6 +1609,8 @@ mod imp {
                 let square_z = (z_factor * z_factor) as f32;
                 let sin_alt_254 = 254.0f32 * zenith.sin();
                 let sin_alt_127 = 127.0f32 * zenith.sin();
+                // GDAL's literal, kept verbatim (it rounds to the same f32).
+                #[allow(clippy::excessive_precision)]
                 let cos225_127 = -32.870_018_728_020_12_f32 * cos_alt_z;
                 let cos_alt_127 = 127.0f32 * cos_alt_z;
                 let nd = nodata_pixel(*nodata_color);

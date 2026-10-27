@@ -596,17 +596,17 @@ impl PalLayer {
                 }
             }
         }
-        if lf.obstacle {
-            if let Some(obs) = &lf.obstacle_parts {
-                for s in obs {
-                    let part = Part::new(layer_index, fi, s.clone());
-                    if (part.kind == Kind::Line && part.x.len() < 2)
-                        || (part.kind == Kind::Polygon && part.x.len() < 3)
-                    {
-                        continue;
-                    }
-                    self.obstacles.push(part);
+        if lf.obstacle
+            && let Some(obs) = &lf.obstacle_parts
+        {
+            for s in obs {
+                let part = Part::new(layer_index, fi, s.clone());
+                if (part.kind == Kind::Line && part.x.len() < 2)
+                    || (part.kind == Kind::Polygon && part.x.len() < 3)
+                {
+                    continue;
                 }
+                self.obstacles.push(part);
             }
         }
         if let Some((_, part)) = biggest {
@@ -2783,10 +2783,10 @@ fn point_on_surface(s: &Shape) -> Option<Pt> {
             xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let mut best: Option<(f64, f64)> = None;
             for pair in xs.chunks(2) {
-                if let [a, b] = pair {
-                    if best.is_none_or(|(w, _)| b - a > w) {
-                        best = Some((b - a, (a + b) / 2.0));
-                    }
+                if let [a, b] = pair
+                    && best.is_none_or(|(w, _)| b - a > w)
+                {
+                    best = Some((b - a, (a + b) / 2.0));
                 }
             }
             best.map(|(_, x)| (x, y))

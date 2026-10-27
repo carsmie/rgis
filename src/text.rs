@@ -154,11 +154,9 @@ fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
             .any(|(n, _)| n.eq_ignore_ascii_case(&req.family))
     });
     let mut req = req.clone();
-    if installed {
-        if let Some((w, i)) = style_weight(&req.style) {
-            req.weight = w;
-            req.italic = i;
-        }
+    if installed && let Some((w, i)) = style_weight(&req.style) {
+        req.weight = w;
+        req.italic = i;
     }
     let req = &req;
     let id = (if installed {

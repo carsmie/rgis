@@ -1,6 +1,9 @@
 //! rGIS: a QGIS-Server-like OGC map server in Rust that serves QGIS
 //! project files (.qgs/.qgz) over WMS, WFS and OGC API Features.
 
+// Ported QGIS/PAL functions keep their C++ signatures and container types.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 mod crs;
 mod expression;
 mod geom;

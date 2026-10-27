@@ -145,6 +145,7 @@ impl TextAnchor {
 
 /// QgsLabelObstacleSettings::ObstacleType.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::enum_variant_names)] // QGIS's names
 pub enum ObstacleType {
     PolygonInterior,
     PolygonBoundary,

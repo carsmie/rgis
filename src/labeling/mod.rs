@@ -133,12 +133,11 @@ impl Engine {
         render_order: usize,
     ) {
         for rule in &layer.labeling {
-            if let Some((mindenom, maxdenom)) = rule.scale_range {
-                if (mindenom > 0.0 && self.scale < mindenom)
-                    || (maxdenom > 0.0 && self.scale > maxdenom)
-                {
-                    continue;
-                }
+            if let Some((mindenom, maxdenom)) = rule.scale_range
+                && ((mindenom > 0.0 && self.scale < mindenom)
+                    || (maxdenom > 0.0 && self.scale > maxdenom))
+            {
+                continue;
             }
             self.register_rule(layer, rule, features, vars, render_order);
         }
@@ -474,7 +473,7 @@ impl Engine {
             z_index,
             render_order,
             area: w * h,
-            graphemes: curved.then(|| (graphemes, letter_spacing)),
+            graphemes: curved.then_some((graphemes, letter_spacing)),
             background: s.format.background.clone(),
         });
 
