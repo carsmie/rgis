@@ -46,8 +46,7 @@ Written 2026-10-18 when moving development from macOS to Windows. Read README.md
    callouts, `formatNumbers`, more data-defined properties (font, buffer).
 5. Stretched GetMap (BBOX aspect ≠ WIDTH/HEIGHT): Qt `SmoothTransformation` area averaging
    instead of bilinear (`render::scale`); explains the remaining 0.77 % / 0.87 % layers.
-6. Housekeeping: add a LICENSE (should be GPL-2.0-or-later — PAL/QGIS code is ported);
-   GitHub may still serve the pre-rewrite commit f429e75 by SHA (ask GitHub support or
+6. Housekeeping: GitHub may still serve the pre-rewrite commit f429e75 by SHA (ask GitHub support or
    recreate the repo if that matters).
 
 ## New machine: Windows with WSL + Docker

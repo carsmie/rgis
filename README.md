@@ -227,3 +227,8 @@ CI (`.github/workflows/ci.yml`) runs formatting, clippy with `-D warnings` and t
 GDAL in the same `osgeo/gdal` image as the Dockerfile and without GDAL. Keep its Rust and GDAL
 versions in step with the Dockerfile. The commit that ran `cargo fmt` over the whole crate is
 listed in `.git-blame-ignore-revs` (`git config blame.ignoreRevsFile .git-blame-ignore-revs`).
+
+## License
+
+GPL-2.0-or-later, the license of QGIS: much of rGIS is ported from QGIS and PAL source
+(see the architecture table). The full text is in [LICENSE](LICENSE).
