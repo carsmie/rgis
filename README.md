@@ -55,7 +55,7 @@ environment variables; in addition:
 
 | QGIS Server | rGIS |
 |---|---|
-| `qgis_mapserver` / FastCGI loop calling `QgsServer::handleRequest` | `main.rs` (axum; each request runs on a blocking thread) → `server::Server::handle` |
+| `qgis_mapserver` / FastCGI loop calling `QgsServer::handleRequest` | `main.rs` (command line) → `http.rs` (axum; each request runs on a blocking thread) → `server::Server::handle` |
 | `QgsServerParameters` (case-insensitive KVP) | `params.rs` |
 | `QgsServer::configPath` (`QGIS_PROJECT_FILE` > `MAP` > default) | `Server::config_path` |
 | `QgsConfigCache` ('filesystem' strategy) | `server::ConfigCache` (reload when the file's mtime changes) |
@@ -213,7 +213,7 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 ## Development
 
 ```sh
-cargo test                     # unit tests (CRS, expressions, symbology, geometry, …)
+cargo test                     # unit tests, plus tests/ against QGIS Server's captured responses
 cargo test --no-default-features   # without GDAL
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 # side-by-side checks need QGIS Server on :8099 and this server on :8098:

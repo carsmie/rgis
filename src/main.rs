@@ -1,35 +1,9 @@
-//! rGIS: a QGIS-Server-like OGC map server in Rust that serves QGIS
-//! project files (.qgs/.qgz) over WMS, WFS and OGC API Features.
-
-// Ported QGIS/PAL functions keep their C++ signatures and container types.
-#![allow(clippy::too_many_arguments, clippy::type_complexity)]
-
-mod crs;
-mod expression;
-mod geom;
-mod labeling;
-mod params;
-mod postgis;
-mod project;
-mod provider;
-mod raster;
-mod render;
-mod server;
-mod services;
-mod svg;
-mod symbology;
-mod text;
+//! The `rgis` command line: parse arguments, set up logging and serve [`rgis::http::router`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
-use axum::response::Response as HttpResponse;
-
-use crate::project::{Project, TreeGroup, TreeNode};
-use crate::server::{Request, Server, Settings};
+use rgis::{Server, Settings};
 
 const USAGE: &str = "\
 rGIS – serve QGIS projects over WMS / WFS / OGC API Features
@@ -63,138 +37,6 @@ ENVIRONMENT:
     GET /health answers 200 (liveness); GET /ready answers 503 until the warm-up is done.
 ";
 
-fn print_tree(p: &Project, g: &TreeGroup, depth: usize) {
-    for c in &g.children {
-        let ind = "  ".repeat(depth);
-        match c {
-            TreeNode::Group(sub) => {
-                println!("{ind}[group] {} (WMS name '{}')", sub.name, sub.nickname());
-                print_tree(p, sub, depth + 1);
-            }
-            TreeNode::Layer { id, .. } => match p.layers.get(id) {
-                Some(l) => {
-                    let provider = match l.provider() {
-                        Ok(pr) => format!("{} ({} fields)", pr.description, pr.fields.len()),
-                        Err(e) => format!("INVALID: {e:#}"),
-                    };
-                    println!(
-                        "{ind}[layer] {} (WMS name '{}', {}, {})",
-                        l.name,
-                        p.nickname(l),
-                        l.geometry,
-                        l.crs().authid
-                    );
-                    println!("{ind}        source:   {}", l.datasource);
-                    println!("{ind}        provider: {provider}");
-                    println!(
-                        "{ind}        renderer: {} legend item(s)",
-                        l.renderer.legend().len()
-                    );
-                }
-                None => println!("{ind}[layer] {id} (missing from <projectlayers>)"),
-            },
-        }
-    }
-}
-
-fn inspect(path: &str) -> anyhow::Result<()> {
-    let p = Project::read(std::path::Path::new(path))?;
-    println!("Project:   {}", p.path.display());
-    println!("Title:     {}", p.title);
-    println!("CRS:       {}", p.crs.authid);
-    println!("WMS root:  {}", p.root_name());
-    println!("CRS list:  {}", p.crs_list().join(", "));
-    println!(
-        "WFS layers: {}",
-        p.wfs_layers()
-            .iter()
-            .map(|l| p.nickname(l))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    println!("Layer tree:");
-    print_tree(&p, &p.tree, 1);
-    Ok(())
-}
-
-async fn handle(
-    State(server): State<Arc<Server>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-) -> HttpResponse {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost")
-        .to_string();
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("http");
-    if uri.path() == "/health" {
-        return HttpResponse::new(Body::from("ok"));
-    }
-    if uri.path() == "/ready" {
-        let ready = server.is_ready();
-        let mut out = HttpResponse::new(Body::from(if ready { "ok" } else { "warming up" }));
-        if !ready {
-            *out.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-        }
-        return out;
-    }
-    if method == Method::OPTIONS {
-        let mut out = HttpResponse::new(Body::empty());
-        *out.status_mut() = StatusCode::NO_CONTENT;
-        cors(out.headers_mut());
-        return out;
-    }
-    let req = Request {
-        method: method.to_string(),
-        path: uri.path().to_string(),
-        query: uri.query().unwrap_or("").to_string(),
-        base_url: format!("{proto}://{host}{}", uri.path()),
-    };
-    // Rendering and data access are blocking work, like QGIS Server's request thread.
-    let resp = tokio::task::spawn_blocking(move || server.handle(&req)).await;
-    match resp {
-        Ok(r) => {
-            let mut out = HttpResponse::new(Body::from(r.body));
-            *out.status_mut() =
-                StatusCode::from_u16(r.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            if let Ok(ct) = HeaderValue::from_str(&r.content_type) {
-                out.headers_mut().insert(header::CONTENT_TYPE, ct);
-            }
-            out.headers_mut()
-                .insert(header::SERVER, HeaderValue::from_static("rGIS"));
-            cors(out.headers_mut());
-            out
-        }
-        Err(e) => {
-            let mut out = HttpResponse::new(Body::from(format!("Internal Server Error: {e}")));
-            *out.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            out
-        }
-    }
-}
-
-/// CORS as the Caddy front of the tnt-qgis image sets it: web maps fetch() legends and
-/// GetFeatureInfo cross-origin, and QGIS Server sends no CORS headers itself.
-fn cors(h: &mut HeaderMap) {
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, OPTIONS"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("*"),
-    );
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -219,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
                 let p = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--inspect needs a project file"))?;
-                return tokio::task::spawn_blocking(move || inspect(&p)).await?;
+                return tokio::task::spawn_blocking(move || rgis::inspect(&p)).await?;
             }
             "-p" | "--project" => {
                 default_project = Some(PathBuf::from(
@@ -255,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         let s = server.clone();
         tokio::task::spawn_blocking(move || s.warm(&warm));
     }
-    let app = axum::Router::new().fallback(handle).with_state(server);
+    let app = rgis::http::router(server);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("rGIS listening on http://{addr}");
     axum::serve(listener, app)

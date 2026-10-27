@@ -24,7 +24,7 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
  && rm -rf src
 COPY . .
 # Only rgis itself compiles here; target/ is dropped so this layer stays small in the cache.
-RUN touch src/main.rs \
+RUN touch src/main.rs src/lib.rs \
  && cargo build --release --locked \
  && cp target/release/rgis /usr/local/bin/rgis \
  && rm -rf target
