@@ -126,9 +126,17 @@ fn lex(s: &str) -> Result<Vec<Tok>> {
     Ok(out)
 }
 
+/// Deepest expression tree the parser builds. Parsing and evaluation recurse once per
+/// level, so without a limit one request with thousands of nested `(` overflows the
+/// stack and aborts the whole server. Counts nesting plus left-associative chain links
+/// (`a OR b OR c` is three deep), so it also caps long operator chains. A 2 MiB stack
+/// (tokio's blocking threads) holds ~200 nested `(` in a debug build, 800+ in release.
+const MAX_DEPTH: usize = 128;
+
 struct Parser {
     t: Vec<Tok>,
     p: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -145,6 +153,13 @@ impl Parser {
     fn op(&self, o: &str) -> bool {
         matches!(self.peek(), Some(Tok::Op(x)) if *x == o)
     }
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            bail!("expression nested more than {MAX_DEPTH} levels deep");
+        }
+        Ok(())
+    }
     fn expect(&mut self, t: Tok) -> Result<()> {
         if self.peek() == Some(&t) {
             self.p += 1;
@@ -154,30 +169,40 @@ impl Parser {
         }
     }
     fn or(&mut self) -> Result<Expr> {
+        let d = self.depth;
         let mut l = self.and()?;
         while self.kw("OR") {
             self.p += 1;
+            self.enter()?;
             l = Expr::Binary("OR", Box::new(l), Box::new(self.and()?));
         }
+        self.depth = d;
         Ok(l)
     }
     fn and(&mut self) -> Result<Expr> {
+        let d = self.depth;
         let mut l = self.not()?;
         while self.kw("AND") {
             self.p += 1;
+            self.enter()?;
             l = Expr::Binary("AND", Box::new(l), Box::new(self.not()?));
         }
+        self.depth = d;
         Ok(l)
     }
     fn not(&mut self) -> Result<Expr> {
         if self.kw("NOT") {
             self.p += 1;
-            return Ok(Expr::Unary("NOT", Box::new(self.not()?)));
+            self.enter()?;
+            let e = Expr::Unary("NOT", Box::new(self.not()?));
+            self.depth -= 1;
+            return Ok(e);
         }
         self.cmp()
     }
     fn list(&mut self) -> Result<Vec<Expr>> {
         self.expect(Tok::LParen)?;
+        self.enter()?;
         let mut v = vec![];
         if self.peek() != Some(&Tok::RParen) {
             loop {
@@ -190,6 +215,7 @@ impl Parser {
             }
         }
         self.expect(Tok::RParen)?;
+        self.depth -= 1;
         Ok(v)
     }
     fn cmp(&mut self) -> Result<Expr> {
@@ -238,14 +264,18 @@ impl Parser {
         Ok(l)
     }
     fn concat(&mut self) -> Result<Expr> {
+        let d = self.depth;
         let mut l = self.add()?;
         while self.op("||") {
             self.p += 1;
+            self.enter()?;
             l = Expr::Binary("||", Box::new(l), Box::new(self.add()?));
         }
+        self.depth = d;
         Ok(l)
     }
     fn add(&mut self) -> Result<Expr> {
+        let d = self.depth;
         let mut l = self.mul()?;
         loop {
             let o = if self.op("+") {
@@ -256,11 +286,14 @@ impl Parser {
                 break;
             };
             self.p += 1;
+            self.enter()?;
             l = Expr::Binary(o, Box::new(l), Box::new(self.mul()?));
         }
+        self.depth = d;
         Ok(l)
     }
     fn mul(&mut self) -> Result<Expr> {
+        let d = self.depth;
         let mut l = self.unary()?;
         loop {
             let o = if self.op("*") {
@@ -273,14 +306,19 @@ impl Parser {
                 break;
             };
             self.p += 1;
+            self.enter()?;
             l = Expr::Binary(o, Box::new(l), Box::new(self.unary()?));
         }
+        self.depth = d;
         Ok(l)
     }
     fn unary(&mut self) -> Result<Expr> {
         if self.op("-") {
             self.p += 1;
-            return Ok(Expr::Unary("-", Box::new(self.unary()?)));
+            self.enter()?;
+            let e = Expr::Unary("-", Box::new(self.unary()?));
+            self.depth -= 1;
+            return Ok(e);
         }
         self.primary()
     }
@@ -295,8 +333,10 @@ impl Parser {
             Tok::Str(s) => Expr::Lit(Value::String(s)),
             Tok::Field(f) => Expr::Field(f),
             Tok::LParen => {
+                self.enter()?;
                 let e = self.or()?;
                 self.expect(Tok::RParen)?;
+                self.depth -= 1;
                 e
             }
             Tok::Ident(id) => match id.to_ascii_uppercase().as_str() {
@@ -332,7 +372,11 @@ impl Expr {
     }
 
     pub fn parse(s: &str) -> Result<Expr> {
-        let mut p = Parser { t: lex(s)?, p: 0 };
+        let mut p = Parser {
+            t: lex(s)?,
+            p: 0,
+            depth: 0,
+        };
         let e = p.or()?;
         if p.p != p.t.len() {
             bail!("unexpected trailing tokens in expression '{s}'");
@@ -584,15 +628,27 @@ fn like(s: &str, pat: &str, ci: bool) -> bool {
     } else {
         (s.chars().collect(), pat.chars().collect())
     };
-    fn m(s: &[char], p: &[char]) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some('%') => (0..=s.len()).any(|i| m(&s[i..], &p[1..])),
-            Some('_') => !s.is_empty() && m(&s[1..], &p[1..]),
-            Some(c) => s.first() == Some(c) && m(&s[1..], &p[1..]),
+    // Iterative wildcard match: on a mismatch, backtrack only to the last `%` and let it
+    // swallow one more char. O(len(s) * len(pat)) worst case; the naive recursive form is
+    // exponential in the number of `%` ('%%%%%%%%zz' hung a request for minutes).
+    let (mut i, mut j) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while i < s.len() {
+        if j < pat.len() && (pat[j] == '_' || pat[j] == s[i]) && pat[j] != '%' {
+            i += 1;
+            j += 1;
+        } else if j < pat.len() && pat[j] == '%' {
+            star = Some((j, i));
+            j += 1;
+        } else if let Some((sj, si)) = star {
+            j = sj + 1;
+            i = si + 1;
+            star = Some((sj, si + 1));
+        } else {
+            return false;
         }
     }
-    m(&s, &pat)
+    pat[j..].iter().all(|&c| c == '%')
 }
 
 #[cfg(test)]
@@ -632,5 +688,57 @@ mod tests {
     fn rejects_garbage() {
         assert!(Expr::parse("\"a\" = ").is_err());
         assert!(Expr::parse("'unterminated").is_err());
+    }
+
+    #[test]
+    fn rejects_deep_nesting_without_overflowing() {
+        // Each of these used to recurse once per level and abort the process.
+        for e in [
+            format!("{}1{}", "(".repeat(20_000), ")".repeat(20_000)),
+            format!("{}TRUE", "NOT ".repeat(20_000)),
+            format!("{}1", "- ".repeat(20_000)),
+            format!("1{}", " + 1".repeat(20_000)),
+            format!("lower({}'a'{})", "lower(".repeat(9_999), ")".repeat(9_999)),
+        ] {
+            assert!(Expr::parse(&e).is_err());
+        }
+        // Expressions right at the limit parse and evaluate on a tokio blocking thread's
+        // 2 MiB stack, even in debug builds.
+        let n = MAX_DEPTH - 1;
+        let ok = format!("{}1{} = 1", "(".repeat(n), ")".repeat(n));
+        let ors = vec![r#""NAME" = 'x'"#; MAX_DEPTH].join(" OR ");
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                assert!(Expr::parse(&ok).unwrap().matches(&attrs()));
+                assert!(!Expr::parse(&ors).unwrap().matches(&attrs()));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn like_matches_wildcards_in_linear_time() {
+        for (s, p, want) in [
+            ("Norway", "Nor%", true),
+            ("Norway", "%way", true),
+            ("Norway", "%or%a_", true),
+            ("Norway", "N_r_a_", true),
+            ("Norway", "N%y%", true),
+            ("Norway", "%", true),
+            ("", "%", true),
+            ("", "", true),
+            ("", "_", false),
+            ("Norway", "Nor", false),
+            ("Norway", "%x%", false),
+            ("abab", "%ab", true),
+            ("aXbXc", "a%b%c", true),
+            ("aXbXc", "a%c%b", false),
+        ] {
+            assert_eq!(like(s, p, false), want, "{s} LIKE {p}");
+        }
+        let s = "a".repeat(5_000);
+        assert!(!like(&s, &format!("{}zz", "%".repeat(40)), false));
     }
 }
