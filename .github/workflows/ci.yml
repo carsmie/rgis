@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  # Same toolchain as the Dockerfile.
+  RUST_VERSION: 1.98.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install $RUST_VERSION --profile minimal -c rustfmt && rustup default $RUST_VERSION
+      - run: cargo fmt --check
+
+  # Default features (raster via GDAL), built in the GDAL image the Dockerfile uses
+  # (keep in sync with its GDAL_VERSION; `env` is not available here).
+  gdal:
+    runs-on: ubuntu-24.04
+    container: ghcr.io/osgeo/gdal:ubuntu-small-3.13.3
+    env:
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /usr/local/rustup
+    steps:
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential libclang-dev libssl-dev pkg-config curl ca-certificates git
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy --default-toolchain $RUST_VERSION
+          echo /usr/local/cargo/bin >> $GITHUB_PATH
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            target
+          key: gdal-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  # Pure Rust build without GDAL.
+  no-default-features:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install $RUST_VERSION --profile minimal -c clippy && rustup default $RUST_VERSION
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: nodefault-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - run: cargo test --locked --no-default-features
