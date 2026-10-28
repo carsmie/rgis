@@ -48,6 +48,12 @@ RUN apt-get update \
  # Canonical's Pebble service manager ships in the Ubuntu base image (not a package, unused
  # here: the entrypoint is rgis) and carries Go stdlib CVEs.
  && rm -rf /usr/bin/pebble /var/lib/pebble
+# eMudhra CA compromise (2026-10): the GHA layer cache kept a pre-fix upgrade layer above, so
+# force the patched bundle (drops emSign ECC Root CA - G3) and fail the build if it's older.
+RUN apt-get update \
+ && apt-get install -y --only-upgrade --no-install-recommends ca-certificates \
+ && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816 \
+ && rm -rf /var/lib/apt/lists/*
 ENV RGIS_LABEL_FONT="Noto Sans"
 # glibc keeps an arena per busy thread and hands little back after a burst of parallel
 # renders (RSS stayed ~2x higher); two arenas cost no measurable latency.
