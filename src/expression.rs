@@ -537,6 +537,13 @@ impl Expr {
                     "abs" => num(&first)
                         .map(|n| serde_json::json!(n.abs()))
                         .unwrap_or(Value::Null),
+                    // lag08 sounding labels: floor("dybde"), floor("dybde" * 10) / 10.
+                    "floor" => num(&first)
+                        .map(|n| serde_json::json!(n.floor()))
+                        .unwrap_or(Value::Null),
+                    "ceil" => num(&first)
+                        .map(|n| serde_json::json!(n.ceil()))
+                        .unwrap_or(Value::Null),
                     "round" => {
                         let places = v.get(1).and_then(num).unwrap_or(0.0) as i32;
                         num(&first)
@@ -686,6 +693,19 @@ mod tests {
             ("name ILIKE 'NOR_AY'", true),
         ] {
             assert_eq!(Expr::parse(e).unwrap().matches(&a), want, "{e}");
+        }
+    }
+
+    #[test]
+    fn evaluates_floor_and_ceil() {
+        let mut a = Attrs::default();
+        a.insert("dybde".into(), json!(2.47));
+        for (e, want) in [
+            (r#"floor("dybde")"#, "2"),
+            (r#"floor("dybde" * 10) / 10"#, "2.4"),
+            (r#"ceil("dybde")"#, "3"),
+        ] {
+            assert_eq!(to_str(&Expr::parse(e).unwrap().eval(&a)), want, "{e}");
         }
     }
 
