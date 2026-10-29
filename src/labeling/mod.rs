@@ -556,6 +556,11 @@ impl Engine {
                 .filter(|d| d.value > 0.0)
                 .map(|d| self.map_units(d.value, d.unit))
                 .unwrap_or(0.0),
+            label_margin: if s.label_margin_distance.value > 0.0 {
+                self.map_units(s.label_margin_distance.value, s.label_margin_distance.unit)
+            } else {
+                0.0
+            },
             min_size: if s.merge_lines
                 && s.min_feature_size > 0.0
                 && matches!(

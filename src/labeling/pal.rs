@@ -110,6 +110,9 @@ pub struct LabelFeature {
     /// QgsLabelThinningSettings::noRepeatDistance: same-text labels closer than this (map
     /// units) conflict (0 = off).
     pub no_repeat_distance: f64,
+    /// QgsLabelThinningSettings::labelMarginDistance: any two labels closer than the larger
+    /// of their margins (map units) conflict (0 = off).
+    pub label_margin: f64,
 }
 
 /// pal::Layer.
@@ -1883,6 +1886,16 @@ impl Problem {
         }
         let fa = &layers[la.layer].features[la.feature];
         let fb = &layers[lb.layer].features[lb.feature];
+        // Pal::candidatesAreConflicting: label margin first, regardless of overlap handling.
+        let margin = fa.label_margin.max(fb.label_margin);
+        if margin > 0.0
+            && la.all_quads().any(|(qa, _, _)| {
+                lb.all_quads()
+                    .any(|(qb, _, _)| shape::quad_distance(&qa, &qb) <= margin)
+            })
+        {
+            return true;
+        }
         let min_separation = fa.no_repeat_distance.max(fb.no_repeat_distance);
         let duplicate = min_separation > 0.0 && fa.label_text == fb.label_text;
         if !duplicate
@@ -2595,7 +2608,9 @@ impl Pal {
         for (fi, cands) in kept.into_iter().enumerate() {
             prob.first[fi] = next;
             for mut c in cands {
-                let d = self.layers[c.layer].features[c.feature].no_repeat_distance;
+                // LabelPosition::boundingBoxForCandidateConflicts: grown by margin and no-repeat.
+                let f = &self.layers[c.layer].features[c.feature];
+                let d = f.no_repeat_distance.max(f.label_margin);
                 if d > 0.0 {
                     c.cbox = BBox {
                         xmin: c.bbox.xmin - d,
