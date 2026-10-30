@@ -37,22 +37,18 @@ FROM scratch AS extra-fonts
 FROM ghcr.io/osgeo/gdal:ubuntu-small-${GDAL_VERSION}
 # The font packages of the tnt-qgis QGIS Server image (CJK left out), so labels resolve to
 # the same faces; Kartverket's own fonts come only through extra-fonts above. Qt falls back to
-# fontconfig's sans-serif there (Noto Sans), rgis to RGIS_LABEL_FONT. The upgrade picks up
-# OS security fixes released after the GDAL base image was built (Pharos/Trivy findings).
+# fontconfig's sans-serif there (Noto Sans), rgis to RGIS_LABEL_FONT.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends fonts-dejavu fonts-dejavu-core fonts-dejavu-extra \
       fonts-liberation fonts-liberation2 fonts-open-sans fonts-noto-core fonts-noto-extra \
       fonts-noto-mono fonts-noto-ui-core fonts-noto-ui-extra fonts-roboto fonts-vollkorn fonts-ebgaramond \
  && rm -rf /var/lib/apt/lists/* \
- # Canonical's Pebble service manager ships in the Ubuntu base image (not a package, unused
- # here: the entrypoint is rgis) and carries Go stdlib CVEs.
  && rm -rf /usr/bin/pebble /var/lib/pebble
-# eMudhra CA compromise (2026-10): the GHA layer cache kept a pre-fix upgrade layer above, so
-# force the patched bundle (drops emSign ECC Root CA - G3) and fail the build if it's older.
 RUN apt-get update \
- && apt-get install -y --only-upgrade --no-install-recommends ca-certificates \
+ && apt-get install -y --only-upgrade --no-install-recommends ca-certificates libbrotli1 \
  && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816 \
+ && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge 1.2.0-3ubuntu0.1 \
  && rm -rf /var/lib/apt/lists/*
 ENV RGIS_LABEL_FONT="Noto Sans"
 # glibc keeps an arena per busy thread and hands little back after a burst of parallel
