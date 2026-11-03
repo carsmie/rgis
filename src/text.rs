@@ -226,14 +226,14 @@ fn trak_units(font: &FontRef, ptem: f32) -> f64 {
         return 0.0;
     };
     let data = trak.offset_data();
-    let Ok(sizes) = h.size_table(data) else {
+    let Some(sizes) = h.size_table(data) else {
         return 0.0;
     };
     let n = sizes.len();
     let Some(entry) = h.track_table().iter().find(|t| t.track().to_f32() == 0.0) else {
         return 0.0;
     };
-    let Ok(values) = entry.per_size_values(data, n as u16) else {
+    let Some(values) = entry.per_size_values(data, n as u16) else {
         return 0.0;
     };
     let size = |i: usize| sizes[i].get().to_f32();
@@ -480,7 +480,7 @@ impl SizedFont {
                 let units = match font
                     .hvar()
                     .ok()
-                    .and_then(|h| h.advance_width_delta(glyph, self.location.coords()).ok())
+                    .and_then(|h| h.advance_delta(glyph, self.location.coords()))
                 {
                     Some(delta) => base + delta.to_f64(),
                     None => font
