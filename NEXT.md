@@ -29,18 +29,16 @@ Written 2026-10-18 when moving development from macOS to Windows. Read README.md
    Kartverket topo projects (README there). 2026-10-19, Oslo z11–15: place names and road
    numbers 0.0–0.3 %, street names 0.1–2.6 % (all 23 streets on the same features as QGIS at
    z14; two still at another candidate — solver, equal-cost neighbours), house numbers 1.4 %.
-   Open: the hint-only near-straight-segments pass
-   (`createCandidatesAlongLineNearStraightSegments`), GetStyles, raster renderers (hillshade,
-   paletted), MarkerLine/HashLine/ShapeburstFill, inline `base64:` SVGs.
+   Open: GetStyles, paletted rasters.
    `tools/topo/qgis_labels.py` dumps QGIS's placed labels (PyQGIS), rGIS logs its own with
    `RUST_LOG=rgis::labels=debug`; diff those instead of pixels.
-2. **Polygon labels** — `createCandidatesForPolygon` (free/horizontal, `splitPolygons`,
-   oriented bbox via `computeConvexHullOrientedBoundingBox`), ring/centroid distance costs
-   (TODO in `labeling/pal.rs::finalize_costs`), `createCandidatesOutsidePolygon`,
-   `GeomFunction::reorderPolygon` (convex hull order), proper `GEOSPointOnSurface`.
-3. Test projects to verify with: find layers with `placement="5|7|8"` in
-   `QGIS/tests/testdata/qgis_server/*.qgs`; if none, make copies of a polygon project
-   with labels enabled (see `make_rect_project.py` idea below).
+2. **Polygon labels** — done 2026-11-03 (`labeling/polygon.rs`, `labeling/ogr.rs`, the
+   polygon branch of `pal.rs::create_candidates`, ring/centroid costs, near-straight-segments
+   pass, permissible zone). Synthetic project with convex/L/U/holed/skewed/tiny polygons ×
+   10 placement modes: every label at QGIS's position (0.00 m) except exact cost ties.
+   Verify with local Qt 5 QGIS by running rGIS with `RGIS_QT5_METRICS=1` (Qt 5's whole-pixel
+   ascent/descent; test-only) and diffing `qgis_labels.py` against the `rgis::labels` log.
+   Still open: proper `GEOSPointOnSurface`.
 4. Label extras: shadows, callouts, `formatNumbers`, more data-defined properties (font,
    buffer). (Line wrapping done 2026-11-03: `labeling::word_wrap`, 108 PyQGIS cases.)
 5. Stretched GetMap (BBOX aspect ≠ WIDTH/HEIGHT): Qt `SmoothTransformation` area averaging

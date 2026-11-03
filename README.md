@@ -195,9 +195,11 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 
 ## Limitations
 
-* Labels: free/horizontal polygon placement, outside-polygon placement, the near-straight-
-  segment pass of hint-only parallel line labels, curved stretch/vertex modes, word spacing,
-  SVG/marker backgrounds, callouts, shadows, HTML text and label masks are not ported yet.
+* Labels: curved stretch/vertex modes, word spacing, SVG/marker backgrounds, callouts,
+  shadows, HTML text and label masks are not ported yet. Polygon placements (centroid, free,
+  horizontal, perimeter, perimeter curved, outside, fit-in-polygon) match QGIS; outside
+  placement buffers through GDAL/GEOS, so builds without the `raster` feature place no
+  outside candidates.
   Legacy (name ID 1) families such as "Noto Sans Condensed" resolve to their own faces like
   fontconfig/Qt 6 (nearest weight; a `namedStyle` the family lacks is ignored). Text metrics follow
   Qt's CoreText engine on macOS (verified glyph by glyph) and its FreeType engine on Linux. When a

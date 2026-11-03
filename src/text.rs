@@ -484,6 +484,14 @@ impl SizedFont {
                         / 64.0;
                 }
             }
+            // Test knob: Qt 5's hinted FT_Size_Metrics (ascent/descent rounded up to whole
+            // pixels), to compare label placement with a local Qt 5 QGIS. Not for serving.
+            static QT5: LazyLock<bool> =
+                LazyLock::new(|| std::env::var_os("RGIS_QT5_METRICS").is_some());
+            if *QT5 {
+                f.ascent = f.ascent.ceil();
+                f.descent = f.descent.ceil();
+            }
         }
         if *ENGINE == Engine::CoreText {
             // CoreText adds the `trak` table's tracking at its size to every advance, unrounded.

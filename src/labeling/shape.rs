@@ -173,6 +173,19 @@ pub fn polygon_contains_quad(rings: &[Vec<Pt>], q: &[Pt; 4]) -> bool {
     true
 }
 
+/// GEOSPreparedContainsProperly(polygon, quad's LinearRing) (GeomFunction::containsCandidate):
+/// the quad's outline lies in the interior. Only the ring is tested, so a hole inside the
+/// quad does not matter.
+pub fn polygon_contains_properly_ring(rings: &[Vec<Pt>], q: &[Pt; 4]) -> bool {
+    if !q.iter().all(|p| polygon_contains_properly(rings, *p)) {
+        return false;
+    }
+    let qr = quad_ring(q);
+    !rings.iter().any(|ring| {
+        edges(ring).any(|(a, b)| qr.windows(2).any(|e| segments_intersect(e[0], e[1], a, b)))
+    })
+}
+
 /// Axis-aligned rectangle contains the quad (inclusive), for map boundaries.
 pub fn rect_contains_quad(r: (f64, f64, f64, f64), q: &[Pt; 4]) -> bool {
     q.iter()

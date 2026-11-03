@@ -9,7 +9,9 @@ pub mod settings;
 
 mod index;
 mod line;
+mod ogr;
 mod pal;
+mod polygon;
 mod rtree;
 mod shape;
 mod stdsort;
@@ -317,10 +319,45 @@ impl Engine {
         let g = f.geometry;
         let centroid_poly = matches!(s.placement, Placement::AroundPoint | Placement::OverPoint)
             && matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
-        let is_line = matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_));
+        let is_line = matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_))
+            || matches!(s.placement, Placement::Line | Placement::PerimeterCurved);
         // UseEntireLine: the whole (unclipped) line, so anchors follow the full feature.
         let do_clip =
             (!centroid_poly || !s.centroid_whole) && !(is_line && s.line_anchor_entire_line);
+        // QgsPalLayerSettings::registerFeature: the permissible zone is the polygon itself
+        // (fit in polygon only, or outside placement allowed), before boundary().
+        let is_poly = matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
+        let permissible_zone = (is_poly && (s.fit_in_polygon_only || s.polygon_flags & 1 != 0))
+            .then(|| {
+                let z = if do_clip && !self.extent.contains_rect(&geom::bbox(g)) {
+                    geom::clip_to_rect(g, &self.extent)
+                } else {
+                    Some(g.clone())
+                };
+                z.map(|z| {
+                    shapes(&z)
+                        .into_iter()
+                        .filter_map(|s| match s {
+                            Shape::Polygon(r) => Some(r),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .flatten();
+        // Perimeter placements label the polygon's boundary (QgsAbstractGeometry::boundary:
+        // exterior then interior rings as lines), before clipping.
+        let boundary;
+        let g = if matches!(s.placement, Placement::Line | Placement::PerimeterCurved)
+            && matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_))
+        {
+            boundary = polygon_boundary(g);
+            &boundary
+        } else {
+            g
+        };
+        // QGIS tests the label geometry (after boundary()) for line settings.
+        let label_is_line = matches!(g, Geometry::LineString(_) | Geometry::MultiLineString(_));
         let g = if do_clip && !self.extent.contains_rect(&geom::bbox(g)) {
             geom::clip_to_rect(g, &self.extent)?
         } else {
@@ -516,11 +553,7 @@ impl Engine {
             .dd(s, "LineAnchorTextPoint", ctx)
             .and_then(|v| TextAnchor::from_dd(&to_str(&v)))
             .unwrap_or(s.line_anchor_text_point);
-        let line = matches!(
-            f.geometry,
-            Geometry::LineString(_) | Geometry::MultiLineString(_)
-        )
-        .then(|| LineLabel {
+        let line = label_is_line.then(|| LineLabel {
             flags: s.line_flags,
             anchor_percent: s.line_anchor_percent,
             anchor_strict: s.line_anchor_strict,
@@ -579,12 +612,9 @@ impl Engine {
             } else {
                 0.0
             },
-            min_size: if s.merge_lines
-                && s.min_feature_size > 0.0
-                && matches!(
-                    f.geometry,
-                    Geometry::LineString(_) | Geometry::MultiLineString(_)
-                ) {
+            permissible_zone,
+            polygon_flags: s.polygon_flags,
+            min_size: if s.merge_lines && s.min_feature_size > 0.0 && label_is_line {
                 self.map_units(s.min_feature_size, Unit::Mm)
             } else {
                 0.0
@@ -888,6 +918,25 @@ fn split_graphemes(s: &str) -> Vec<String> {
         join_next = c == '\u{200D}';
     }
     out
+}
+
+/// QgsPolygon/QgsMultiPolygon::boundary: every ring as a line (exterior first).
+fn polygon_boundary(g: &Geometry<f64>) -> Geometry<f64> {
+    let polys: Vec<&geo_types::Polygon<f64>> = match g {
+        Geometry::Polygon(p) => vec![p],
+        Geometry::MultiPolygon(mp) => mp.0.iter().collect(),
+        _ => Vec::new(),
+    };
+    let rings: Vec<geo_types::LineString<f64>> = polys
+        .into_iter()
+        .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+        .filter(|r| r.0.len() >= 2)
+        .cloned()
+        .collect();
+    match rings.len() {
+        1 => Geometry::LineString(rings.into_iter().next().expect("one ring")),
+        _ => Geometry::MultiLineString(geo_types::MultiLineString(rings)),
+    }
 }
 
 /// Simple geometries of a (multi) geometry, as PAL's Util::unmulti.

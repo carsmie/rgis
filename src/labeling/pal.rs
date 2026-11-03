@@ -47,6 +47,18 @@ fn near(a: f64, b: f64) -> bool {
     (a - b).abs() <= 4.0 * f64::EPSILON * a.abs().max(b.abs()).max(1.0)
 }
 
+/// QgsGeometryUtilsBase::normalizedAngle: into [0, 2π).
+fn normalized_angle(a: f64) -> f64 {
+    let mut c = a;
+    if c >= PI * 2.0 || c <= -2.0 * PI {
+        c %= 2.0 * PI;
+    }
+    if c < 0.0 {
+        c += 2.0 * PI;
+    }
+    c
+}
+
 fn near_eps(a: f64, b: f64, eps: f64) -> bool {
     (a - b).abs() <= eps
 }
@@ -113,6 +125,11 @@ pub struct LabelFeature {
     /// QgsLabelThinningSettings::labelMarginDistance: any two labels closer than the larger
     /// of their margins (map units) conflict (0 = off).
     pub label_margin: f64,
+    /// QgsLabelFeature::permissibleZone: the polygon(s) candidates must lie in (fit in polygon
+    /// only, or placement outside allowed); each entry is one polygon's rings.
+    pub permissible_zone: Option<Vec<Vec<Vec<Pt>>>>,
+    /// Qgis::LabelPolygonPlacementFlags: 1 = outside allowed, 2 = inside allowed.
+    pub polygon_flags: u32,
 }
 
 /// pal::Layer.
@@ -198,6 +215,18 @@ impl Part {
             is_hole: false,
             total_repeats: 1,
         }
+    }
+
+    /// Layer::registerFeature: polygons get GeomFunction::reorderPolygon (holes too, in
+    /// FeaturePart::extractCoords); false = bad hull, part dropped.
+    fn reorder(&mut self) -> bool {
+        if self.kind != Kind::Polygon {
+            return true;
+        }
+        for h in &mut self.holes {
+            super::polygon::reorder_polygon(&mut h.x, &mut h.y);
+        }
+        super::polygon::reorder_polygon(&mut self.x, &mut self.y)
     }
 
     fn length(&self) -> f64 {
@@ -570,9 +599,10 @@ impl PalLayer {
         let mut added = false;
         let mut biggest: Option<(f64, Part)> = None;
         for s in &lf.parts {
-            let part = Part::new(layer_index, fi, s.clone());
+            let mut part = Part::new(layer_index, fi, s.clone());
             if (part.kind == Kind::Line && part.x.len() < 2)
                 || (part.kind == Kind::Polygon && part.x.len() < 3)
+                || !part.reorder()
             {
                 continue;
             }
@@ -603,9 +633,10 @@ impl PalLayer {
             && let Some(obs) = &lf.obstacle_parts
         {
             for s in obs {
-                let part = Part::new(layer_index, fi, s.clone());
+                let mut part = Part::new(layer_index, fi, s.clone());
                 if (part.kind == Kind::Line && part.x.len() < 2)
                     || (part.kind == Kind::Polygon && part.x.len() < 3)
+                    || !part.reorder()
                 {
                     continue;
                 }
@@ -936,6 +967,262 @@ impl CandidateContext<'_> {
         LabelPosition::new(self.part, x, y, w, h, alpha, cost, q, self.upright_only)
     }
 
+    /// `!permissibleZonePrepared() || GeomFunction::containsCandidate(zone, x, y, w, h, alpha)`.
+    fn zone_contains(&self, x: f64, y: f64, w: f64, h: f64, alpha: f64) -> bool {
+        if self.lf.permissible_zone.is_none() {
+            return true;
+        }
+        let q = if near_eps(alpha, 0.0, 4.0 * f64::EPSILON) {
+            [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        } else {
+            let b = alpha + FRAC_PI_2;
+            let (dx1, dy1) = (alpha.cos() * w, alpha.sin() * w);
+            let (dx2, dy2) = (b.cos() * h, b.sin() * h);
+            [
+                (x, y),
+                (x + dx1, y + dy1),
+                (x + dx1 + dx2, y + dy1 + dy2),
+                (x + dx2, y + dy2),
+            ]
+        };
+        self.zone_contains_quad(&q)
+    }
+
+    /// FeaturePart::createCandidatesForPolygon (free / horizontal placement inside): a grid of
+    /// centres over each split shape's oriented hull box, denser until enough fit.
+    fn for_polygon(
+        &self,
+        out: &mut Vec<LabelPosition>,
+        max_candidates: usize,
+        per_unit2: f64,
+    ) -> usize {
+        use super::polygon::{oriented_bbox, split_polygons};
+        let lf = self.lf;
+        let part = self.part;
+        let (lw, lh) = lf.size;
+        let total_area = part.area();
+        let target = if max_candidates > 0 {
+            max_candidates.min((per_unit2 * total_area).ceil() as usize)
+        } else {
+            0
+        };
+        let shapes = split_polygons(part.x.clone(), part.y.clone(), lw, lh);
+        if shapes.is_empty() {
+            return 0;
+        }
+        let diago = (lw * lw / 4.0 + lh * lh / 4.0).sqrt();
+        let boxes: Vec<_> = shapes
+            .iter()
+            .filter_map(|s| oriented_bbox(&s.x, &s.y, &s.hull))
+            .collect();
+        let zone = lf.permissible_zone.as_ref();
+        let free = self.layer.arrangement == Placement::Free;
+        let horizontal = self.layer.arrangement == Placement::Horizontal;
+        let mut density = 1.0 / per_unit2.sqrt();
+        let mut tries = 0;
+        let max_tries = if zone.is_some() { 7 } else { 10 };
+        let mut generated = 0usize;
+        let part_bbox_area = (part.bbox.xmax - part.bbox.xmin) * (part.bbox.ymax - part.bbox.ymin);
+        loop {
+            for b in &boxes {
+                let mut dx = density;
+                if tries == 0 && max_candidates > 0 {
+                    let box_area = b.width * b.length;
+                    let max_this = target as f64 * box_area / total_area;
+                    dx = dx.max((box_area / max_this).sqrt() * 0.8);
+                }
+                let dy = dx;
+                if b.length * b.width > part_bbox_area * 5.0 {
+                    continue;
+                }
+                if horizontal && let Some(z) = zone {
+                    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                    for p in z.iter().flatten().flatten() {
+                        (x0, y0, x1, y1) = (x0.min(p.0), y0.min(p.1), x1.max(p.0), y1.max(p.1));
+                    }
+                    if x1 - x0 < lw || y1 - y0 < lh {
+                        continue;
+                    }
+                }
+                let mut enough = false;
+                if free {
+                    // A label twice the size centred on the box: horizontal if it fits.
+                    enough = true;
+                    let px = (b.x[0] + b.x[2]) / 2.0 - lw;
+                    let py = (b.y[0] + b.y[2]) / 2.0 - lh;
+                    'corners: for i in 0..2 {
+                        for j in 0..2 {
+                            let (rx, ry) = (px + 2.0 * lw * i as f64, py + 2.0 * lh * j as f64);
+                            if !part.contains_point((rx, ry)) {
+                                enough = false;
+                                break 'corners;
+                            }
+                        }
+                    }
+                }
+                let alpha = if horizontal || enough {
+                    0.0
+                } else if b.length > 1.5 * lw && b.width > 1.5 * lw {
+                    if b.alpha <= FRAC_PI_4 {
+                        b.alpha
+                    } else {
+                        b.alpha - FRAC_PI_2
+                    }
+                } else if b.length > b.width {
+                    b.alpha - FRAC_PI_2
+                } else {
+                    b.alpha
+                };
+                let beta = lh.atan2(lw) + alpha;
+                let (dlx, dly) = (beta.cos() * diago, beta.sin() * diago);
+                let mut px0 = b.width / 2.0;
+                let mut py0 = b.length / 2.0;
+                px0 -= (px0 / dx).ceil() * dx;
+                py0 -= (py0 / dy).ceil() * dy;
+                let mut px = px0;
+                while px <= b.width {
+                    let mut py = py0;
+                    while py <= b.length {
+                        let rx = b.alpha.cos() * px + (b.alpha - FRAC_PI_2).cos() * py + b.x[0];
+                        let ry = b.alpha.sin() * px + (b.alpha - FRAC_PI_2).sin() * py + b.y[0];
+                        let ok = if zone.is_some() {
+                            self.zone_contains(rx - dlx, ry - dly, lw, lh, alpha)
+                        } else {
+                            part.contains_point((rx, ry))
+                        };
+                        if ok {
+                            out.push(self.pos(
+                                rx - dlx,
+                                ry - dly,
+                                lw,
+                                lh,
+                                alpha,
+                                0.0001,
+                                Quadrant::Over,
+                            ));
+                            generated += 1;
+                        }
+                        py += dy;
+                    }
+                    px += dx;
+                }
+            }
+            if max_candidates > 0 && generated < target {
+                density /= 2.0;
+                tries += 1;
+                if tries >= max_tries {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        generated
+    }
+
+    /// FeaturePart::createCandidatesOutsidePolygon: horizontal labels around a 50 % buffer
+    /// of the polygon, at regular steps along its ring, costed by distance to the centroid.
+    fn outside_polygon(
+        &self,
+        out: &mut Vec<LabelPosition>,
+        max_candidates: usize,
+        per_unit2: f64,
+    ) -> usize {
+        let lf = self.lf;
+        let part = self.part;
+        let (lw, lh) = lf.size;
+        let dist = lf.dist_label;
+        let Shape::Polygon(rings) = &part.shape else {
+            return 0;
+        };
+        let (cx, cy) = shape::centroid(&part.shape);
+        // Half the distance here, the other half when placing the candidate.
+        let Some(buffer) = super::ogr::buffer_polygon(rings, dist * 0.5, 1) else {
+            return 0;
+        };
+        let Some(ring) = buffer.first() else { return 0 };
+        let ring_len = shape::line_length(ring);
+        let circle_area = ring_len.powi(2) / (4.0 * PI);
+        let for_area = (per_unit2 * circle_area).ceil() as usize;
+        let target = 16.max(if max_candidates > 0 {
+            max_candidates.min(for_area)
+        } else {
+            for_area
+        });
+        let delta = ring_len / target as f64;
+        let b = &part.bbox;
+        let mdx = (b.xmax - cx).max(cx - b.xmin) + dist;
+        let mdy = (b.ymax - cy).max(cy - b.ymin) + dist;
+        let max_dist = (mdx * mdx + mdy * mdy).sqrt();
+        let buffer_shape = Shape::Polygon(buffer.clone());
+        let mut created = 0;
+        let mut add = |x: f64, y: f64, position: PointPosition| {
+            let (lx, ly, q) = ordered_position(
+                x,
+                y,
+                lw,
+                lh,
+                position,
+                dist * 0.5,
+                lf.visual_margin,
+                0.0,
+                0.0,
+                0.0,
+            );
+            let mut c = self.pos(lx, ly, lw, lh, 0.0, 0.0, q);
+            if shape::quad_intersects(&c.quad(), &buffer_shape) {
+                return;
+            }
+            c.cost = c.distance_to_point((cx, cy)) / max_dist;
+            out.push(c);
+            created += 1;
+        };
+        use PointPosition::*;
+        visit_points_by_regular_distance(ring, delta, |x, y, (sx, sy), (ex, ey)| {
+            // Float maths as QGIS (float angle = atan2(float, float) * 180 / M_PI).
+            let mut a = ((((ey - sy) as f32).atan2((ex - sx) as f32) * 180.0) as f64 / PI) as f32;
+            if a < 0.0 {
+                a += 360.0;
+            }
+            let positions: &[PointPosition] = if (0.0..=5.0).contains(&a) {
+                &[TopMiddle, TopLeft]
+            } else if a <= 85.0 {
+                &[TopLeft]
+            } else if a <= 90.0 {
+                &[TopLeft, MiddleLeft]
+            } else if a <= 95.0 {
+                &[MiddleLeft, BottomLeft]
+            } else if a <= 175.0 {
+                &[BottomLeft]
+            } else if a <= 180.0 {
+                &[BottomLeft, BottomMiddle]
+            } else if a <= 185.0 {
+                &[BottomMiddle, BottomRight]
+            } else if a <= 265.0 {
+                &[BottomRight]
+            } else if a <= 270.0 {
+                &[BottomRight, MiddleRight]
+            } else if a <= 275.0 {
+                &[MiddleRight, TopRight]
+            } else if a <= 355.0 {
+                &[TopRight]
+            } else {
+                &[TopRight, TopMiddle]
+            };
+            for &p in positions {
+                add(x, y, p);
+            }
+        });
+        created
+    }
+
+    fn zone_contains_quad(&self, q: &[Pt; 4]) -> bool {
+        self.lf.permissible_zone.as_ref().is_none_or(|zone| {
+            zone.iter()
+                .any(|rings| shape::polygon_contains_properly_ring(rings, q))
+        })
+    }
+
     /// FeaturePart::createCandidateCenteredOverPoint.
     fn centered_over_point(&self, x: f64, y: f64, out: &mut Vec<LabelPosition>, angle: f64) {
         let (w, h) = (self.width(), self.height());
@@ -1237,7 +1524,178 @@ impl CandidateContext<'_> {
                 return;
             }
         }
-        self.along_line_near_midpoint(out, 0.0, max_line_candidates);
+        // Prefer straight-ish segments (HintOnly anchors), then fill up near the midpoint.
+        let mut n = 0;
+        if !ll.anchor_strict {
+            n = self.along_line_near_straight_segments(out, max_line_candidates);
+        }
+        if n < max_line_candidates {
+            self.along_line_near_midpoint(out, if n > 0 { 0.01 } else { 0.0 }, max_line_candidates);
+        }
+    }
+
+    /// FeaturePart::createCandidatesAlongLineNearStraightSegments: candidates along the
+    /// stretches between nodes turning more than 45°. Returns `out.len()` like QGIS.
+    fn along_line_near_straight_segments(
+        &self,
+        out: &mut Vec<LabelPosition>,
+        max_line_candidates: usize,
+    ) -> usize {
+        let lf = self.lf;
+        let Some(ll) = &lf.line else { return out.len() };
+        let (x, y) = (&self.part.x, &self.part.y);
+        let n = x.len();
+        if n < 2 {
+            return 0;
+        }
+        let (w, h) = lf.size;
+        let dist = lf.dist_label;
+        let mut flags = ll.flags;
+        if flags == 0 {
+            flags = ON_LINE;
+        }
+        let eq = |a: f64, b: f64| near_eps(a, b, 4.0 * f64::EPSILON);
+        let closed = eq(x[0], x[n - 1]) && eq(y[0], y[n - 1]);
+        // Nodes where the line turns by more than 45° ("hard breaks").
+        let mut extreme: Vec<usize> = Vec::new();
+        let last = if closed { n - 1 } else { n.saturating_sub(2) };
+        for i in 1..=last {
+            let j = if i == n - 1 { 1 } else { i + 1 };
+            let (x1, x2, x3, y1, y2, y3) = (x[i - 1], x[i], x[j], y[i - 1], y[i], y[j]);
+            if (eq(y2, y3) && eq(x2, x3)) || (eq(y1, y2) && eq(x1, x2)) {
+                continue;
+            }
+            let a = normalized_angle(PI - ((y3 - y2).atan2(x3 - x2) - (y2 - y1).atan2(x2 - x1)));
+            if a < PI * 135.0 / 180.0 || a > PI * 225.0 / 180.0 {
+                extreme.push(i);
+            }
+        }
+        extreme.push(n - 1);
+        let mut seg_len = vec![0.0; n - 1];
+        let mut to_seg = vec![0.0; n];
+        let mut total = 0.0;
+        let (mut straight_len, mut straight_angle) = (Vec::new(), Vec::new());
+        let (mut cur, mut longest) = (0.0f64, 0.0f64);
+        let (mut sx0, mut sy0) = (x[0], y[0]);
+        for i in 0..n - 1 {
+            if i > 0 {
+                to_seg[i] = to_seg[i - 1] + seg_len[i - 1];
+            }
+            seg_len[i] = (x[i + 1] - x[i]).hypot(y[i + 1] - y[i]);
+            total += seg_len[i];
+            if extreme.contains(&i) {
+                straight_len.push(cur);
+                straight_angle.push(normalized_angle((y[i] - sy0).atan2(x[i] - sx0)));
+                longest = longest.max(cur);
+                cur = 0.0;
+                (sx0, sy0) = (x[i], y[i]);
+            }
+            cur += seg_len[i];
+        }
+        to_seg[n - 1] = total;
+        straight_len.push(cur);
+        straight_angle.push(normalized_angle((y[n - 1] - sy0).atan2(x[n - 1] - sx0)));
+        longest = longest.max(cur);
+        let anchor = total * ll.anchor_percent;
+        if total < w {
+            return 0;
+        }
+        let step = h
+            .min(w)
+            .min((total - w) / max_line_candidates.max(1) as f64);
+        let flexible = ll.anchor_percent > 0.1 && ll.anchor_percent < 0.9;
+        let mut to_end = 0.0;
+        for (i, &seg_length) in straight_len.iter().enumerate() {
+            let seg_angle = straight_angle[i];
+            let to_start = to_end;
+            to_end = to_seg[extreme[i]];
+            let to_center = 0.5 * (to_end + to_start);
+            if seg_length < w {
+                continue;
+            }
+            let segment_cost = 1.0 - (to_end - to_start) / longest;
+            let angle_cost = 1.0 - ((seg_angle % PI) - FRAC_PI_2).abs() / FRAC_PI_2;
+            let mut along = to_start;
+            while along + w < to_end {
+                let (sx, sy) = point_by_distance(x, y, &seg_len, &to_seg, along);
+                let (ex, ey) = point_by_distance(x, y, &seg_len, &to_seg, along + w);
+                let mut cost = (ex - sx).hypot(ey - sy) / w;
+                cost = if cost > 0.98 {
+                    0.0001
+                } else {
+                    (1.0 - cost) / 100.0
+                };
+                let center = along + w / 2.0;
+                let text_anchor = match ll.text_point {
+                    TextAnchor::Start | TextAnchor::Follow => along,
+                    TextAnchor::Center => along + w / 2.0,
+                    TextAnchor::End => along + w,
+                };
+                if flexible {
+                    cost += 2.0 * (center - to_center).abs() / (to_end - to_start) * 0.0005;
+                }
+                if !closed {
+                    cost += 2.0 * (text_anchor - anchor).abs() / total * 0.0005;
+                }
+                if flexible {
+                    cost += segment_cost * 0.0005 + angle_cost * 0.0001;
+                }
+                let angle = if eq(ey, sy) && eq(ex, sx) {
+                    0.0
+                } else {
+                    (ey - sy).atan2(ex - sx)
+                };
+                let beta = angle + FRAC_PI_2;
+                match self.layer.arrangement {
+                    Placement::Line => {
+                        let rtl = angle > FRAC_PI_2 || angle <= -FRAC_PI_2;
+                        let reversed = flags & MAP_ORIENTATION != 0 && rtl;
+                        let above = (!reversed && flags & ABOVE_LINE != 0)
+                            || (reversed && flags & BELOW_LINE != 0);
+                        let below = (!reversed && flags & BELOW_LINE != 0)
+                            || (reversed && flags & ABOVE_LINE != 0);
+                        let mut push = |px: f64, py: f64, c: f64| {
+                            if self.zone_contains(px, py, w, h, angle) {
+                                out.push(self.pos(px, py, w, h, angle, c, Quadrant::Over));
+                            }
+                        };
+                        if below {
+                            push(
+                                sx - beta.cos() * (dist + h),
+                                sy - beta.sin() * (dist + h),
+                                cost + if reversed { 0.0 } else { 0.001 },
+                            );
+                        }
+                        if above {
+                            push(
+                                sx + beta.cos() * dist,
+                                sy + beta.sin() * dist,
+                                cost + if reversed { 0.001 } else { 0.0 },
+                            );
+                        }
+                        if flags & ON_LINE != 0 {
+                            push(
+                                sx - h * beta.cos() / 2.0,
+                                sy - h * beta.sin() / 2.0,
+                                cost + 0.002,
+                            );
+                        }
+                    }
+                    Placement::Horizontal => out.push(self.pos(
+                        sx - w / 2.0,
+                        sy - h / 2.0,
+                        w,
+                        h,
+                        0.0,
+                        cost,
+                        Quadrant::Over,
+                    )),
+                    _ => {}
+                }
+                along += step;
+            }
+        }
+        out.len()
     }
 
     /// FeaturePart::createCandidatesAlongLineNearMidpoint.
@@ -1318,7 +1776,15 @@ impl CandidateContext<'_> {
                     (!reversed && flags & ABOVE_LINE != 0) || (reversed && flags & BELOW_LINE != 0);
                 let below =
                     (!reversed && flags & BELOW_LINE != 0) || (reversed && flags & ABOVE_LINE != 0);
-                if above {
+                if above
+                    && self.zone_contains(
+                        sx + beta.cos() * dist,
+                        sy + beta.sin() * dist,
+                        w,
+                        h,
+                        angle,
+                    )
+                {
                     let c = cost + if reversed { 0.001 } else { 0.0 };
                     out.push(self.pos(
                         sx + beta.cos() * dist,
@@ -1330,7 +1796,15 @@ impl CandidateContext<'_> {
                         Quadrant::Over,
                     ));
                 }
-                if below {
+                if below
+                    && self.zone_contains(
+                        sx - beta.cos() * (dist + h),
+                        sy - beta.sin() * (dist + h),
+                        w,
+                        h,
+                        angle,
+                    )
+                {
                     let c = cost + if reversed { 0.0 } else { 0.001 };
                     out.push(self.pos(
                         sx - beta.cos() * (dist + h),
@@ -1342,7 +1816,15 @@ impl CandidateContext<'_> {
                         Quadrant::Over,
                     ));
                 }
-                if flags & ON_LINE != 0 {
+                if flags & ON_LINE != 0
+                    && self.zone_contains(
+                        sx - h * beta.cos() / 2.0,
+                        sy - h * beta.sin() / 2.0,
+                        w,
+                        h,
+                        angle,
+                    )
+                {
                     out.push(self.pos(
                         sx - h * beta.cos() / 2.0,
                         sy - h * beta.sin() / 2.0,
@@ -1637,6 +2119,13 @@ impl CandidateContext<'_> {
                     cost += 0.002;
                 }
                 lp.cost = cost;
+                // Every character must lie in the permissible zone.
+                if self.lf.permissible_zone.is_some()
+                    && !(self.zone_contains_quad(&std::array::from_fn(|i| (lp.x[i], lp.y[i])))
+                        && lp.next.iter().all(|q| self.zone_contains_quad(&q.quad())))
+                {
+                    continue;
+                }
                 if backup_only {
                     backup = Some(lp);
                 } else {
@@ -1648,6 +2137,47 @@ impl CandidateContext<'_> {
         if let Some(b) = backup {
             out.push(b);
         }
+    }
+}
+
+/// QgsLineString::visitPointsByRegularDistance: points every `distance` along the line, with
+/// the segment they fall on.
+fn visit_points_by_regular_distance(
+    line: &[Pt],
+    distance: f64,
+    mut visit: impl FnMut(f64, f64, Pt, Pt),
+) {
+    if distance < 0.0 || line.is_empty() {
+        return;
+    }
+    let mut prev = line[0];
+    if near_eps(distance, 0.0, 4.0 * f64::EPSILON) {
+        visit(prev.0, prev.1, prev, prev);
+        return;
+    }
+    let mut traversed = 0.0;
+    let mut next = distance;
+    let eps = 4.0 * next * f64::EPSILON;
+    for &this in &line[1..] {
+        let seg = (this.0 - prev.0).hypot(this.1 - prev.1);
+        while next < traversed + seg || near_eps(next, traversed + seg, eps) {
+            let d = (next - traversed).min(seg);
+            // QgsGeometryUtilsBase::pointOnLineWithDistance
+            let (dx, dy) = (this.0 - prev.0, this.1 - prev.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            let (px, py) = if near_eps(len, 0.0, 4.0 * f64::EPSILON) {
+                prev
+            } else {
+                {
+                    let scale = d / len;
+                    (prev.0 + dx * scale, prev.1 + dy * scale)
+                }
+            };
+            visit(px, py, prev, this);
+            next += distance;
+        }
+        traversed += seg;
+        prev = this;
     }
 }
 
@@ -2299,25 +2829,50 @@ impl Pal {
                 }
             }
             Kind::Polygon => {
-                let (cx, cy) = shape::centroid(&part.shape);
-                let (cx, cy) = if layer.centroid_inside && !part.contains_point((cx, cy)) {
-                    point_on_surface(&part.shape).unwrap_or((cx, cy))
+                // FeaturePart::createCandidates, polygon case.
+                let (lw, lh) = lf.size;
+                let allow_out = lf.polygon_flags & 1 != 0;
+                let allow_in = lf.polygon_flags & 2 != 0;
+                let per_unit2 =
+                    self.settings.candidates_polygon_per_cm2 / self.map_units_per_cm.powi(2);
+                let max_polygon = layer.max_polygon_candidates();
+                let b = &part.bbox;
+                if (allow_out && !allow_in) || layer.arrangement == Placement::OutsidePolygons {
+                    ctx.outside_polygon(&mut out, max_polygon, per_unit2);
+                } else if allow_out
+                    && ((b.xmax - b.xmin).abs() < lw || (b.ymax - b.ymin).abs() < lh)
+                {
+                    // Cannot fit inside: only outside.
+                    ctx.outside_polygon(&mut out, max_polygon, per_unit2);
                 } else {
-                    (cx, cy)
-                };
-                match layer.arrangement {
-                    Placement::AroundPoint => {
-                        if near(lf.dist_label, 0.0) {
-                            ctx.centered_over_point(cx, cy, &mut out, angle);
+                    if allow_in {
+                        let centroid = || {
+                            let (cx, cy) = shape::centroid(&part.shape);
+                            if layer.centroid_inside && !part.contains_point((cx, cy)) {
+                                point_on_surface(&part.shape).unwrap_or((cx, cy))
+                            } else {
+                                (cx, cy)
+                            }
+                        };
+                        match layer.arrangement {
+                            Placement::AroundPoint => {
+                                let (cx, cy) = centroid();
+                                if near(lf.dist_label, 0.0) {
+                                    ctx.centered_over_point(cx, cy, &mut out, angle);
+                                }
+                                ctx.around_point(cx, cy, &mut out, angle, max_point);
+                            }
+                            Placement::OverPoint => {
+                                let (cx, cy) = centroid();
+                                ctx.over_point(cx, cy, &mut out, angle)
+                            }
+                            _ => {
+                                ctx.for_polygon(&mut out, max_polygon, per_unit2);
+                            }
                         }
-                        ctx.around_point(cx, cy, &mut out, angle, max_point);
                     }
-                    Placement::OverPoint => ctx.over_point(cx, cy, &mut out, angle),
-                    _ => {
-                        tracing::debug!(
-                            "polygon label placement {:?} not implemented yet",
-                            layer.arrangement
-                        );
+                    if allow_out {
+                        ctx.outside_polygon(&mut out, max_polygon, per_unit2);
                     }
                 }
             }
@@ -2712,6 +3267,62 @@ impl Pal {
     }
 }
 
+/// CostCalculator::calculatePolygonRingDistance: squared distance from the candidate's centre
+/// to the nearest of the exterior ring, the map extent's outline and the holes.
+fn polygon_ring_distance(c: &LabelPosition, part: &Part, bbx: &[f64; 4], bby: &[f64; 4]) -> f64 {
+    let p = ((c.x[0] + c.x[2]) / 2.0, (c.y[0] + c.y[2]) / 2.0);
+    let extent: Vec<Pt> = (0..5).map(|i| (bbx[i % 4], bby[i % 4])).collect();
+    let mut d = part.min_dist2(p).min(shape::min_dist2_to_line(&extent, p));
+    for h in &part.holes {
+        d = d.min(h.min_dist2(p));
+    }
+    d
+}
+
+/// CostCalculator::calculateCandidatePolygonRingDistanceCosts: + 0..0.002, farthest from the
+/// rings best.
+fn polygon_ring_distance_costs(
+    cands: &mut [LabelPosition],
+    part: &Part,
+    bbx: &[f64; 4],
+    bby: &[f64; 4],
+) {
+    let d: Vec<f64> = cands
+        .iter()
+        .map(|c| polygon_ring_distance(c, part, bbx, bby))
+        .collect();
+    let min = d.iter().copied().fold(f64::MAX, f64::min);
+    let max = d.iter().copied().fold(f64::MIN, f64::max);
+    let range = max - min;
+    if range <= 1e-9 {
+        return;
+    }
+    let norm = 0.0020 / range;
+    for (c, d) in cands.iter_mut().zip(d) {
+        c.cost += 0.002 - (d - min) * norm;
+    }
+}
+
+/// CostCalculator::calculateCandidatePolygonCentroidDistanceCosts: + 0..0.001, nearest to
+/// the polygon's centroid best.
+fn polygon_centroid_distance_costs(cands: &mut [LabelPosition], part: &Part) {
+    let (cx, cy) = shape::centroid(&part.shape);
+    let d: Vec<f64> = cands
+        .iter()
+        .map(|c| (cx - (c.x[0] + c.x[2]) / 2.0).hypot(cy - (c.y[0] + c.y[2]) / 2.0))
+        .collect();
+    let min = d.iter().copied().fold(f64::MAX, f64::min);
+    let max = d.iter().copied().fold(f64::MIN, f64::max);
+    let range = max - min;
+    if range <= 1e-9 {
+        return;
+    }
+    let norm = 0.001 / range;
+    for (c, d) in cands.iter_mut().zip(d) {
+        c.cost += (d - min) * norm;
+    }
+}
+
 /// CostCalculator::finalizeCandidatesCosts.
 fn finalize_costs(
     cands: &mut Vec<LabelPosition>,
@@ -2743,7 +3354,8 @@ fn finalize_costs(
     cands.truncate(stop);
     if part.kind == Kind::Polygon && matches!(arrangement, Placement::Free | Placement::Horizontal)
     {
-        // TODO: polygon ring/centroid distance costs (used with free/horizontal placement)
+        polygon_ring_distance_costs(cands, part, bbx, bby);
+        polygon_centroid_distance_costs(cands, part);
     }
     // FeaturePart::addSizePenalty
     let size_cost = match part.kind {
