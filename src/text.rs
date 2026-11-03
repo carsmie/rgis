@@ -18,7 +18,7 @@ use crate::render::FillNonEmpty;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use harfrust::{ShapeOptions, ShaperData, UnicodeBuffer};
+use harfrust::{ShapeOptions, ShaperFont};
 use parking_lot::Mutex;
 use resvg::usvg::fontdb;
 use skrifa::instance::{Location, Size};
@@ -105,7 +105,7 @@ fn coretext_instance_weight(name: &str) -> Option<u16> {
 struct Face {
     data: Arc<Vec<u8>>,
     index: u32,
-    shaper: ShaperData,
+    shaper: harfrust::Font,
     upem: f64,
     axes: Vec<String>,
     /// Named instances at default width/optical size: (Qt weight, `wght` coordinate).
@@ -279,7 +279,8 @@ fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
             .collect();
         Face {
             instances,
-            shaper: ShaperData::new(&font),
+            shaper: harfrust::Font::new(data.clone() as Arc<dyn AsRef<[u8]> + Send + Sync>, index)
+                .expect("font parsed before"),
             upem: font
                 .metrics(Size::unscaled(), skrifa::instance::LocationRef::default())
                 .units_per_em as f64,
@@ -303,14 +304,14 @@ fn trak_units(font: &FontRef, ptem: f32) -> f64 {
         return 0.0;
     };
     let data = trak.offset_data();
-    let Ok(sizes) = h.size_table(data) else {
+    let Some(sizes) = h.size_table(data) else {
         return 0.0;
     };
     let n = sizes.len();
     let Some(entry) = h.track_table().iter().find(|t| t.track().to_f32() == 0.0) else {
         return 0.0;
     };
-    let Ok(values) = entry.per_size_values(data, n as u16) else {
+    let Some(values) = entry.per_size_values(data, n as u16) else {
         return 0.0;
     };
     let size = |i: usize| sizes[i].get().to_f32();
@@ -508,37 +509,33 @@ impl SizedFont {
         no_ligatures: bool,
     ) -> Vec<(u32, f64, f64, u32)> {
         struct EngineAdvances<'a>(&'a SizedFont);
-        impl harfrust::font::FontFuncs for EngineAdvances<'_> {
-            fn advance_width(
-                &mut self,
-                _: &harfrust::font::BuiltinFontFuncs,
-                glyph: GlyphId,
-            ) -> i32 {
+        impl harfrust::FontFuncs for EngineAdvances<'_> {
+            fn glyph_h_advance(&self, _: &ShaperFont, glyph: GlyphId) -> i32 {
                 self.0.engine_adv64(glyph.to_u32()) as i32
             }
         }
-        let font = self.face.font();
-        let shaper = self.face.shaper.shaper(&font).build();
-        let mut buf = UnicodeBuffer::new();
+        let mut buf = harfrust::Buffer::new();
         buf.push_str(text);
         buf.guess_segment_properties();
-        let mut funcs = EngineAdvances(self);
+        let funcs = EngineAdvances(self);
         static NO_LIGATURES: LazyLock<Vec<harfrust::Feature>> = LazyLock::new(|| {
             ["-liga", "-clig", "-dlig", "-hlig"]
                 .iter()
                 .filter_map(|f| f.parse().ok())
                 .collect()
         });
-        let mut opts = ShapeOptions::new()
-            .point_size(Some(ptem as f32))
-            .scale(Some(self.px * 64));
+        let mut font = ShaperFont::new(&self.face.shaper).with_scale(self.px * 64);
+        if engine {
+            font.set_font_funcs(Some(&funcs));
+        }
+        let mut opts = ShapeOptions::new().point_size(Some(ptem as f32));
         if no_ligatures {
             opts = opts.features(&NO_LIGATURES);
         }
-        if engine {
-            opts = opts.font_funcs(Some(&mut funcs));
+        if harfrust::shape(&font, &mut buf, opts).is_err() {
+            return Vec::new();
         }
-        let out = shaper.shape(buf, opts);
+        let out = &buf;
         out.glyph_infos()
             .iter()
             .zip(out.glyph_positions())
@@ -561,7 +558,7 @@ impl SizedFont {
                 let units = match font
                     .hvar()
                     .ok()
-                    .and_then(|h| h.advance_width_delta(glyph, self.location.coords()).ok())
+                    .and_then(|h| h.advance_delta(glyph, self.location.coords()))
                 {
                     Some(delta) => base + delta.to_f64(),
                     None => font

@@ -29,31 +29,31 @@ fn main() {
         "unscaled ascent {} descent {} leading {} cap {:?}",
         mu.ascent, mu.descent, mu.leading, mu.cap_height
     );
-    let data_ = harfrust::ShaperData::new(&font);
-    let inst = harfrust::ShaperInstance::from_variations(
-        &font,
-        [
-            harfrust::Variation {
-                tag: harfrust::Tag::new(b"wght"),
-                value: wght,
-            },
-            harfrust::Variation {
-                tag: harfrust::Tag::new(b"opsz"),
-                value: opsz,
-            },
-        ],
-    );
-    let shaper = data_.shaper(&font).instance(Some(&inst)).build();
+    let hb_font = harfrust::Font::new(
+        std::sync::Arc::new(data.clone()) as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+        0,
+    )
+    .unwrap()
+    .instance_builder()
+    .variations([("wght", wght), ("opsz", opsz)])
+    .build();
+    let shaper = harfrust::ShaperFont::new(&hb_font);
     let upem = m.units_per_em as f32;
     for t in &a[5..] {
-        let mut buf = harfrust::UnicodeBuffer::new();
+        let mut buf = harfrust::Buffer::new();
         buf.push_str(t);
         buf.guess_segment_properties();
         let ptem: f32 = std::env::var("PTEM")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(px);
-        let out = shaper.shape(buf, harfrust::ShapeOptions::new().point_size(Some(ptem)));
+        harfrust::shape(
+            &shaper,
+            &mut buf,
+            harfrust::ShapeOptions::new().point_size(Some(ptem)),
+        )
+        .unwrap();
+        let out = &buf;
         let gm = font.glyph_metrics(Size::new(px), &loc);
         let raw: Vec<String> = out
             .glyph_infos()
