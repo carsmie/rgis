@@ -666,6 +666,71 @@ fn add_line(
     }
 }
 
+/// Pixel vertices with add_line's sub-half-pixel culling, so offsetting doesn't mitre noise.
+fn culled_px(l: &LineString<f64>, to_px: &dyn Fn(&Coord<f64>) -> (f32, f32)) -> Vec<(f64, f64)> {
+    let n = l.0.len();
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(n);
+    for (i, c) in l.0.iter().enumerate() {
+        let (x, y) = to_px(c);
+        let p = (x as f64, y as f64);
+        if let Some(q) = out.last()
+            && i + 1 < n
+            && (p.0 - q.0).abs() < 0.5
+            && (p.1 - q.1).abs() < 0.5
+        {
+            continue;
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// Ring buffered by -`off` (GEOS, as QgsSymbolLayerUtils::offsetLine): + shrinks it.
+/// None when it shrinks away (GEOS returns an empty buffer).
+fn offset_px_ring(pts: &[(f64, f64)], off: f64) -> Option<Vec<(f64, f64)>> {
+    let a = geom::signed_area(pts);
+    if a == 0.0 || pts.len() < 4 {
+        return None;
+    }
+    // offset_ring shifts left; for a positive-area ring left is inside.
+    let o = geom::offset_ring(pts, off * a.signum(), 2.0);
+    if off < 0.0 {
+        return Some(o); // growing never collapses
+    }
+    // Shrunk past its inradius the mitre curve flips through the ring (winding kept): then
+    // no sampled vertex keeps ~offset distance from the ring.
+    let d2 = |p: (f64, f64)| {
+        pts.windows(2)
+            .map(|w| seg_dist2(p, w[0], w[1]))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let lim = (0.9 * off).powi(2);
+    let step = (o.len() / 32).max(1);
+    o.iter().step_by(step).any(|&p| d2(p) >= lim).then_some(o)
+}
+
+fn seg_dist2(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let l2 = dx * dx + dy * dy;
+    let t = if l2 == 0.0 {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2).clamp(0.0, 1.0)
+    };
+    let (x, y) = (a.0 + t * dx - p.0, a.1 + t * dy - p.1);
+    x * x + y * y
+}
+
+fn add_px_line(pb: &mut PathBuilder, pts: &[(f64, f64)]) {
+    for (i, p) in pts.iter().enumerate() {
+        if i == 0 {
+            pb.move_to(p.0 as f32, p.1 as f32);
+        } else {
+            pb.line_to(p.0 as f32, p.1 as f32);
+        }
+    }
+}
+
 fn polygons(g: &Geometry<f64>) -> Vec<&geo_types::Polygon<f64>> {
     match g {
         Geometry::Polygon(p) => vec![p],
@@ -943,13 +1008,35 @@ pub fn draw_symbol(
                     ),
                 }
             }
-            SymbolLayer::SimpleLine { stroke, .. } => {
+            SymbolLayer::SimpleLine { stroke, offset } => {
                 if !stroke.visible {
                     continue;
                 }
                 let mut pb = PathBuilder::new();
-                for l in lines(g) {
-                    add_line(&mut pb, l, to_px, false);
+                let off = offset.px(u);
+                if off == 0.0 {
+                    for l in lines(g) {
+                        add_line(&mut pb, l, to_px, false);
+                    }
+                } else {
+                    // QgsSymbolLayerUtils::offsetLine: lines offsetCurve (+ = left); polygon
+                    // rings buffered so + puts the band inside the area (holes grow).
+                    if matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)) {
+                        for p in polygons(g) {
+                            for (i, r) in geom::polygon_rings(p).enumerate() {
+                                let d = if i == 0 { off } else { -off };
+                                if let Some(o) = offset_px_ring(&culled_px(r, to_px), d) {
+                                    add_px_line(&mut pb, &o);
+                                    pb.close();
+                                }
+                            }
+                        }
+                    } else {
+                        for l in lines(g) {
+                            let o = geom::offset_polyline(&culled_px(l, to_px), off, 2.0);
+                            add_px_line(&mut pb, &o);
+                        }
+                    }
                 }
                 if let Some(path) = pb.finish() {
                     pm.stroke_path(
@@ -1993,7 +2080,9 @@ fn line_bleed(line: &Symbol, u: &RenderUnits) -> f64 {
     line.layers
         .iter()
         .map(|l| match &l.kind {
-            SymbolLayer::SimpleLine { stroke } => stroke.width.px(u) / 2.0,
+            SymbolLayer::SimpleLine { stroke, offset } => {
+                stroke.width.px(u) / 2.0 + offset.px(u).abs()
+            }
             _ => 0.0,
         })
         .fold(0.0, f64::max)
@@ -2479,6 +2568,34 @@ pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_line_offset_goes_into_rings_either_winding() {
+        let sq = vec![
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (0.0, 10.0),
+            (0.0, 0.0),
+        ];
+        let rev: Vec<_> = sq.iter().rev().copied().collect();
+        for r in [&sq, &rev] {
+            let o = offset_px_ring(r, 2.0).expect("not collapsed");
+            assert!(
+                o.iter()
+                    .all(|p| (1.99..=8.01).contains(&p.0) && (1.99..=8.01).contains(&p.1))
+            );
+            // Negative offset grows the ring.
+            let o = offset_px_ring(r, -2.0).expect("grown");
+            assert!(o.iter().all(|p| p.0 < 0.01 || p.0 > 9.99));
+        }
+        // Thinner than twice the offset: GEOS buffer is empty, nothing drawn.
+        assert!(offset_px_ring(&sq, 6.0).is_none());
+        // Acute apex: inside joins meet at the mitre point, nothing pokes past the corner.
+        let tri = vec![(0.0, 0.0), (10.0, 0.0), (5.0, 20.0), (0.0, 0.0)];
+        let o = offset_px_ring(&tri, 1.0).unwrap();
+        assert!(o.iter().all(|p| p.1 < 20.0 && p.1 > 0.0), "{o:?}");
+    }
 
     fn near(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9

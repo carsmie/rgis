@@ -138,6 +138,8 @@ pub enum SymbolLayer {
     },
     SimpleLine {
         stroke: Stroke,
+        /// QgsLineSymbolLayer::offset: + = left of lines, into the polygon area (holes grow).
+        offset: Size,
     },
     /// QgsShapeburstFillSymbolLayer with its two-colour gradient: colour by distance from the
     /// polygon boundary (color1 at the edge, color2 at `max_distance` or the shape's centre).
@@ -395,7 +397,7 @@ impl Layer {
                 }
                 stroke_dd(stroke);
             }
-            SymbolLayer::SimpleLine { stroke } => {
+            SymbolLayer::SimpleLine { stroke, .. } => {
                 // Line layers use strokeColor / strokeWidth for their pen.
                 stroke_dd(stroke);
             }
@@ -787,6 +789,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     "line_style",
                     0.26,
                 ),
+                offset: Size::new(g("offset"), g("offset_unit"), 0.0),
             },
             "LinePatternFill" => {
                 let Some(sub) = l.children().find(|c| c.has_tag_name("symbol")) else {

@@ -740,11 +740,29 @@ pub fn to_gml3(g: &Geometry<f64>, srs: &str, precision: usize, swap: bool) -> St
     format!("<gml:{0} srsName=\"{srs}\">{1}</gml:{0}>", body.0, body.1)
 }
 
+/// Shoelace area of a closed ring (first == last); sign follows vertex order.
+pub fn signed_area(pts: &[(f64, f64)]) -> f64 {
+    pts.windows(2)
+        .map(|w| w[0].0 * w[1].1 - w[1].0 * w[0].1)
+        .sum::<f64>()
+        / 2.0
+}
+
 /// A polyline (pixel coordinates) moved `dist` to its left, like GEOS offsetCurve with
 /// mitre joins and mitre limit 2 as QgsSymbolLayerUtils::offsetLine asks for: each
 /// segment shifted along its normal, neighbours joined at their mitre point, cut to a
 /// bevel where the mitre would reach beyond `limit * |dist|`. Closed lines stay closed.
 pub fn offset_polyline(pts: &[(f64, f64)], dist: f64, limit: f64) -> Vec<(f64, f64)> {
+    offset_impl(pts, dist, limit, false)
+}
+
+/// offset_polyline for a polygon ring as GEOS buffer cuts it: joins on the inside of a
+/// turn always meet at the mitre point (no bevel overshooting the corner).
+pub fn offset_ring(pts: &[(f64, f64)], dist: f64, limit: f64) -> Vec<(f64, f64)> {
+    offset_impl(pts, dist, limit, true)
+}
+
+fn offset_impl(pts: &[(f64, f64)], dist: f64, limit: f64, inner_mitre: bool) -> Vec<(f64, f64)> {
     let mut p: Vec<(f64, f64)> = pts.to_vec();
     p.dedup();
     if p.len() < 2 || dist == 0.0 {
@@ -778,7 +796,9 @@ pub fn offset_polyline(pts: &[(f64, f64)], dist: f64, limit: f64) -> Vec<(f64, f
         let m = (p1.0 + t * d1.0, p1.1 + t * d1.1);
         // Mitre length from the original vertex `v`.
         let mitre = ((m.0 - v.0).powi(2) + (m.1 - v.1).powi(2)).sqrt();
-        if mitre <= limit * dist.abs() {
+        // Inside of the turn (offset side = turn side): the shifted segments cross.
+        let inside = inner_mitre && den * dist > 0.0;
+        if inside || mitre <= limit * dist.abs() {
             out.push(m);
         } else {
             out.push(p2);
