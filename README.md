@@ -197,9 +197,9 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 
 * Labels: free/horizontal polygon placement, outside-polygon placement, the near-straight-
   segment pass of hint-only parallel line labels, curved stretch/vertex modes, word spacing,
-  SVG/marker backgrounds, callouts, shadows, HTML text, line wrapping and label masks are not
-  ported yet. Fonts are matched by fontdb's (typographic) family names, so legacy families such
-  as "Noto Sans Condensed" fall back instead of resolving like fontconfig. Text metrics follow
+  SVG/marker backgrounds, callouts, shadows, HTML text and label masks are not ported yet.
+  Legacy (name ID 1) families such as "Noto Sans Condensed" resolve to their own faces like
+  fontconfig/Qt 6 (nearest weight; a `namedStyle` the family lacks is ignored). Text metrics follow
   Qt's CoreText engine on macOS (verified glyph by glyph) and its FreeType engine on Linux. When a
   project's font is missing on macOS, Qt falls back to the variable system font, whose
   CoreText advances rGIS reproduces to within 1/64 px but not always exactly; with thousands
@@ -211,8 +211,9 @@ byte-identical to the one rendered from local files (14 range requests for 4 MB 
 * Not implemented: diagrams, 3D, print layouts (GetPrint), DXF/PDF output, WMTS/WCS, WFS-T,
   Python server plugins, access control; non-file providers other than PostGIS (WMS, WFS,
   virtual layers, …);
-  GeometryGenerator, MarkerLine, PointPatternFill and other less common symbol layers
-  (skipped with a warning); blend modes and paint effects.
+  GeometryGenerator, PointPatternFill and other less common symbol layers, MarkerLine/HashLine
+  placements other than interval/first/last vertex (skipped with a warning); blend modes and
+  paint effects other than drop/inner shadow and outer glow.
 * PNG output only; GetLegendGraphic PNG has symbol patches without text (use
   `FORMAT=application/json` for titles).
 * The expression engine covers the common subset listed above, not all QGIS functions.

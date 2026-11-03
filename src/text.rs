@@ -136,6 +136,77 @@ fn query(db: &fontdb::Database, family: &str, req: &FontRequest) -> Option<fontd
     })
 }
 
+/// Faces of a legacy family name (name ID 1, e.g. "Noto Sans Condensed") that fontdb hides
+/// behind the typographic one (ID 16, "Noto Sans"). fontconfig/Qt register it as a family of
+/// its own holding just those faces. Only faces whose typographic family prefixes `family`
+/// are read; cached per name.
+fn legacy_family(db: &fontdb::Database, family: &str) -> Vec<fontdb::ID> {
+    static CACHE: LazyLock<Mutex<HashMap<String, Vec<fontdb::ID>>>> =
+        LazyLock::new(Default::default);
+    let key = family.to_lowercase();
+    if let Some(v) = CACHE.lock().get(&key) {
+        return v.clone();
+    }
+    let ids: Vec<_> = db
+        .faces()
+        .filter(|f| {
+            f.families
+                .iter()
+                .any(|(n, _)| key.len() > n.len() && key.starts_with(&n.to_lowercase()))
+        })
+        .filter(|f| {
+            db.with_face_data(f.id, |d, i| {
+                let font = FontRef::from_index(d, i).ok()?;
+                let name = font
+                    .localized_strings(skrifa::string::StringId::FAMILY_NAME)
+                    .english_or_first()?
+                    .to_string();
+                Some(name.eq_ignore_ascii_case(family))
+            })
+            .flatten()
+            .unwrap_or(false)
+        })
+        .map(|f| f.id)
+        .collect();
+    CACHE.lock().insert(key, ids.clone());
+    ids
+}
+
+/// fontdb's (CSS) weight/style matching restricted to `ids`; Qt's nearest-weight pick agrees
+/// on the legacy RIBBI families.
+fn pick_face(db: &fontdb::Database, ids: &[fontdb::ID], req: &FontRequest) -> Option<fontdb::ID> {
+    let faces: Vec<_> = ids.iter().filter_map(|id| db.face(*id)).collect();
+    let italic = |f: &&fontdb::FaceInfo| f.style != fontdb::Style::Normal;
+    let pool: Vec<_> = if faces.iter().any(|f| italic(f) == req.italic) {
+        faces
+            .into_iter()
+            .filter(|f| italic(f) == req.italic)
+            .collect()
+    } else {
+        faces
+    };
+    let w = req.weight as i32;
+    // CSS Fonts 4 §5.2 order: lower = preferred.
+    let rank = |fw: i32| -> (u8, i32) {
+        if fw == w {
+            (0, 0)
+        } else if (400..=500).contains(&w) {
+            match fw {
+                _ if fw > w && fw <= 500 => (1, fw - w),
+                _ if fw < w => (2, w - fw),
+                _ => (3, fw - w),
+            }
+        } else if (w < 400) == (fw < w) {
+            (1, (fw - w).abs())
+        } else {
+            (2, (fw - w).abs())
+        }
+    };
+    pool.iter()
+        .min_by_key(|f| rank(f.weight.0 as i32))
+        .map(|f| f.id)
+}
+
 /// The face Qt would pick: the family if installed, otherwise Qt's fallback (on macOS the
 /// system UI font, `.AppleSystemUIFont`; fontconfig's sans-serif elsewhere).
 fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
@@ -153,8 +224,15 @@ fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case(&req.family))
     });
+    let legacy = if installed {
+        Vec::new()
+    } else {
+        legacy_family(db, &req.family)
+    };
     let mut req = req.clone();
-    if installed && let Some((w, i)) = style_weight(&req.style) {
+    if (installed || !legacy.is_empty())
+        && let Some((w, i)) = style_weight(&req.style)
+    {
         req.weight = w;
         req.italic = i;
     }
@@ -162,7 +240,7 @@ fn resolve_face(req: &FontRequest) -> Option<(Arc<Face>, u16)> {
     let id = (if installed {
         query(db, &req.family, req)
     } else {
-        None
+        pick_face(db, &legacy, req)
     })
     .or_else(|| query(db, &fallback, req))
     .or_else(|| {
@@ -845,6 +923,44 @@ pub fn draw_text(pm: &mut Pixmap, path: &tiny_skia::Path, color: Rgba, opacity: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Legacy name-ID-1 families resolve like Qt 6 + fontconfig (PyQt6 6.12, QGIS 3.40
+    /// updateFontViaStyle emulated, tnt-qgis Noto fonts): QFontMetricsF::horizontalAdvance
+    /// of "Tromsø fjord" at 40 px. Runs only with RGIS_FONT_DIRS holding those fonts.
+    #[test]
+    fn legacy_family_names_resolve_like_qt6() {
+        let req = |family: &str, style: &str, weight: u16, italic: bool| FontRequest {
+            family: family.into(),
+            weight,
+            italic,
+            style: style.into(),
+        };
+        if legacy_family(crate::svg::fontdb(), "Noto Sans Condensed").is_empty() {
+            eprintln!("Noto Sans Condensed not installed; skipped");
+            return;
+        }
+        for (r, want) in [
+            (
+                req("Noto Sans Condensed", "Medium Condensed", 500, false),
+                195.234,
+            ),
+            (
+                req("Noto Sans Condensed", "Medium Condensed Italic", 500, true),
+                179.766,
+            ),
+            (req("Noto Sans Condensed", "Regular", 50, false), 195.234),
+            (req("Noto Sans Condensed", "Condensed", 400, false), 195.234),
+            (req("Noto Sans", "Medium", 500, false), 243.609),
+        ] {
+            let got = font(&r, 40).unwrap().horizontal_advance("Tromsø fjord");
+            assert!(
+                (got - want).abs() < 0.01,
+                "{} {}: {got} vs Qt {want}",
+                r.family,
+                r.style
+            );
+        }
+    }
 
     /// Glyph positions Qt 6 reports for "Sans Serif" Bold at 19 px on macOS
     /// (QTextLayout::glyphRuns, PyQt6, offscreen platform).

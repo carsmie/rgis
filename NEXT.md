@@ -29,8 +29,7 @@ Written 2026-10-18 when moving development from macOS to Windows. Read README.md
    Kartverket topo projects (README there). 2026-10-19, Oslo z11–15: place names and road
    numbers 0.0–0.3 %, street names 0.1–2.6 % (all 23 streets on the same features as QGIS at
    z14; two still at another candidate — solver, equal-cost neighbours), house numbers 1.4 %.
-   Open: legacy font family names (`Noto Sans Condensed` → index fontconfig-style family
-   names, name ID 1, in `text::resolve_face`), the hint-only near-straight-segments pass
+   Open: the hint-only near-straight-segments pass
    (`createCandidatesAlongLineNearStraightSegments`), GetStyles, raster renderers (hillshade,
    paletted), MarkerLine/HashLine/ShapeburstFill, inline `base64:` SVGs.
    `tools/topo/qgis_labels.py` dumps QGIS's placed labels (PyQGIS), rGIS logs its own with
@@ -42,8 +41,8 @@ Written 2026-10-18 when moving development from macOS to Windows. Read README.md
 3. Test projects to verify with: find layers with `placement="5|7|8"` in
    `QGIS/tests/testdata/qgis_server/*.qgs`; if none, make copies of a polygon project
    with labels enabled (see `make_rect_project.py` idea below).
-4. Label extras: line wrapping (`autoWrapLength`, `QgsStringUtils::wordWrap`), shadows,
-   callouts, `formatNumbers`, more data-defined properties (font, buffer).
+4. Label extras: shadows, callouts, `formatNumbers`, more data-defined properties (font,
+   buffer). (Line wrapping done 2026-11-03: `labeling::word_wrap`, 108 PyQGIS cases.)
 5. Stretched GetMap (BBOX aspect ≠ WIDTH/HEIGHT): Qt `SmoothTransformation` area averaging
    instead of bilinear (`render::scale`); explains the remaining 0.77 % / 0.87 % layers.
 6. Housekeeping: GitHub may still serve the pre-rewrite commit f429e75 by SHA (ask GitHub support or

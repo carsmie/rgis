@@ -923,7 +923,7 @@ pub fn draw_symbol(
                 max_distance,
                 ignore_rings,
                 offset,
-                ..
+                blur,
             } => {
                 let off = (offset.0.px(u) as f32, offset.1.px(u) as f32);
                 for p in polygons(g) {
@@ -940,6 +940,7 @@ pub fn draw_symbol(
                         *ignore_rings,
                         off,
                         sym.opacity,
+                        *blur,
                     );
                 }
             }
@@ -1069,6 +1070,7 @@ pub fn draw_symbol(
                 let avg = average_over.px(u) / 2.0;
                 let parts = lines(g);
                 let n_parts = parts.len();
+                let mut final_vertex = None;
                 for (part, l) in parts.into_iter().enumerate() {
                     let pts: Vec<(f64, f64)> =
                         l.0.iter()
@@ -1087,17 +1089,32 @@ pub fn draw_symbol(
                     } else {
                         pts
                     };
-                    // QgsTemplatedLineSymbolLayerBase::renderPolyline order: interval, first, last.
+                    // QgsTemplatedLineSymbolLayerBase::renderPolyline order: interval, first, last
+                    // (last before first on an offset line).
                     let mut placed = vec![];
                     if *on_interval {
                         placed.extend(interval_points(&pts, iv, along, avg));
                     }
-                    if *on_first && (*every_part || part == 0) {
-                        placed.push((pts[0], end_angle(&pts, true)));
+                    let first = (*on_first && (*every_part || part == 0))
+                        .then(|| vertex_along(&pts, true, along))
+                        .flatten();
+                    // Not on every part: QGIS defers the last marker to stopFeatureRender, drawn
+                    // at mFinalVertex (the latest vertex marker found in the feature).
+                    let last = on_last.then(|| vertex_along(&pts, false, along)).flatten();
+                    let (a, b) = if off != 0.0 {
+                        (last, first)
+                    } else {
+                        (first, last)
+                    };
+                    for (m, is_last) in [(a, off != 0.0), (b, off == 0.0)] {
+                        let Some(m) = m else { continue };
+                        final_vertex = Some(m);
+                        if !is_last || *every_part {
+                            placed.push(m);
+                        }
                     }
-                    // Not on every part: QGIS defers it to the end of the feature (last part).
-                    if *on_last && (*every_part || part + 1 == n_parts) {
-                        placed.push((pts[pts.len() - 1], end_angle(&pts, false)));
+                    if !*every_part && *on_last && part + 1 == n_parts {
+                        placed.extend(final_vertex);
                     }
                     for ((x, y), line_angle) in placed {
                         let a = if *rotate { line_angle } else { 0.0 };
@@ -1607,7 +1624,7 @@ fn stack_blur(im: &mut [[u8; 4]], w: usize, h: usize, radius: i32) {
     }
 }
 
-/// QgsShapeburstFillSymbolLayer::renderPolygon (no blur): a squared-distance transform
+/// QgsShapeburstFillSymbolLayer::renderPolygon: a squared-distance transform
 /// (Felzenszwalb & Huttenlocher, as QGIS) of the polygon drawn white with a black hairline
 /// on black, shaded with the two-colour gradient and clipped by the polygon's coverage.
 #[allow(clippy::too_many_arguments)]
@@ -1620,6 +1637,7 @@ fn draw_shapeburst(
     ignore_rings: bool,
     offset: (f32, f32),
     opacity: f64,
+    blur: i32,
 ) {
     const INF: f64 = 1e20;
     let Some(outer) = rings.first().filter(|r| r.len() >= 3) else {
@@ -1629,7 +1647,8 @@ fn draw_shapeburst(
     for &(x, y) in outer {
         (l, t, r, b) = (l.min(x), t.min(y), r.max(x), b.max(y));
     }
-    let side = 4 + 2 * 4; // 4 + (blur + 2) * 4 with no blur
+    let blur = blur.max(0);
+    let side = 4 + (blur + 2) * 4;
     let (w, h) = (
         (r - l).round() as i32 + 2 * side,
         (b - t).round() as i32 + 2 * side,
@@ -1714,35 +1733,68 @@ fn draw_shapeburst(
         Some(_) => 0.0,
         None => dt.iter().cloned().fold(0.0, f64::max).sqrt(),
     };
-    let alpha_px = alpha.pixels().to_vec();
-    for (i, px) in fill.pixels_mut().iter_mut().enumerate() {
-        let sq = dt[i];
-        let v = if max_dist > 0.0 {
-            if sq > 0.0 {
-                (sq.sqrt() / max_dist).min(1.0)
-            } else {
-                0.0
-            }
-        } else {
+    // Gradient position of a squared distance (dtArrayToQImage).
+    let shade = |sq: f64| {
+        if max_dist <= 0.0 {
             1.0
-        };
-        let c = tiny_skia::ColorU8::from_rgba(
-            lerp8(c1.0, c2.0, v),
-            lerp8(c1.1, c2.1, v),
-            lerp8(c1.2, c2.2, v),
-            lerp8(c1.3, c2.3, v),
-        )
-        .premultiply();
-        // CompositionMode_DestinationIn with the polygon coverage (and the opacity).
-        let a = alpha_px[i].alpha() as f64 / 255.0 * opacity;
-        let m = |v: u8| (v as f64 * a).round() as u8;
-        *px = tiny_skia::PremultipliedColorU8::from_rgba(
-            m(c.red()),
-            m(c.green()),
-            m(c.blue()),
-            m(c.alpha()),
-        )
-        .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        } else if sq > 0.0 {
+            (sq.sqrt() / max_dist).min(1.0)
+        } else {
+            0.0
+        }
+    };
+    let alpha_px = alpha.pixels().to_vec();
+    if blur > 0 {
+        // dtArrayToQImage, multiplyOpacity (DestinationIn fill, alpha int(255·f)), stackBlur,
+        // then DestinationIn with the coverage: Qt BYTE_MUL rounding at each step.
+        let op = (255.0 * opacity) as u32;
+        let mut im: Vec<[u8; 4]> = dt
+            .iter()
+            .map(|&sq| {
+                let v = shade(sq);
+                let c = tiny_skia::ColorU8::from_rgba(
+                    lerp8(c1.0, c2.0, v),
+                    lerp8(c1.1, c2.1, v),
+                    lerp8(c1.2, c2.2, v),
+                    lerp8(c1.3, c2.3, v),
+                )
+                .premultiply();
+                let px = [c.red(), c.green(), c.blue(), c.alpha()];
+                if opacity < 1.0 {
+                    px.map(|v| byte_mul(v, op))
+                } else {
+                    px
+                }
+            })
+            .collect();
+        stack_blur(&mut im, wu, hu, blur);
+        for (i, px) in fill.pixels_mut().iter_mut().enumerate() {
+            let a = alpha_px[i].alpha() as u32;
+            let [r, g, b, al] = im[i].map(|v| byte_mul(v, a));
+            *px = tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, al)
+                .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        }
+    } else {
+        for (i, px) in fill.pixels_mut().iter_mut().enumerate() {
+            let v = shade(dt[i]);
+            let c = tiny_skia::ColorU8::from_rgba(
+                lerp8(c1.0, c2.0, v),
+                lerp8(c1.1, c2.1, v),
+                lerp8(c1.2, c2.2, v),
+                lerp8(c1.3, c2.3, v),
+            )
+            .premultiply();
+            // CompositionMode_DestinationIn with the polygon coverage (and the opacity).
+            let a = alpha_px[i].alpha() as f64 / 255.0 * opacity;
+            let m = |v: u8| (v as f64 * a).round() as u8;
+            *px = tiny_skia::PremultipliedColorU8::from_rgba(
+                m(c.red()),
+                m(c.green()),
+                m(c.blue()),
+                m(c.alpha()),
+            )
+            .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+        }
     }
     pm.draw_pixmap(
         (l + offset.0 - side as f32).round() as i32,
@@ -1752,6 +1804,12 @@ fn draw_shapeburst(
         SkTransform::identity(),
         None,
     );
+}
+
+/// Qt's BYTE_MUL on one channel: c · a / 255 as qdrawhelper rounds it.
+fn byte_mul(c: u8, a: u32) -> u8 {
+    let t = c as u32 * a;
+    ((t + (t >> 8) + 0x80) >> 8) as u8
 }
 
 /// QgsGradientColorRamp::color for two colours: a channel interpolated as floats, stored
@@ -1897,6 +1955,37 @@ fn end_angle(pts: &[(f64, f64)], first: bool) -> f64 {
             .map(|p| Seg::new(*p, last))
     };
     seg.map_or(0.0, |s| s.angle().to_degrees())
+}
+
+/// QgsTemplatedLineSymbolLayerBase::renderOffsetVertexAlongLine: the first / last vertex,
+/// moved `dist` px into the line (none if the line is shorter). Walking back from the last
+/// vertex builds reversed segments, so QGIS turns those markers by 180°; kept.
+fn vertex_along(pts: &[(f64, f64)], first: bool, dist: f64) -> Option<((f64, f64), f64)> {
+    let v = if first { 0 } else { pts.len() - 1 };
+    // Only a positive offset walks the line (renderPolylineVertex: offsetAlongLine > 0).
+    if dist <= 0.0 {
+        return Some((pts[v], end_angle(pts, first)));
+    }
+    let order: Box<dyn Iterator<Item = &(f64, f64)>> = if first {
+        Box::new(pts.iter().skip(1))
+    } else {
+        Box::new(pts.iter().rev().skip(1))
+    };
+    let mut prev = pts[v];
+    let mut left = dist.abs();
+    for &pt in order {
+        if pt == prev {
+            continue;
+        }
+        let l = Seg::new(prev, pt);
+        if left < l.length {
+            let (dx, dy) = l.diff_for_interval(left);
+            return Some(((prev.0 + dx, prev.1 + dy), l.angle().to_degrees()));
+        }
+        left -= l.length;
+        prev = pt;
+    }
+    None
 }
 
 /// QgsTemplatedLineSymbolLayerBase::collectOffsetPoints.

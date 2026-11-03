@@ -266,6 +266,24 @@ impl Engine {
             s.wrap_char.as_str()
         };
         let lines: Vec<&str> = label.split(wrap).flat_map(|l| l.split('\n')).collect();
+        // QgsPalLabeling::splitToLines: auto wrap each manual line (data-defined length first).
+        let wrap_len = self
+            .dd(s, "AutoWrapLength", ctx)
+            .and_then(|v| num(&v))
+            .map_or(s.auto_wrap_length, |v| v as i64);
+        let wrapped: Vec<String>;
+        let lines: Vec<&str> = if wrap_len != 0 {
+            wrapped = lines
+                .iter()
+                .flat_map(|l| {
+                    let w = word_wrap(l, wrap_len, s.use_max_line_length);
+                    w.split('\n').map(str::to_string).collect::<Vec<_>>()
+                })
+                .collect();
+            wrapped.iter().map(String::as_str).collect()
+        } else {
+            lines
+        };
         // QgsPalLayerSettings::dataDefinedValEval FontLetterSpacing: in the font size unit,
         // converted to painter units (QFont::AbsoluteSpacing).
         let letter_spacing = self
@@ -1026,4 +1044,135 @@ fn marker_bounds(
 /// Project-wide labeling engine settings.
 pub fn engine_settings(project: &crate::project::Project) -> EngineSettings {
     EngineSettings::from_project(|k| project.text_prop(&format!("PAL/{k}")).map(String::from))
+}
+
+/// QgsStringUtils::wordWrap without a custom delimiter: break at whitespace or U+200B so
+/// lines stay within `length` UTF-16 units (`use_max`), else after at least `|length|`.
+/// QString index semantics kept (negative `lastIndexOf` start, negative `mid` length).
+pub fn word_wrap(line: &str, length: i64, use_max: bool) -> String {
+    if line.is_empty() || length == 0 {
+        return line.to_string();
+    }
+    // `[\x{200B}\s]` without UseUnicodePropertiesOption: \s is ASCII whitespace only.
+    let is_delim = |u: u16| u == 0x200B || matches!(u, 0x09..=0x0D | 0x20);
+    // QString::indexOf / lastIndexOf(QRegularExpression, from).
+    let index_of = |u: &[u16], from: i64| -> i64 {
+        let from = if from < 0 {
+            (from + u.len() as i64).max(0)
+        } else {
+            from
+        };
+        // PCRE2 rejects a start offset inside a surrogate pair (BADUTFOFFSET): no match.
+        if (from as usize) < u.len() && (0xDC00..0xE000).contains(&u[from as usize]) {
+            return -1;
+        }
+        (from as usize..u.len())
+            .find(|&i| is_delim(u[i]))
+            .map_or(-1, |i| i as i64)
+    };
+    let last_index_of = |u: &[u16], from: i64| -> i64 {
+        let from = if from < 0 {
+            from + u.len() as i64
+        } else {
+            from
+        };
+        if from < 0 {
+            return -1;
+        }
+        let from = (from as usize).min(u.len().saturating_sub(1));
+        (0..=from)
+            .rev()
+            .find(|&i| is_delim(u[i]))
+            .map_or(-1, |i| i as i64)
+    };
+    // QStringView::mid(pos, n): n < 0 = to the end.
+    let mid = |u: &[u16], pos: i64, n: i64| -> Vec<u16> {
+        let pos = pos.clamp(0, u.len() as i64) as usize;
+        let end = if n < 0 {
+            u.len()
+        } else {
+            (pos + n as usize).min(u.len())
+        };
+        u[pos..end].to_vec()
+    };
+    let mut out: Vec<u16> = Vec::new();
+    let lines: Vec<&str> = line.split('\n').collect();
+    for (i, l) in lines.iter().enumerate() {
+        let u: Vec<u16> = l.encode_utf16().collect();
+        let n = u.len() as i64;
+        if n <= length {
+            out.extend(&u);
+        } else {
+            let (mut cur, mut last_hit) = (0i64, 0i64);
+            // Qt can step backwards on some negative lengths and spin; cap the passes.
+            let mut guard = 2 * n + 8;
+            while cur < n && guard > 0 {
+                guard -= 1;
+                let fwd = |cur: i64| {
+                    if cur + length.abs() >= n {
+                        -1
+                    } else {
+                        index_of(&u, cur + length.abs())
+                    }
+                };
+                let hit = if use_max {
+                    let mut h = if cur + length >= n {
+                        -1
+                    } else {
+                        last_index_of(&u, cur + length)
+                    };
+                    if h == last_hit || h == -1 {
+                        h = fwd(cur);
+                    }
+                    last_hit = h;
+                    h
+                } else {
+                    fwd(cur)
+                };
+                if hit > -1 {
+                    out.extend(mid(&u, cur, hit - cur));
+                    out.push(b'\n' as u16);
+                    cur = hit + 1;
+                } else {
+                    out.extend(mid(&u, cur, -1));
+                    cur = n;
+                }
+            }
+        }
+        if i + 1 < lines.len() {
+            out.push(b'\n' as u16);
+        }
+    }
+    String::from_utf16_lossy(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::word_wrap;
+
+    /// QgsStringUtils::wordWrap outputs (PyQGIS 3.40): [text, length, useMaxLineLength, result].
+    #[test]
+    fn word_wrap_matches_qgis() {
+        let cases: Vec<(String, i64, bool, String)> =
+            serde_json::from_str(include_str!("wordwrap_qgis.json")).unwrap();
+        assert!(cases.len() > 100);
+        for (text, len, use_max, want) in cases {
+            assert_eq!(
+                word_wrap(&text, len, use_max),
+                want,
+                "{text:?} {len} {use_max}"
+            );
+        }
+    }
+
+    /// QGIS spins forever on a negative length with useMaxLineLength; rGIS must return.
+    #[test]
+    fn word_wrap_negative_max_terminates() {
+        let w = word_wrap(
+            "Nordre Øyeren naturreservat og fuglefredningsområde",
+            -12,
+            true,
+        );
+        assert!(!w.is_empty());
+    }
 }

@@ -150,6 +150,8 @@ pub enum SymbolLayer {
         max_distance: Option<Size>,
         ignore_rings: bool,
         offset: (Size, Size),
+        /// `blur_radius` in pixels (QgsImageOperation::stackBlur), 0 = none.
+        blur: i32,
     },
     /// Parallel lines drawn with a line sub-symbol (QgsLinePatternFillSymbolLayer).
     LinePatternFill {
@@ -763,10 +765,6 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 if g("color_type") == Some("1") {
                     warn!("ShapeburstFill with a colour ramp drawn with its two colours");
                 }
-                let blur = g("blur_radius").and_then(|v| v.parse().ok()).unwrap_or(0);
-                if blur > 0 {
-                    warn!("ShapeburstFill blur is not supported; drawn without blur");
-                }
                 SymbolLayer::ShapeburstFill {
                     color1: g("color")
                         .and_then(Rgba::parse)
@@ -778,6 +776,7 @@ pub fn parse_symbol(n: Node) -> Symbol {
                         .then(|| Size::new(g("max_distance"), g("distance_unit"), 5.0)),
                     ignore_rings: g("ignore_rings") == Some("1"),
                     offset: offset(),
+                    blur: g("blur_radius").and_then(|v| v.parse().ok()).unwrap_or(0),
                 }
             }
             "SimpleLine" => SymbolLayer::SimpleLine {
@@ -927,9 +926,6 @@ pub fn parse_symbol(n: Node) -> Symbol {
                 let offset = g("offset")
                     .and_then(|o| o.split(',').next()?.parse::<f64>().ok())
                     .unwrap_or(0.0);
-                let along = g("offset_along_line")
-                    .and_then(|o| o.parse::<f64>().ok())
-                    .unwrap_or(0.0);
                 let Some(sub) = l.children().find(|c| c.has_tag_name("symbol")) else {
                     warn!("{class} without a sub-symbol ignored");
                     continue;
@@ -940,14 +936,6 @@ pub fn parse_symbol(n: Node) -> Symbol {
                     .collect();
                 if !unsupported.is_empty() {
                     warn!("{class}: placement {unsupported:?} not supported; those are left out");
-                }
-                // The vertex placements' offset along the line is QGIS's
-                // renderOffsetVertexAlongLine, not ported yet.
-                if along != 0.0 && (has("FirstVertex") || has("LastVertex")) {
-                    warn!(
-                        "{class} at first/last vertex with an offset along the line is not supported; ignored"
-                    );
-                    continue;
                 }
                 SymbolLayer::TemplatedLine {
                     on_interval: has("Interval"),
