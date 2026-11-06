@@ -40,7 +40,8 @@ FROM ghcr.io/osgeo/gdal:ubuntu-small-${GDAL_VERSION}
 # fontconfig's sans-serif there (Noto Sans), rgis to RGIS_LABEL_FONT.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
- && apt-get install -y --no-install-recommends fonts-dejavu fonts-dejavu-core fonts-dejavu-extra \
+ && apt-get install -y --no-install-recommends libtcmalloc-minimal4t64 \
+      fonts-dejavu fonts-dejavu-core fonts-dejavu-extra \
       fonts-liberation fonts-liberation2 fonts-open-sans fonts-noto-core fonts-noto-extra \
       fonts-noto-mono fonts-noto-ui-core fonts-noto-ui-extra fonts-roboto fonts-vollkorn fonts-ebgaramond \
  && rm -rf /var/lib/apt/lists/* \
@@ -51,9 +52,11 @@ RUN apt-get update \
  && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge 1.2.0-3ubuntu0.1 \
  && rm -rf /var/lib/apt/lists/*
 ENV RGIS_LABEL_FONT="Noto Sans"
-# glibc keeps an arena per busy thread and hands little back after a burst of parallel
-# renders (RSS stayed ~2x higher); two arenas cost no measurable latency.
-ENV MALLOC_ARENA_MAX=2
+# tcmalloc, stated here rather than left to the GDAL base image: Oslo topo replay on 7 cores,
+# 180 req/s / 640 MB against glibc's 154 / 1205 (default arenas) and 85 / 695 (2 arenas).
+# Fails the build if the library goes missing; losing it silently would cost half the throughput.
+RUN ldconfig -p | grep -q libtcmalloc_minimal.so.4
+ENV LD_PRELOAD=libtcmalloc_minimal.so.4
 # GDAL (rasters, /vsigs/): the block cache otherwise defaults to 5 % of the RAM GDAL sees,
 # which can be the node's rather than the pod's limit (a GEBCO read kept ~500 MB); the rest
 # matches the tnt-qgis image: HTTP/2, no sidecar-file probing on open, retries.
