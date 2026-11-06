@@ -1,8 +1,6 @@
-//! rGIS: a QGIS-Server-like OGC map server in Rust that serves QGIS
-//! project files (.qgs/.qgz) over WMS, WFS and OGC API Features.
-//!
-//! The `rgis` binary is a thin command line around [`http::router`]; tests and tools can
-//! drive the same [`Server`] directly.
+//! rGIS: a QGIS-Server-like OGC map server serving QGIS projects (.qgs/.qgz) over WMS, WFS and OGC
+//! API Features. The `rgis` binary is a thin CLI around [`http::router`]; tests and tools can drive
+//! the same [`Server`] directly.
 
 // Ported QGIS/PAL functions keep their C++ signatures and container types.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]

@@ -552,9 +552,9 @@ mod imp {
     pub struct RasterSource {
         /// GDAL name the handles are opened from.
         name: String,
-        /// Free dataset handles (base, warped VRT). A GDAL dataset must not be read from two
-        /// threads at once, and one shared handle made concurrent requests for the same
-        /// raster queue behind each other; a handle per concurrent reader instead.
+        /// Free dataset handles (base, warped VRT), one per concurrent reader: a GDAL dataset can't
+        /// be read from two threads, and one shared handle queued concurrent requests for the same
+        /// raster.
         pool: Mutex<Vec<(Handle, Option<Handle>)>>,
         width: usize,
         height: usize,
@@ -2307,10 +2307,10 @@ mod imp {
         }
     }
 
-    /// HiDPI requests (DPI >= 2x OGC) draw rasters at 1x pixel density and upscale them:
-    /// sources run out of resolution a zoom earlier on 2x grids, so full density only adds
-    /// cost (~4x pixels) and cubic blur. Deliberate QGIS deviation; RGIS_RASTER_HIDPI=full
-    /// restores per-pixel rendering (parity tests).
+    /// HiDPI requests (DPI >= 2x OGC) draw rasters at 1x density and upscale: sources run out of
+    /// resolution a zoom earlier on 2x grids, so full density only adds cost (~4x pixels) and cubic
+    /// blur. Deliberate QGIS deviation; RGIS_RASTER_HIDPI=full restores per-pixel rendering (parity
+    /// tests).
     static HIDPI_DOWNSAMPLE: LazyLock<bool> =
         LazyLock::new(|| std::env::var("RGIS_RASTER_HIDPI").as_deref() != Ok("full"));
 

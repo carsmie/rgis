@@ -97,12 +97,11 @@ pub fn layer_features(
     Ok(out)
 }
 
-/// Features prepared for drawing, as QgsVectorLayerRenderer does: simplified in the layer
-/// CRS with the layer's pixel tolerance, reprojected, then clipped to the (buffered) view.
-///
-/// With `keep_full`, the reprojected but unclipped geometry is kept too (for labeling).
 type Prepared = (Feature, Option<Coord<f64>>, Option<Geometry<f64>>);
 
+/// Features prepared for drawing, as QgsVectorLayerRenderer: simplified in the layer CRS with the
+/// layer's pixel tolerance, reprojected, clipped to the (buffered) view. `keep_full` also keeps the
+/// reprojected, unclipped geometry (for labeling).
 fn features_for_drawing(
     layer: &MapLayer,
     ms: &MapSettings,
@@ -121,9 +120,8 @@ fn features_for_drawing(
         ms.extent.xmax + b,
         ms.extent.ymax + b,
     );
-    // Unlabelled layers: drop features no rule/class gives a symbol while reading, before
-    // their geometry is decoded (lag24's airport rules keep a few dozen of ~250 000 N50
-    // points in a 200 km view).
+    // Unlabelled layers: drop symbol-less features while reading, before decoding geometry (lag24's
+    // airport rules keep a few dozen of ~250 000 N50 points in a 200 km view).
     let scale = ms.scale();
     let symbolled = !keep_full && !matches!(layer.renderer, crate::symbology::Renderer::Single(_));
     let keep = |a: &Attrs| {
@@ -222,9 +220,8 @@ fn ignore_rendering_errors() -> bool {
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
-/// fill_path that skips zero-area paths (horizontal/vertical lines, collapsed slivers):
-/// tiny-skia refuses them with a warning per call (thousands per hour), QGIS paints
-/// nothing for them either.
+/// fill_path skipping zero-area paths (straight lines, collapsed slivers): tiny-skia refuses them
+/// with a warning per call (thousands per hour), and QGIS paints nothing either.
 pub trait FillNonEmpty {
     fn fill_nonempty(
         &mut self,
@@ -252,11 +249,10 @@ impl FillNonEmpty for Pixmap {
     }
 }
 
-/// Bounds the pixels being rendered at once. Each request's working set (output, per-layer
-/// scratch pixmaps, PNG buffer) scales with its pixel count, and spawn_blocking alone would
-/// run hundreds of renders in parallel (QGIS Server is bounded by its worker count instead).
-/// RGIS_RENDER_BUDGET_MPX sets the budget in megapixels (default 16); a request larger than
-/// the budget waits for the whole budget.
+/// Bounds the pixels rendered at once: a request's working set (output, scratch pixmaps, PNG
+/// buffer) scales with its pixels, and spawn_blocking alone would run hundreds of renders (QGIS
+/// Server is bounded by its workers). RGIS_RENDER_BUDGET_MPX sets megapixels (default 16); a larger
+/// request waits for the whole budget.
 pub struct RenderGate {
     budget: u64,
     used: parking_lot::Mutex<u64>,
@@ -332,9 +328,8 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
         .iter()
         .any(|j| !j.layer.labeling.is_empty())
         .then(|| crate::labeling::Engine::new(ms, ms.labeling.clone()));
-    // Vector layers whose features are read, decided up front so their (I/O-bound) reads
-    // can run ahead of drawing: cold remote FlatGeobufs cost a few index round trips each,
-    // which add up layer by layer otherwise (lag06 z11 cold: 4 layers, 3.9 s → ~1.5 s).
+    // Read layers decided up front so their I/O-bound reads run ahead of drawing: cold remote
+    // FlatGeobufs cost a few index round trips each (lag06 z11 cold: 4 layers, 3.9 s → ~1.5 s).
     let reads: Vec<Option<bool>> = jobs
         .iter()
         .map(|job| {
@@ -505,9 +500,9 @@ fn render_layers(
             continue;
         }
         let started = std::time::Instant::now();
-        // Nothing to draw or label at this scale: skip before reading any data (a layer
-        // without a scale limit whose rules are all out of scale otherwise loads every
-        // feature in the extent — 40 s and >1 GB for national N50 points at 1:2.4M).
+        // Nothing to draw or label at this scale: skip before reading. A layer without a scale
+        // limit whose rules are all out of scale would load every feature in the extent (40 s, >1
+        // GB for national N50 points at 1:2.4M).
         let Some(labeled) = reads[order] else {
             debug!("layer {} has no active rule at 1:{scale:.0}", l.name);
             continue;
@@ -651,9 +646,8 @@ fn add_line(
     to_px: &dyn Fn(&Coord<f64>) -> (f32, f32),
     close: bool,
 ) {
-    // Besides the QGIS-style simplification (geom::simplify), dropping sub-half-pixel steps
-    // here matches QGIS output better (measured with tools/parity.py: 0.54% vs 0.63% on
-    // Natural Earth countries), presumably as Qt's path rasterisation does similar culling.
+    // On top of geom::simplify, dropping sub-half-pixel steps matches QGIS better (tools/parity.py:
+    // 0.54% vs 0.63% on Natural Earth countries), presumably like Qt's path rasterisation culling.
     let mut last: Option<(f32, f32)> = None;
     let n = l.0.len();
     for (i, c) in l.0.iter().enumerate() {
@@ -2419,12 +2413,12 @@ fn draw_pattern_lines(
     );
 }
 
-/// Marker outlines in QGIS's unit coordinates (y down), from
-/// QgsSimpleMarkerSymbolLayerBase::shapeToPolygon. `None` = circle; the bool marks
-/// open shapes that are only stroked.
 /// Marker outline parts (each a list of unit-space points) and whether they are open.
 type MarkerShape = (Vec<Vec<(f32, f32)>>, bool);
 
+/// Marker outlines in QGIS's unit coordinates (y down), from
+/// QgsSimpleMarkerSymbolLayerBase::shapeToPolygon. `None` = circle; the bool marks open shapes that
+/// are only stroked.
 fn marker_shape(shape: &str) -> Option<MarkerShape> {
     const S: f32 = 0.866_025_4; // sin(60°)
     let closed = |p: &[(f32, f32)]| Some((vec![p.to_vec()], false));

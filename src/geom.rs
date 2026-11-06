@@ -527,11 +527,8 @@ fn clip_line(l: &LineString<f64>, r: &Rect, out: &mut Vec<LineString<f64>>) {
     }
 }
 
-/// Clip a geometry to a rectangle for drawing (QGIS `clip_to_extent`). Polygon rings are
-/// clipped independently, so `r` should be larger than the visible area to keep the
-/// artificial edges along the clip boundary out of view.
-/// clip_to_rect for an owned geometry whose bbox `b` is already known: a geometry inside
-/// `r` (most features of a dense tile) is returned as is instead of re-scanned and cloned.
+/// clip_to_rect for an owned geometry with a known bbox `b`: one inside `r` (most of a dense tile)
+/// returns as is, not re-scanned and cloned.
 pub fn clip_owned(g: Geometry<f64>, b: &Rect, r: &Rect) -> Option<Geometry<f64>> {
     if !b.intersects(r) {
         return None;
@@ -542,6 +539,8 @@ pub fn clip_owned(g: Geometry<f64>, b: &Rect, r: &Rect) -> Option<Geometry<f64>>
     clip_to_rect(&g, r)
 }
 
+/// Clip a geometry to a rectangle for drawing (QGIS `clip_to_extent`). Rings clip independently, so
+/// `r` should exceed the visible area to hide the artificial clip edges.
 pub fn clip_to_rect(g: &Geometry<f64>, r: &Rect) -> Option<Geometry<f64>> {
     let b = bbox(g);
     if !b.intersects(r) {
@@ -748,10 +747,9 @@ pub fn signed_area(pts: &[(f64, f64)]) -> f64 {
         / 2.0
 }
 
-/// A polyline (pixel coordinates) moved `dist` to its left, like GEOS offsetCurve with
-/// mitre joins and mitre limit 2 as QgsSymbolLayerUtils::offsetLine asks for: each
-/// segment shifted along its normal, neighbours joined at their mitre point, cut to a
-/// bevel where the mitre would reach beyond `limit * |dist|`. Closed lines stay closed.
+/// A polyline (pixels) moved `dist` left, like GEOS offsetCurve with mitre joins and limit 2
+/// (QgsSymbolLayerUtils::offsetLine): segments shifted along their normal, joined at the mitre
+/// point, bevelled beyond `limit * |dist|`. Closed lines stay closed.
 pub fn offset_polyline(pts: &[(f64, f64)], dist: f64, limit: f64) -> Vec<(f64, f64)> {
     offset_impl(pts, dist, limit, false)
 }

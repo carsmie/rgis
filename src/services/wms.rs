@@ -124,9 +124,9 @@ fn map_settings(
             })
     };
     let (width, height) = (dim("WIDTH")?, dim("HEIGHT")?);
-    // Project WMSMaxWidth/Height and the QGIS_SERVER_WMS_MAX_* variables (smallest wins,
-    // as in QgsWmsRenderContext::isValidWidthHeight). Unlike QGIS, which is unlimited
-    // when neither is set, we keep a default safety cap.
+    // Project WMSMaxWidth/Height and QGIS_SERVER_WMS_MAX_*, smallest wins
+    // (QgsWmsRenderContext::isValidWidthHeight). QGIS is unlimited when neither is set; we keep a
+    // default safety cap.
     let limit = |prop: &str, env: &str| -> u32 {
         let from_env = std::env::var(env)
             .ok()
@@ -585,9 +585,9 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
         }
     }
     if patches.is_empty() {
-        // An unknown RULE is a client error; a layer with nothing to show (raster, labels
-        // only) gets an empty image, not a 400: tnt-mapproxy's legend builder fetches every
-        // project and treats tiny images as "no legend", errors as failures.
+        // Unknown RULE = client error; a layer with nothing to show (raster, labels only) gets an
+        // empty image, not a 400: tnt-mapproxy's legend builder reads tiny images as "no legend",
+        // errors as failures.
         if rule.is_some() {
             return Err(OwsError::bad(
                 "InvalidParameterValue",

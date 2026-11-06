@@ -1,18 +1,14 @@
-//! Label text the way QGIS Server draws it: QgsTextRenderer with `TextRenderFormat::AlwaysOutlines`
-//! (glyph outlines filled as paths, buffers stroked as paths), using the font metrics and glyph
-//! advances Qt reports.
+//! Label text as QGIS Server draws it: QgsTextRenderer with `TextRenderFormat::AlwaysOutlines`
+//! (glyph outlines filled, buffers stroked as paths), using the metrics and advances Qt reports.
+//! Qt's numbers come from its font engine, so they are modelled per engine:
 //!
-//! Qt's numbers come from its platform font engine, so they are modelled per engine:
-//!
-//! * **CoreText** (macOS): font size in pixels = CoreText point size, so variable fonts get the
-//!   optical size axis set to the pixel size. Glyph advances are CoreText's (design advance + the
-//!   `trak` table at the pixel size), truncated to Qt's 26.6 fixed point. Qt then shapes with
-//!   HarfBuzz on the *default* instance with ptem = pixel size · 72/96, which adds GPOS kerning and
-//!   the `trak` adjustment a second time. Verified glyph by glyph against PyQt6.
+//! * **CoreText** (macOS): pixel size = CoreText point size, so variable fonts set optical size to
+//!   it. Advances are CoreText's (design advance + `trak` at that size), truncated to 26.6. Qt then
+//!   shapes with HarfBuzz on the *default* instance, ptem = px · 72/96, adding GPOS kerning and
+//!   `trak` a second time. Verified glyph by glyph against PyQt6.
 //! * **FreeType** (Linux): design advances at the pixel size, HarfBuzz kerning.
 //!
-//! Shaped runs and glyph outlines are cached per font and size, so repeated labels (the same
-//! names on every tile) cost no shaping or outline decoding.
+//! Shaped runs and outlines are cached per font and size: repeated labels skip shaping and decoding.
 
 use crate::render::FillNonEmpty;
 use std::collections::HashMap;
@@ -136,10 +132,9 @@ fn query(db: &fontdb::Database, family: &str, req: &FontRequest) -> Option<fontd
     })
 }
 
-/// Faces of a legacy family name (name ID 1, e.g. "Noto Sans Condensed") that fontdb hides
-/// behind the typographic one (ID 16, "Noto Sans"). fontconfig/Qt register it as a family of
-/// its own holding just those faces. Only faces whose typographic family prefixes `family`
-/// are read; cached per name.
+/// Faces of a legacy family name (name ID 1, e.g. "Noto Sans Condensed") that fontdb hides behind
+/// the typographic one (ID 16, "Noto Sans"); fontconfig/Qt give it its own family. Reads only faces
+/// whose typographic family prefixes `family`; cached per name.
 fn legacy_family(db: &fontdb::Database, family: &str) -> Vec<fontdb::ID> {
     static CACHE: LazyLock<Mutex<HashMap<String, Vec<fontdb::ID>>>> =
         LazyLock::new(Default::default);
@@ -504,11 +499,10 @@ impl SizedFont {
         self.px as f64 * 64.0 / self.face.upem
     }
 
-    /// Shape on the default instance (as Qt's HarfBuzz font does): glyph ids and 26.6 advances.
-    /// Shape on the default instance at 26.6 scale. With `engine`, glyph advances come from
-    /// the font engine (Qt's HarfBuzz font functions), else from the font's tables.
-    /// Returns (glyph, x advance, x offset, cluster). `no_ligatures` as Qt shapes letter-spaced
-    /// text (liga/clig/dlig/hlig off).
+    /// Shape on the default instance at 26.6 scale (as Qt's HarfBuzz font): (glyph, x advance, x
+    /// offset, cluster). With `engine`, advances come from the font engine (Qt's HarfBuzz font
+    /// functions), else the font's tables. `no_ligatures` as Qt shapes letter-spaced text
+    /// (liga/clig/dlig/hlig off).
     fn hb_shape(
         &self,
         text: &str,
@@ -658,9 +652,9 @@ impl SizedFont {
         g
     }
 
-    /// A glyph's outline stroked with `stroke` (cached). The stroke of a whole text path is
-    /// the nonzero union of its contours' strokes, so per-glyph strokes filled together draw
-    /// exactly what stroking the label path would, without re-stroking every label.
+    /// A glyph's outline stroked with `stroke` (cached). A text path's stroke is the nonzero union
+    /// of its contours' strokes, so per-glyph strokes filled together draw the same without
+    /// re-stroking every label.
     fn stroked(&self, gid: u32, stroke: &tiny_skia::Stroke) -> Option<Arc<tiny_skia::Path>> {
         let key = (gid, stroke.width.to_bits(), stroke.line_join as u8);
         if let Some(p) = self.strokes.lock().get(&key) {

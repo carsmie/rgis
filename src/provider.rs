@@ -216,9 +216,8 @@ impl Provider {
         self.features_where(bbox_filter, None)
     }
 
-    /// Features in `bbox_filter` whose attributes pass `keep` (and the layer subset).
-    /// FlatGeobuf checks `keep` right after decoding the properties, so rejected features
-    /// never have their geometry decoded.
+    /// Features in `bbox_filter` whose attributes pass `keep` (and the layer subset). FlatGeobuf
+    /// checks `keep` right after decoding properties, so rejected features skip geometry decoding.
     pub fn features_where(
         &self,
         bbox_filter: Option<Rect>,
@@ -639,9 +638,8 @@ async fn fetch(
     }
 }
 
-/// Blocks of all remote files beyond RGIS_HTTP_CACHE_MB (default 256) evicted least
-/// recently used first. One budget for the process: a per-file cap grows with the number
-/// of files opened.
+/// Blocks of all remote files, evicted LRU beyond RGIS_HTTP_CACHE_MB (default 256). One
+/// process-wide budget: a per-file cap grows with the number of files opened.
 struct BlockCache {
     /// Block → (data, stamp of its newest entry in `order`).
     blocks: HashMap<(u64, u64), (Arc<Vec<u8>>, u64)>,
@@ -653,9 +651,9 @@ struct BlockCache {
 }
 
 impl BlockCache {
-    /// A cached block. Hits re-queue it once it has aged a quarter of the cache (second
-    /// chance, without a queue push per read): FIFO evicted every file's FlatGeobuf root
-    /// index blocks first — they are read first — though every request reads them.
+    /// A cached block. Hits re-queue it after aging a quarter of the cache (second chance without a
+    /// push per read): FIFO evicted every file's FlatGeobuf root index blocks first, though every
+    /// request reads them.
     fn get(&mut self, key: (u64, u64)) -> Option<Arc<Vec<u8>>> {
         let refresh_after = (self.budget as u64 / BLOCK / 4).max(1);
         let tick = self.tick;
@@ -881,12 +879,9 @@ impl HttpFile {
         })
     }
 
-    /// Fetch the blocks covering `ranges` that are not cached yet: consecutive missing
-    /// blocks in one request (up to MAX_READAHEAD_BLOCKS), at most 8 requests at a time.
-    /// Best effort — a failed run is left to the on-demand read.
-    /// Prefetch FlatGeobuf features at `starts` (byte offsets) through `ranges` that guess
-    /// their ends, then the rest of any feature longer than its guess — its size prefix is
-    /// cached by then — in one more parallel round instead of a miss each while decoding.
+    /// Prefetch FlatGeobuf features at `starts` (byte offsets) through `ranges` that guess their
+    /// ends, then the rest of any longer feature (its size prefix is cached by then) in one more
+    /// parallel round, not a miss each while decoding.
     fn prefetch_features(&self, ranges: &[(u64, u64)], starts: &[u64]) {
         self.prefetch(ranges);
         let tails: Vec<(u64, u64)> = {
@@ -907,6 +902,9 @@ impl HttpFile {
         self.prefetch(&tails);
     }
 
+    /// Fetch the uncached blocks covering `ranges`: consecutive ones in one request (up to
+    /// MAX_READAHEAD_BLOCKS), at most 8 requests at a time. Best effort; a failed run is left to
+    /// the on-demand read.
     fn prefetch(&self, ranges: &[(u64, u64)]) {
         let last_block = (self.len.max(1) - 1) / BLOCK;
         let mut runs: Vec<(u64, u64)> = vec![]; // (first block, count)
@@ -987,10 +985,10 @@ impl HttpFile {
         if let Some(b) = cached {
             return Ok(b);
         }
-        // A miss right after the previous fetch is a sequential scan (FlatGeobuf features
-        // in a bbox are contiguous): double the blocks per request up to 4 MB, as GDAL's
-        // /vsicurl/ does; anything else is a lookup and fetches one block. One request
-        // per 256 KB made a 200 km view of a national file take minutes at GCS latency.
+        // A miss right after the previous fetch is a sequential scan (FlatGeobuf bbox features are
+        // contiguous): double the request up to 4 MB, as GDAL's /vsicurl/; else a lookup, one
+        // block. One request per 256 KB took minutes for a 200 km view of a national file at GCS
+        // latency.
         let window = {
             let mut ra = self.readahead.lock();
             ra.1 = if n == ra.0 {

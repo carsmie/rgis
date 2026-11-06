@@ -354,9 +354,8 @@ pub fn draw(pm: &mut Pixmap, m: &Marker, x: f32, y: f32) {
         };
         let (w, h) = (m.width, m.width * hw);
         let rect = fit(vb, w, h, (w, h), m.fixed_aspect > 0.0);
-        // Rendered into a pixmap just around the rotated marker (whole-pixel offset, so the
-        // samples are those of a canvas-sized one) instead of a canvas-sized layer: marker
-        // lines draw hundreds of rotated markers per image, each was a full-image composite.
+        // Drawn in a pixmap just around the rotated marker (whole-pixel offset, same samples as a
+        // canvas-sized one): marker lines draw hundreds per image, each was a full-image composite.
         let r = ((w * w + h * h).sqrt() / 2.0 + m.stroke_width + 2.0) as f32;
         let (ox, oy) = ((x - r).floor(), (y - r).floor());
         let size = (2.0 * r).ceil() as u32 + 2;

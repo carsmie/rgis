@@ -127,8 +127,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// SIGTERM (pod shutdown) or Ctrl-C: in-flight requests finish, new connections are refused.
-/// The handler is what makes SIGTERM work at all: as a container's PID 1, rGIS ignores any
-/// signal it has no handler for, and sat out the grace period until SIGKILL.
+/// Without a handler a container's PID 1 ignores SIGTERM and sits out the grace period until
+/// SIGKILL.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {

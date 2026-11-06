@@ -263,9 +263,8 @@ pub(crate) fn deadline() -> Option<Instant> {
     DEADLINE.get()
 }
 
-/// Fail once the current request is past its deadline. Called between units of work
-/// (layers, the label solver), so a runaway request frees its thread instead of only
-/// having its response dropped.
+/// Fail past the request's deadline. Called between units of work (layers, the label solver), so a
+/// runaway request frees its thread rather than only losing its response.
 pub(crate) fn check_deadline() -> anyhow::Result<()> {
     match DEADLINE.get() {
         Some(d) if Instant::now() >= d => anyhow::bail!("request timed out"),
@@ -317,9 +316,8 @@ impl Server {
         self.ready.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Load projects and open their vector data before taking traffic, so a new pod
-    /// doesn't serve its first requests cold (tnt-qgis `warmProjects`). Names are project
-    /// names under --projects-dir; `*` lists a local projects directory.
+    /// Load projects and open vector data before taking traffic, so a new pod isn't cold (tnt-qgis
+    /// `warmProjects`). Names are under --projects-dir; `*` lists a local projects directory.
     pub fn warm(&self, names: &[String]) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(dir) = &self.settings.projects_dir else {

@@ -15,9 +15,9 @@ RUN apt-get update \
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION}
 WORKDIR /src
-# Dependencies in their own layer, rebuilt only when Cargo.toml/Cargo.lock (or the GDAL base
-# image, for gdal-sys) change: CI's layer cache (cache-to: gha) keeps layers, not cache mounts,
-# so with mounts every release compiled all dependencies again (~5 of ~6 min).
+# Dependencies in their own layer, rebuilt only on Cargo.toml/Cargo.lock or GDAL base changes: CI's
+# cache (cache-to: gha) keeps layers, not cache mounts; with mounts every release recompiled them
+# (~5 of ~6 min).
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
  && cargo build --release --locked \
@@ -29,15 +29,14 @@ RUN touch src/main.rs src/lib.rs \
  && cp target/release/rgis /usr/local/bin/rgis \
  && rm -rf target
 
-# Extra fonts for the runtime image, empty unless a build supplies them as a named build
-# context, e.g. `docker build --build-context extra-fonts=<dir> .` (tnt-rgis passes
-# Kartverket's map fonts this way; they are not part of this repository).
+# Extra fonts, empty unless a build supplies them: `docker build --build-context extra-fonts=<dir>
+# .` (tnt-rgis passes Kartverket's map fonts, which aren't in this repository).
 FROM scratch AS extra-fonts
 
 FROM ghcr.io/osgeo/gdal:ubuntu-small-${GDAL_VERSION}
-# The font packages of the tnt-qgis QGIS Server image (CJK left out), so labels resolve to
-# the same faces; Kartverket's own fonts come only through extra-fonts above. Qt falls back to
-# fontconfig's sans-serif there (Noto Sans), rgis to RGIS_LABEL_FONT.
+# The tnt-qgis image's font packages (minus CJK), so labels resolve to the same faces; Kartverket's
+# own come via extra-fonts. Qt falls back to fontconfig's sans-serif (Noto Sans), rgis to
+# RGIS_LABEL_FONT.
 RUN apt-get update \
  && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends libtcmalloc-minimal4t64 \
@@ -52,14 +51,13 @@ RUN apt-get update \
  && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge 1.2.0-3ubuntu0.1 \
  && rm -rf /var/lib/apt/lists/*
 ENV RGIS_LABEL_FONT="Noto Sans"
-# tcmalloc, stated here rather than left to the GDAL base image: Oslo topo replay on 7 cores,
-# 180 req/s / 640 MB against glibc's 154 / 1205 (default arenas) and 85 / 695 (2 arenas).
-# Fails the build if the library goes missing; losing it silently would cost half the throughput.
+# tcmalloc, explicit rather than via the GDAL base image: Oslo replay on 7 cores 180 req/s / 640 MB
+# vs glibc 154 / 1205 (default arenas), 85 / 695 (2 arenas). The build fails if it goes missing.
 RUN ldconfig -p | grep -q libtcmalloc_minimal.so.4
 ENV LD_PRELOAD=libtcmalloc_minimal.so.4
-# GDAL (rasters, /vsigs/): the block cache otherwise defaults to 5 % of the RAM GDAL sees,
-# which can be the node's rather than the pod's limit (a GEBCO read kept ~500 MB); the rest
-# matches the tnt-qgis image: HTTP/2, no sidecar-file probing on open, retries.
+# GDAL (rasters, /vsigs/): the block cache defaults to 5 % of the RAM GDAL sees, possibly the node's
+# rather than the pod's limit (a GEBCO read kept ~500 MB); the rest matches tnt-qgis: HTTP/2, no
+# sidecar probing on open, retries.
 ENV GDAL_CACHEMAX=256 \
     GDAL_HTTP_VERSION=2 \
     GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR \

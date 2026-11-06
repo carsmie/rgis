@@ -1,10 +1,8 @@
-//! Port of QGIS's PAL labeling engine (src/core/pal): feature parts, label candidates, obstacle
-//! costs, the conflict graph, and the FALP + chain search solver — same algorithm, same costs,
-//! same tie-breaking order where QGIS's is deterministic.
-//!
-//! Faster than QGIS mainly by construction: candidates are plain rectangles tested with
-//! closed-form predicates instead of GEOS prepared geometries, and the conflict cache is only
-//! used for rotated candidates (axis-aligned conflicts are a four-comparison test).
+//! Port of QGIS's PAL engine (src/core/pal): feature parts, candidates, obstacle costs, conflict
+//! graph, FALP + chain search; same algorithm, costs and deterministic tie-breaking. Faster by
+//! construction: candidates are plain rectangles tested with closed-form predicates, not GEOS
+//! prepared geometries, and only rotated ones use the conflict cache (axis-aligned conflicts take
+//! four comparisons).
 
 use std::collections::HashMap;
 use std::f64::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4, PI};

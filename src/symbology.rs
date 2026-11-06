@@ -618,10 +618,9 @@ pub enum Renderer {
 static NEXT_RENDERER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 thread_local! {
-    /// (renderer id, scale bits, field values) → symbol names of the matching rules.
-    /// Rule filters ran up to three times per feature (read filter, drawing, labels),
-    /// each through every rule (23 in lag20's FKB roads); most features share a few
-    /// attribute combinations.
+    /// (renderer id, scale bits, field values) → matching rules' symbol names. Filters ran up to
+    /// three times per feature (read filter, drawing, labels) through every rule (23 in lag20's FKB
+    /// roads), and most features share a few attribute combinations.
     static RULE_CACHE: std::cell::RefCell<HashMap<(u64, u64, String), Vec<String>>> = Default::default();
 }
 
@@ -1319,9 +1318,9 @@ impl Renderer {
 }
 
 impl Renderer {
-    /// Whether any feature can get a symbol at this scale (QgsRuleBasedRenderer::startRender
-    /// leaves no active rule → QGIS fetches nothing). False lets the layer be skipped
-    /// before any data is read.
+    /// Whether any feature can get a symbol at this scale (no active rule after
+    /// QgsRuleBasedRenderer::startRender → QGIS fetches nothing). False skips the layer before any
+    /// read.
     pub fn active_at(&self, scale: f64) -> bool {
         fn any(rules: &[Rule], scale: f64) -> bool {
             rules.iter().any(|r| {

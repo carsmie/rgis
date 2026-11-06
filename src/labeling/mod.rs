@@ -1,9 +1,7 @@
-//! Labeling, ported from QGIS: QgsPalLayerSettings registration (labeling/settings.rs, here),
-//! the PAL placement engine (labeling/pal.rs) and QgsTextRenderer drawing (text.rs).
-//!
-//! Flow as in QgsMapRendererJob: while each vector layer is drawn its features are registered
-//! with the engine; after all layers, the engine solves the placement problem once for the whole
-//! map and draws the labels on top.
+//! Labeling, ported from QGIS: QgsPalLayerSettings registration (labeling/settings.rs, here), the
+//! PAL engine (labeling/pal.rs), QgsTextRenderer drawing (text.rs). As in QgsMapRendererJob, each
+//! vector layer registers its features while drawn; after all layers the engine solves the whole
+//! map once and draws the labels on top.
 
 pub mod settings;
 

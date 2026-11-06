@@ -54,10 +54,9 @@ async fn handle(
         query: uri.query().unwrap_or("").to_string(),
         base_url: format!("{proto}://{host}{}", uri.path()),
     };
-    // Rendering and data access are blocking work, like QGIS Server's request thread.
-    // Server::handle stops between layers once the timeout passes; work inside one layer
-    // (a large raster read, a whole-layer WFS response) can overrun it, so the client gets
-    // its answer after a grace period while that thread finishes on its own.
+    // Rendering and data access block, like QGIS Server's request thread. Server::handle stops
+    // between layers after the timeout; work inside a layer (large raster read, whole-layer WFS)
+    // can overrun, so the client is answered after a grace period while that thread finishes.
     let limit = server
         .request_timeout()
         .map(|t| t + Duration::from_secs(30));

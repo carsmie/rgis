@@ -1,11 +1,8 @@
-//! pal::PalRtree: QGIS's bundled R-tree (external/rtree/include/RTree.h, Guttman quadratic
-//! split, spherical volumes, `RTree<T*, float, 2, float>`, 8 entries per node, 4 minimum) with
-//! PalRtree's coordinate scaling.
-//!
-//! Ported operation for operation — including single-precision arithmetic — because the order
-//! in which queries report candidates decides ties in PAL's FALP priority queue. (With PAL's
-//! scaling, coordinates become tiny and most volumes underflow to 0 in `f32`; the tree's
-//! first-index tie-breaks then decide its shape, exactly as in QGIS.)
+//! pal::PalRtree: QGIS's bundled R-tree (external/rtree/include/RTree.h, Guttman quadratic split,
+//! spherical volumes, `RTree<T*, float, 2, float>`, 8 entries per node, 4 minimum) with PalRtree's
+//! coordinate scaling. Ported op for op, single precision included: query order decides ties in
+//! PAL's FALP queue. With PAL's scaling most volumes underflow to 0 in `f32`, so first-index
+//! tie-breaks shape the tree, as in QGIS.
 
 use super::index::BBox;
 

@@ -126,11 +126,10 @@ fn lex(s: &str) -> Result<Vec<Tok>> {
     Ok(out)
 }
 
-/// Deepest expression tree the parser builds. Parsing and evaluation recurse once per
-/// level, so without a limit one request with thousands of nested `(` overflows the
-/// stack and aborts the whole server. Counts nesting plus left-associative chain links
-/// (`a OR b OR c` is three deep), so it also caps long operator chains. A 2 MiB stack
-/// (tokio's blocking threads) holds ~200 nested `(` in a debug build, 800+ in release.
+/// Deepest expression tree parsed. Parsing and evaluation recurse per level, so thousands of nested
+/// `(` would overflow the stack and abort the server. Counts nesting plus left-associative links
+/// (`a OR b OR c` is three deep), capping long chains too. A 2 MiB stack (tokio's blocking threads)
+/// holds ~200 nested `(` in debug, 800+ in release.
 const MAX_DEPTH: usize = 128;
 
 struct Parser {

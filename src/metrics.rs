@@ -1,6 +1,5 @@
-//! Prometheus metrics. Served on their own port (RGIS_METRICS_ADDR), never the service port,
-//! which is behind a public ingress. Label values are fixed sets or come from the project
-//! (layer names): client input never becomes a label, or anyone could mint unlimited series.
+//! Prometheus metrics on their own port (RGIS_METRICS_ADDR), off the public ingress. Labels are
+//! fixed sets or project layer names: client input as a label would mint unlimited series.
 
 use std::sync::LazyLock;
 use std::time::Duration;
