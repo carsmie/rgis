@@ -13,6 +13,7 @@ mod geom;
 pub mod http;
 mod inspect;
 mod labeling;
+pub mod metrics;
 mod params;
 mod postgis;
 mod project;

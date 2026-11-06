@@ -300,6 +300,7 @@ pub fn render_permit(width: u32, height: u32) -> Result<RenderPermit> {
     }
     *used += need;
     let waited = started.elapsed();
+    crate::metrics::gate_waited(waited);
     if waited.as_millis() > 100 {
         debug!("render gate: waited {waited:?} for {need} px");
     }
@@ -488,6 +489,7 @@ fn render_layers(
             continue;
         }
         if l.kind == "raster" {
+            let started = std::time::Instant::now();
             if let Err(e) = render_raster(pm, l, ms) {
                 if ignore_rendering_errors() {
                     warn_ignored(&e);
@@ -495,6 +497,7 @@ fn render_layers(
                     return Err(e);
                 }
             }
+            crate::metrics::layer_rendered(&l.name, 0, started.elapsed());
             continue;
         }
         if l.kind != "vector" {
@@ -547,6 +550,7 @@ fn render_layers(
             features.len(),
             started.elapsed()
         );
+        crate::metrics::layer_rendered(&l.name, features.len(), started.elapsed());
         if let (true, Some(engine)) = (labeled, labels.as_mut()) {
             // Labels are registered for rendered features (QgsVectorLayerRenderer::drawRenderer).
             let sources: Vec<crate::labeling::LabelSource> = features

@@ -82,3 +82,37 @@ async fn hostile_filters_get_an_error_not_a_crash() {
     let r = c.get(format!("{base}health")).send().await.unwrap();
     assert_eq!(r.status(), 200);
 }
+
+/// Metrics are served apart from the service, and client input stays out of the labels.
+#[tokio::test]
+async fn metrics_count_requests_without_client_labels() {
+    let base = start().await;
+    let c = reqwest::Client::new();
+    let get = |q: &str| c.get(format!("{base}?{q}")).send();
+    get("SERVICE=WMS&REQUEST=GetCapabilities").await.unwrap();
+    get("SERVICE=evil&REQUEST=minted_label").await.unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, rgis::metrics::router()).into_future());
+    let r = c
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert!(
+        text.contains(
+            r#"rgis_requests_total{request="GetCapabilities",service="WMS",status="200"}"#
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("evil") && !text.contains("minted_label"),
+        "{text}"
+    );
+
+    let r = c.get(format!("{base}metrics")).send().await.unwrap();
+    assert!(!r.text().await.unwrap().contains("rgis_requests_total"));
+}

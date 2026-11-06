@@ -448,6 +448,7 @@ impl Server {
 
     pub fn handle(&self, req: &Request) -> Response {
         let started = Instant::now();
+        let _in_flight = crate::metrics::in_flight();
         DEADLINE.set(self.settings.request_timeout.map(|t| started + t));
         let params = Params::from_query(&req.query);
         let service = params.service();
@@ -492,6 +493,13 @@ impl Server {
             ms = (started.elapsed().as_secs_f64() * 1e4).round() / 10.0,
             query = %req.query,
             "request"
+        );
+        crate::metrics::request(
+            &service,
+            params.get("REQUEST").unwrap_or(""),
+            resp.status,
+            started.elapsed(),
+            resp.body.len(),
         );
         resp
     }

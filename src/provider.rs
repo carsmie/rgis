@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use flatgeobuf::packed_r_tree::PackedRTree;
@@ -16,7 +17,7 @@ use geo_types::{
 use geozero::{ColumnValue, PropertyProcessor, ToGeo};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::expression::Attrs;
 use crate::geom::{Rect, bbox};
@@ -533,6 +534,111 @@ const BLOCK: u64 = 256 * 1024;
 /// Largest read-ahead: 16 blocks = 4 MB per request.
 const MAX_READAHEAD_BLOCKS: u64 = 16;
 
+/// Gaps between attempts of a remote read; three retries like the image's
+/// GDAL_HTTP_MAX_RETRY, so vector and raster reads ride out the same GCS hiccups.
+#[cfg(not(test))]
+const RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
+#[cfg(test)]
+const RETRY_BACKOFF: [Duration; 3] = [Duration::from_millis(1); 3];
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest silence on a connection. A gap between reads, not a total: a 4 MB read-ahead may
+/// legitimately take a while, a stalled socket otherwise blocks its render thread for good.
+#[cfg(not(test))]
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+}
+
+/// A delay stretched by up to 50 %, so reads that failed together don't retry together.
+fn jittered(d: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |t| t.subsec_nanos());
+    d + d.mul_f64((nanos % 1000) as f64 / 2000.0)
+}
+
+/// What GCS's retry guidance lists: rate limits and server-side failures. Anything else
+/// (403, 404) answers the same next time.
+fn transient_status(s: reqwest::StatusCode) -> bool {
+    matches!(s.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// A remote file response, body read.
+struct Fetched {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+}
+
+/// GET with a retry per `backoff` entry on transport errors (resets mid-body included) and
+/// transient statuses, while `deadline` allows. `get` builds every attempt anew: GOOG1 signs
+/// the Date header. Answers success or 304; anything else is an error.
+async fn fetch(
+    get: impl Fn() -> reqwest::RequestBuilder,
+    url: &str,
+    backoff: &[Duration],
+    deadline: Option<Instant>,
+) -> Result<Fetched> {
+    async fn attempt(req: reqwest::RequestBuilder) -> reqwest::Result<Fetched> {
+        let resp = req.send().await?;
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        // Error bodies stay unread: they would count as egress and say nothing we log.
+        let body = if status.is_success() {
+            resp.bytes().await?.to_vec()
+        } else {
+            vec![]
+        };
+        Ok(Fetched {
+            status,
+            headers,
+            body,
+        })
+    }
+    let mut waits = backoff.iter();
+    loop {
+        let error = match attempt(get()).await {
+            Ok(f) if f.status.is_success() || f.status == reqwest::StatusCode::NOT_MODIFIED => {
+                crate::metrics::remote_request("ok");
+                crate::metrics::remote_bytes(f.body.len());
+                return Ok(f);
+            }
+            Ok(f) if !transient_status(f.status) => {
+                crate::metrics::remote_request("error");
+                bail!("HTTP {} from {url}", f.status);
+            }
+            Ok(f) => anyhow!("HTTP {} from {url}", f.status),
+            Err(e) if e.is_builder() => {
+                crate::metrics::remote_request("error");
+                return Err(e.into());
+            }
+            Err(e) => e.into(),
+        };
+        let wait = waits
+            .next()
+            .map(|d| jittered(*d))
+            .filter(|w| deadline.is_none_or(|d| Instant::now() + *w < d));
+        let Some(wait) = wait else {
+            crate::metrics::remote_request("error");
+            return Err(error);
+        };
+        crate::metrics::remote_request("retry");
+        warn!("{error:#}; retrying in {wait:?}");
+        tokio::time::sleep(wait).await;
+    }
+}
+
 /// Blocks of all remote files beyond RGIS_HTTP_CACHE_MB (default 256) evicted least
 /// recently used first. One budget for the process: a per-file cap grows with the number
 /// of files opened.
@@ -695,26 +801,27 @@ pub fn fetch_vsigs_if_changed(
     etag: Option<&str>,
 ) -> Result<Option<(Vec<u8>, Option<String>)>> {
     let (url, resource) = gcs_location(path)?;
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let client = http_client()?;
     let etag = etag.map(str::to_string);
+    let deadline = crate::server::deadline();
     run(async move {
-        let mut req = gcs_get(&client, &url, Some(&resource));
-        if let Some(e) = &etag {
-            req = req.header("If-None-Match", e);
-        }
-        let resp = req.send().await?;
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        let get = || {
+            let req = gcs_get(&client, &url, Some(&resource));
+            match &etag {
+                Some(e) => req.header("If-None-Match", e),
+                None => req,
+            }
+        };
+        let f = fetch(get, &url, &RETRY_BACKOFF, deadline).await?;
+        if f.status == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(None);
         }
-        let resp = resp.error_for_status()?;
-        let etag = resp
-            .headers()
+        let etag = f
+            .headers
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        Ok(Some((resp.bytes().await?.to_vec(), etag)))
+        Ok(Some((f.body, etag)))
     })
     .with_context(|| format!("cannot read /vsigs/{path}"))
 }
@@ -747,18 +854,14 @@ impl HttpFile {
     }
 
     fn open_with(url: &str, gcs_resource: Option<String>) -> Result<HttpFile> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("rGIS/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let client = http_client()?;
         let (c, u, r) = (client.clone(), url.to_string(), gcs_resource.clone());
+        let deadline = crate::server::deadline();
         let len = run(async move {
-            let resp = gcs_get(&c, &u, r.as_deref())
-                .header("Range", "bytes=0-0")
-                .send()
-                .await?
-                .error_for_status()?;
-            let total = resp
-                .headers()
+            let get = || gcs_get(&c, &u, r.as_deref()).header("Range", "bytes=0-0");
+            let f = fetch(get, &u, &RETRY_BACKOFF, deadline).await?;
+            let total = f
+                .headers
                 .get("content-range")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.rsplit('/').next())
@@ -849,14 +952,11 @@ impl HttpFile {
                     let _permit = limit.acquire_owned().await.ok()?;
                     let start = first * BLOCK;
                     let end = ((first + count) * BLOCK).min(len) - 1;
-                    let resp = gcs_get(&c, &u, r.as_deref())
-                        .header("Range", format!("bytes={start}-{end}"))
-                        .send()
-                        .await
-                        .ok()?
-                        .error_for_status()
-                        .ok()?;
-                    Some((first, resp.bytes().await.ok()?.to_vec()))
+                    // No retries: the on-demand read retries what this leaves behind.
+                    let range = format!("bytes={start}-{end}");
+                    let get = || gcs_get(&c, &u, r.as_deref()).header("Range", &range);
+                    let f = fetch(get, &u, &[], None).await.ok()?;
+                    Some((first, f.body))
                 });
             }
             let mut out = vec![];
@@ -882,7 +982,9 @@ impl HttpFile {
     }
 
     fn block(&self, n: u64) -> Result<Arc<Vec<u8>>> {
-        if let Some(b) = BLOCK_CACHE.lock().get((self.id, n)) {
+        let cached = BLOCK_CACHE.lock().get((self.id, n));
+        crate::metrics::block_lookup(cached.is_some());
+        if let Some(b) = cached {
             return Ok(b);
         }
         // A miss right after the previous fetch is a sequential scan (FlatGeobuf features
@@ -914,13 +1016,11 @@ impl HttpFile {
             self.url.clone(),
             self.gcs_resource.clone(),
         );
+        let deadline = crate::server::deadline();
         let data = run(async move {
-            let resp = gcs_get(&c, &u, r.as_deref())
-                .header("Range", format!("bytes={start}-{end}"))
-                .send()
-                .await?
-                .error_for_status()?;
-            Ok(resp.bytes().await?.to_vec())
+            let range = format!("bytes={start}-{end}");
+            let get = || gcs_get(&c, &u, r.as_deref()).header("Range", &range);
+            Ok(fetch(get, &u, &RETRY_BACKOFF, deadline).await?.body)
         })?;
         debug!(
             "vsicurl: fetched bytes {start}-{end} ({count} blocks) of {}",
@@ -936,6 +1036,7 @@ impl HttpFile {
             }
             c.insert((self.id, n + i as u64), chunk);
         }
+        crate::metrics::block_cache_size(c.bytes);
         first.ok_or_else(|| anyhow!("empty range response for {}", self.url))
     }
 }
@@ -1465,6 +1566,122 @@ fn open_geojson(path: &Path) -> Result<Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the scripted server does with one connection.
+    #[derive(Clone, Copy)]
+    enum Step {
+        Answer(&'static str),
+        /// Promise more body than is sent, then close: a reset mid-transfer.
+        Truncate,
+        /// Say nothing for longer than READ_TIMEOUT.
+        Stall,
+    }
+
+    const OK: &str = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata";
+    const UNAVAILABLE: &str =
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const MISSING: &str =
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// A server playing `script` one connection per step (the last step repeats); returns its
+    /// URL and the connection count.
+    async fn scripted(script: Vec<Step>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let i = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let step = script[i.min(script.len() - 1)];
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    match step {
+                        Step::Answer(a) => {
+                            let _ = sock.write_all(a.as_bytes()).await;
+                        }
+                        Step::Truncate => {
+                            let head =
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nda";
+                            let _ = sock.write_all(head.as_bytes()).await;
+                        }
+                        Step::Stall => tokio::time::sleep(Duration::from_secs(5)).await,
+                    }
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    async fn get(url: &str, deadline: Option<Instant>) -> Result<Fetched> {
+        let client = http_client().unwrap();
+        fetch(|| client.get(url), url, &RETRY_BACKOFF, deadline).await
+    }
+
+    fn calls(n: &std::sync::atomic::AtomicUsize) -> usize {
+        n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_retried() {
+        let (url, n) = scripted(vec![
+            Step::Answer(UNAVAILABLE),
+            Step::Truncate,
+            Step::Stall,
+            Step::Answer(OK),
+        ])
+        .await;
+        let f = get(&url, None).await.unwrap();
+        assert_eq!(f.body, b"data");
+        assert_eq!(calls(&n), 4);
+    }
+
+    #[tokio::test]
+    async fn permanent_failures_are_not_retried() {
+        let (url, n) = scripted(vec![Step::Answer(MISSING)]).await;
+        let e = get(&url, None).await.err().unwrap();
+        assert!(e.to_string().contains("404"), "{e:#}");
+        assert_eq!(calls(&n), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_run_out() {
+        let (url, n) = scripted(vec![Step::Answer(UNAVAILABLE)]).await;
+        let e = get(&url, None).await.err().unwrap();
+        assert!(e.to_string().contains("503"), "{e:#}");
+        assert_eq!(calls(&n), 1 + RETRY_BACKOFF.len());
+    }
+
+    #[tokio::test]
+    async fn no_retry_past_the_deadline() {
+        let (url, n) = scripted(vec![Step::Answer(UNAVAILABLE)]).await;
+        assert!(get(&url, Some(Instant::now())).await.is_err());
+        assert_eq!(calls(&n), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_file_reads_survive_a_failed_block() {
+        // Open, then a block read that fails once.
+        let (url, n) = scripted(vec![
+            Step::Answer(OK),
+            Step::Answer(UNAVAILABLE),
+            Step::Answer(OK),
+        ])
+        .await;
+        let block = tokio::task::spawn_blocking(move || {
+            let f = HttpFile::open(&url)?;
+            assert_eq!(f.len, 4);
+            f.block(0)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(block.as_slice(), b"data");
+        assert_eq!(calls(&n), 3);
+    }
 
     #[test]
     fn index_search_matches_stream_search() {

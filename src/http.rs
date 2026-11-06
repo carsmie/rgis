@@ -67,6 +67,7 @@ async fn handle(
             Ok(r) => r,
             Err(_) => {
                 tracing::warn!("{method} {}: no response after {limit:?}", uri.path());
+                crate::metrics::overrun();
                 let mut out = HttpResponse::new(Body::from("request timed out"));
                 *out.status_mut() = StatusCode::GATEWAY_TIMEOUT;
                 cors(out.headers_mut());

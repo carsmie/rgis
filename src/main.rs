@@ -34,6 +34,8 @@ ENVIRONMENT:
     RGIS_REQUEST_TIMEOUT       seconds before a request gives up with 503 (default 120,
                                0 = never); checked between layers
     RGIS_HTTP_CACHE_MB         remote-file block cache size (default 256)
+    RGIS_METRICS_ADDR          address for Prometheus GET /metrics (default: off); a separate
+                               port so metrics stay off the public service port
     PGUSER, PGPASSWORD         credentials for postgres layers (override the datasource's)
 
     GET /health answers 200 (liveness); GET /ready answers 503 until the warm-up is done.
@@ -107,13 +109,40 @@ async fn main() -> anyhow::Result<()> {
         let s = server.clone();
         tokio::task::spawn_blocking(move || s.warm(&warm));
     }
+    if let Ok(metrics_addr) = std::env::var("RGIS_METRICS_ADDR") {
+        let listener = tokio::net::TcpListener::bind(&metrics_addr).await?;
+        tracing::info!("metrics on http://{metrics_addr}/metrics");
+        tokio::spawn(axum::serve(listener, rgis::metrics::router()).into_future());
+    }
     let app = rgis::http::router(server);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("rGIS listening on http://{addr}");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
-    Ok(())
+    tracing::info!("stopped");
+    // Not a plain return: dropping the runtime waits for spawn_blocking work, so a render past
+    // its deadline (or the warm-up) would hold the exit until the pod's SIGKILL.
+    std::process::exit(0)
+}
+
+/// SIGTERM (pod shutdown) or Ctrl-C: in-flight requests finish, new connections are refused.
+/// The handler is what makes SIGTERM work at all: as a container's PID 1, rGIS ignores any
+/// signal it has no handler for, and sat out the grace period until SIGKILL.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("shutting down");
 }
