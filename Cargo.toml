@@ -19,7 +19,7 @@ harfrust = "0.15.0"
 hmac = "0.13.0"
 httpdate = "1.0.3"
 indexmap = "2.14.2"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 png = "0.18.1"
 prometheus = { version = "0.14", default-features = false }
 proj4rs = "0.3.0"
