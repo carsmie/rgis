@@ -356,7 +356,27 @@ impl Parser {
 /// SipHash took ~10% of a dense lag21 render; keys are schema names, not untrusted input.
 pub type Attrs = IndexMap<String, Value, rustc_hash::FxBuildHasher>;
 
+/// Geometry measures QGIS evaluates from the feature geometry. Not attributes: render::
+/// features_for_drawing injects them, else they read NULL (lag04 lake `$area >` rules dropped all).
+pub const MEASURE_VARS: [&str; 3] = ["$area", "$length", "$perimeter"];
+
+pub fn is_measure_var(f: &str) -> bool {
+    MEASURE_VARS.iter().any(|m| m.eq_ignore_ascii_case(f))
+}
+
 impl Expr {
+    /// Whether the expression reads `$area`, `$length` or `$perimeter`.
+    pub fn reads_measures(&self) -> bool {
+        match self {
+            Expr::Lit(_) => false,
+            Expr::Field(f) => is_measure_var(f),
+            Expr::Unary(_, e) | Expr::IsNull(e, _) => e.reads_measures(),
+            Expr::Binary(_, l, r) => l.reads_measures() || r.reads_measures(),
+            Expr::In(e, list, _) => e.reads_measures() || list.iter().any(Expr::reads_measures),
+            Expr::Call(_, args) => args.iter().any(Expr::reads_measures),
+        }
+    }
+
     /// A constant (data-defined "static value"); numbers are kept numeric.
     pub fn literal(v: &str) -> Expr {
         match v.trim().parse::<f64>() {
@@ -388,6 +408,8 @@ impl Expr {
     pub fn fields(&self, out: &mut Vec<String>) -> bool {
         match self {
             Expr::Lit(_) => true,
+            // Per-feature geometry values: memoising rules on them would only churn RULE_CACHE.
+            Expr::Field(f) if is_measure_var(f) => false,
             Expr::Field(f) => {
                 if !out.contains(f) {
                     out.push(f.clone());
@@ -673,6 +695,20 @@ mod tests {
         a.insert("pop".into(), json!(5_400_000));
         a.insert("note".into(), Value::Null);
         a
+    }
+
+    #[test]
+    fn measure_vars_are_detected_and_not_memoised() {
+        // lag04_Europa eu_F_lakeresa 1:2M-3M rule.
+        let e = Expr::parse(" $area > 10000000").unwrap();
+        assert!(e.reads_measures());
+        let mut f = vec![];
+        assert!(!e.fields(&mut f));
+        assert!(!Expr::parse(r#""pop" > 1"#).unwrap().reads_measures());
+        let mut a = attrs();
+        assert!(!e.matches(&a)); // NULL without injection: the original bug.
+        a.insert("$area".into(), json!(5.65e9)); // Vänern
+        assert!(e.matches(&a));
     }
 
     #[test]

@@ -1052,7 +1052,18 @@ impl Symbol {
     }
 }
 
+fn rules_read_measures(rules: &[Rule]) -> bool {
+    rules.iter().any(|r| {
+        r.filter.as_ref().is_some_and(Expr::reads_measures) || rules_read_measures(&r.children)
+    })
+}
+
 impl Renderer {
+    /// Whether rule filters read `$area`/`$length`/`$perimeter` (see expression::MEASURE_VARS).
+    pub fn reads_measures(&self) -> bool {
+        matches!(self, Renderer::Rules { rules, .. } if rules_read_measures(rules))
+    }
+
     pub fn resolve_paths(&mut self, project_dir: &std::path::Path) {
         match self {
             Renderer::Single(s) => s.resolve_paths(project_dir),

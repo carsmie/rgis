@@ -747,6 +747,68 @@ pub fn signed_area(pts: &[(f64, f64)]) -> f64 {
         / 2.0
 }
 
+/// QGIS `$area`, `$length`, `$perimeter` of a layer-CRS geometry: area/perimeter for polygons,
+/// length for lines, 0 otherwise (QgsDistanceArea). Projected CRSs measure planar in CRS units;
+/// geographic ones on a WGS84-radius sphere in metres (QGIS uses the project ellipsoid, <0.5% off).
+pub fn measures(g: &Geometry<f64>, geographic: bool) -> (f64, f64, f64) {
+    const R: f64 = 6_378_137.0;
+    let seg = |a: Coord<f64>, b: Coord<f64>| -> f64 {
+        if geographic {
+            // Haversine.
+            let (p1, p2) = (a.y.to_radians(), b.y.to_radians());
+            let h = ((p2 - p1) / 2.0).sin().powi(2)
+                + p1.cos() * p2.cos() * ((b.x - a.x).to_radians() / 2.0).sin().powi(2);
+            2.0 * R * h.sqrt().min(1.0).asin()
+        } else {
+            (b.x - a.x).hypot(b.y - a.y)
+        }
+    };
+    let len = |l: &LineString<f64>| l.0.windows(2).map(|w| seg(w[0], w[1])).sum::<f64>();
+    let ring_area = |l: &LineString<f64>| -> f64 {
+        if geographic {
+            // Spherical excess (Chamberlain & Duquette 2007).
+            l.0.windows(2)
+                .map(|w| {
+                    (w[1].x - w[0].x).to_radians()
+                        * (2.0 + w[0].y.to_radians().sin() + w[1].y.to_radians().sin())
+                })
+                .sum::<f64>()
+                .abs()
+                * R
+                * R
+                / 2.0
+        } else {
+            let pts: Vec<(f64, f64)> = l.0.iter().map(|c| (c.x, c.y)).collect();
+            signed_area(&pts).abs()
+        }
+    };
+    let poly = |p: &Polygon<f64>| -> (f64, f64) {
+        let area = ring_area(p.exterior()) - p.interiors().iter().map(ring_area).sum::<f64>();
+        (area.max(0.0), polygon_rings(p).map(len).sum())
+    };
+    match g {
+        Geometry::Polygon(p) => {
+            let (a, per) = poly(p);
+            (a, 0.0, per)
+        }
+        Geometry::MultiPolygon(mp) => {
+            mp.0.iter()
+                .map(poly)
+                .fold((0.0, 0.0, 0.0), |acc, (a, per)| {
+                    (acc.0 + a, 0.0, acc.2 + per)
+                })
+        }
+        Geometry::LineString(l) => (0.0, len(l), 0.0),
+        Geometry::MultiLineString(ml) => (0.0, ml.0.iter().map(len).sum(), 0.0),
+        Geometry::Line(l) => (0.0, seg(l.start, l.end), 0.0),
+        Geometry::GeometryCollection(gc) => gc.0.iter().fold((0.0, 0.0, 0.0), |acc, g| {
+            let m = measures(g, geographic);
+            (acc.0 + m.0, acc.1 + m.1, acc.2 + m.2)
+        }),
+        _ => (0.0, 0.0, 0.0),
+    }
+}
+
 /// A polyline (pixels) moved `dist` left, like GEOS offsetCurve with mitre joins and limit 2
 /// (QgsSymbolLayerUtils::offsetLine): segments shifted along their normal, joined at the mitre
 /// point, bevelled beyond `limit * |dist|`. Closed lines stay closed.
@@ -823,6 +885,35 @@ fn offset_impl(pts: &[(f64, f64)], dist: f64, limit: f64, inner_mitre: bool) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn measures_planar_and_geographic() {
+        use super::measures;
+        use geo_types::{Geometry, LineString, Polygon};
+        // 10 km square with a 1 km hole, metres.
+        let sq = |x0: f64, y0: f64, s: f64| -> LineString<f64> {
+            vec![
+                (x0, y0),
+                (x0 + s, y0),
+                (x0 + s, y0 + s),
+                (x0, y0 + s),
+                (x0, y0),
+            ]
+            .into()
+        };
+        let p = Geometry::Polygon(Polygon::new(sq(0.0, 0.0, 1e4), vec![sq(1e3, 1e3, 1e3)]));
+        let (a, l, per) = measures(&p, false);
+        assert_eq!((a, l), (1e8 - 1e6, 0.0));
+        assert_eq!(per, 4e4 + 4e3);
+        let line = Geometry::LineString(vec![(0.0, 0.0), (3.0, 4.0)].into());
+        assert_eq!(measures(&line, false), (0.0, 5.0, 0.0));
+        // 1x1 degree at the equator: ~111.3 km square, ~12 390 km².
+        let (a, _, _) = measures(
+            &Geometry::Polygon(Polygon::new(sq(0.0, 0.0, 1.0), vec![])),
+            true,
+        );
+        assert!((a / 1e6 - 12_391.0).abs() < 20.0, "{a}");
+    }
+
     #[test]
     fn offset_polyline_mitres_and_bevels() {
         use super::offset_polyline;

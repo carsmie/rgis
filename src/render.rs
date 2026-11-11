@@ -124,11 +124,36 @@ fn features_for_drawing(
     // airport rules keep a few dozen of ~250 000 N50 points in a 200 km view).
     let scale = ms.scale();
     let symbolled = !keep_full && !matches!(layer.renderer, crate::symbology::Renderer::Single(_));
+    // $area/$length/$perimeter need the geometry, which the read filter runs before decoding:
+    // with them, read everything, measure, then filter.
+    let measured = layer.renderer.reads_measures()
+        || filter.is_some_and(Expr::reads_measures)
+        || layer
+            .labeling
+            .iter()
+            .any(|r| r.filter.as_ref().is_some_and(Expr::reads_measures));
     let keep = |a: &Attrs| {
         filter.is_none_or(|e| e.matches(a))
             && (!symbolled || !layer.renderer.symbols_for(a, scale).is_empty())
     };
-    let out = provider.features_where(to_layer.rect(&render_extent).ok(), Some(&keep))?;
+    let mut out = provider.features_where(
+        to_layer.rect(&render_extent).ok(),
+        (!measured).then_some(&keep as &dyn Fn(&Attrs) -> bool),
+    )?;
+    if measured {
+        // Raw layer-CRS geometry as QGIS measures it: no simplification, no tile clipping
+        // (else a lake's area, and so its rule, would change from tile to tile).
+        for f in &mut out {
+            let (area, length, perimeter) = f
+                .geometry
+                .as_ref()
+                .map_or((0.0, 0.0, 0.0), |g| geom::measures(g, layer_crs.geographic));
+            f.attrs.insert("$area".into(), json!(area));
+            f.attrs.insert("$length".into(), json!(length));
+            f.attrs.insert("$perimeter".into(), json!(perimeter));
+        }
+        out.retain(|f| keep(&f.attrs));
+    }
 
     // The pixel tolerance in layer units, as QgsVectorLayerRenderer computes it: scale by the
     // diagonal ratio of a small square (0.0008983° or 100 units) at the centre of the extent
