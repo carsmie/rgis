@@ -158,7 +158,13 @@ pub fn in_flight() -> InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         IN_FLIGHT.dec();
+        crate::alloc::request_done();
     }
+}
+
+/// Requests being handled now.
+pub fn in_flight_now() -> i64 {
+    IN_FLIGHT.get()
 }
 
 pub fn request(service: &str, request: &str, status: u16, took: Duration, bytes: usize) {

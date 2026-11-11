@@ -159,7 +159,7 @@ impl Provider {
 
     fn open_uri(base_dir: &Path, uri: &Uri) -> Result<Provider> {
         if let Some(obj) = uri.path.strip_prefix("/vsigs/") {
-            let file = Arc::new(HttpFile::open_vsigs(obj)?);
+            let file = HttpFile::shared_vsigs(obj)?;
             let (fields, extent) = fgb_header(&mut HttpReader::new(file.clone()))?;
             return Ok(Provider {
                 filter: None,
@@ -170,7 +170,7 @@ impl Provider {
             });
         }
         if let Some(url) = uri.path.strip_prefix("/vsicurl/") {
-            let file = Arc::new(HttpFile::open(url)?);
+            let file = HttpFile::shared(url)?;
             let (fields, extent) = fgb_header(&mut HttpReader::new(file.clone()))?;
             return Ok(Provider {
                 filter: None,
@@ -233,10 +233,20 @@ impl Provider {
                 None,
             ),
             Kind::Fgb(FgbSource::Http(f)) => {
-                let prefetch =
-                    |ranges: &[(u64, u64)], starts: &[u64]| f.prefetch_features(ranges, starts);
+                // Index levels are fetched at once (small); the selected features go into a
+                // plan the reader fetches a window at a time as decoding reaches them.
+                let plan = Arc::new(Mutex::new(ReadPlan::default()));
+                let prefetch = |ranges: &[(u64, u64)], starts: &[u64]| {
+                    if starts.is_empty() {
+                        f.prefetch(ranges);
+                    } else {
+                        let mut p = plan.lock();
+                        p.ranges = ranges.iter().copied().collect();
+                        p.starts = starts.iter().copied().collect();
+                    }
+                };
                 fgb_features(
-                    HttpReader::new(f.clone()),
+                    HttpReader::with_plan(f.clone(), plan.clone()),
                     bbox_filter,
                     &self.fields,
                     keep,
@@ -574,11 +584,23 @@ fn transient_status(s: reqwest::StatusCode) -> bool {
     matches!(s.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
 
-/// A remote file response, body read.
+/// A remote file response, body read straight into BLOCK-sized buffers: block reads go into the
+/// cache without a whole-body buffer and a copy of it (2x the response, 4 MB contiguous each).
 struct Fetched {
     status: reqwest::StatusCode,
     headers: reqwest::header::HeaderMap,
-    body: Vec<u8>,
+    body: Vec<Vec<u8>>,
+}
+
+impl Fetched {
+    fn len(&self) -> usize {
+        self.body.iter().map(Vec::len).sum()
+    }
+
+    /// The body in one buffer (projects, small reads).
+    fn into_bytes(self) -> Vec<u8> {
+        self.body.concat()
+    }
 }
 
 /// GET with a retry per `backoff` entry on transport errors (resets mid-body included) and
@@ -591,14 +613,28 @@ async fn fetch(
     deadline: Option<Instant>,
 ) -> Result<Fetched> {
     async fn attempt(req: reqwest::RequestBuilder) -> reqwest::Result<Fetched> {
-        let resp = req.send().await?;
+        let mut resp = req.send().await?;
         let (status, headers) = (resp.status(), resp.headers().clone());
         // Error bodies stay unread: they would count as egress and say nothing we log.
-        let body = if status.is_success() {
-            resp.bytes().await?.to_vec()
-        } else {
-            vec![]
-        };
+        let mut body: Vec<Vec<u8>> = vec![];
+        if status.is_success() {
+            let mut left = resp.content_length();
+            while let Some(chunk) = resp.chunk().await? {
+                let mut c = &chunk[..];
+                while !c.is_empty() {
+                    if body.last().is_none_or(|b| b.len() == BLOCK as usize) {
+                        // Sized to what is still coming: a short last block wastes nothing.
+                        let cap = left.map_or(BLOCK, |l| l.clamp(1, BLOCK)) as usize;
+                        body.push(Vec::with_capacity(cap));
+                    }
+                    let b = body.last_mut().expect("pushed above");
+                    let n = (BLOCK as usize - b.len()).min(c.len());
+                    b.extend_from_slice(&c[..n]);
+                    c = &c[n..];
+                    left = left.map(|l| l.saturating_sub(n as u64));
+                }
+            }
+        }
         Ok(Fetched {
             status,
             headers,
@@ -610,7 +646,7 @@ async fn fetch(
         let error = match attempt(get()).await {
             Ok(f) if f.status.is_success() || f.status == reqwest::StatusCode::NOT_MODIFIED => {
                 crate::metrics::remote_request("ok");
-                crate::metrics::remote_bytes(f.body.len());
+                crate::metrics::remote_bytes(f.len());
                 return Ok(f);
             }
             Ok(f) if !transient_status(f.status) => {
@@ -725,17 +761,55 @@ static IO_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 });
 
 /// A remote file read with HTTP Range requests and an in-memory block cache,
-/// shared by all requests (the equivalent of GDAL's /vsicurl/).
+/// shared by all requests (the equivalent of GDAL's /vsicurl/). One per object version
+/// (HttpFile::shared): layers reading the same file share its cached blocks.
 pub struct HttpFile {
     url: String,
     len: u64,
     client: reqwest::Client,
     /// Key of this file's blocks in BLOCK_CACHE.
     id: u64,
-    /// Sequential-read detection: (block after the last fetch, blocks per request).
-    readahead: Mutex<(u64, u64)>,
     /// GCS canonical resource (`/bucket/object`) when requests are HMAC-signed (/vsigs/).
     gcs_resource: Option<String>,
+}
+
+/// Open remote files by (URL, ETag or length): the topo projects point dozens of layers at the
+/// same FlatGeobuf (one per subset), and a file each cached the same index blocks once per
+/// layer. Weak, so a file still goes (blocks freed) with the last layer using it.
+static OPEN_FILES: LazyLock<Mutex<HashMap<(String, String), std::sync::Weak<HttpFile>>>> =
+    LazyLock::new(Default::default);
+
+/// Bytes of remote reads in flight and not yet in the block cache, process-wide
+/// (RGIS_HTTP_INFLIGHT_MB, default 64). The block budget only counts cached blocks: without
+/// this, concurrent renders each holding 8 x 4 MB bodies went GBs past it.
+static INFLIGHT: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    let mb = std::env::var("RGIS_HTTP_INFLIGHT_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64);
+    Arc::new(tokio::sync::Semaphore::new(inflight_blocks(mb) as usize))
+});
+
+/// The in-flight budget in blocks, never below one maximal read.
+fn inflight_blocks(mb: u64) -> u64 {
+    ((mb << 20) / BLOCK).max(MAX_READAHEAD_BLOCKS)
+}
+
+/// A share of INFLIGHT for `blocks` blocks, waiting at most until `deadline`.
+async fn inflight_permit(
+    blocks: u64,
+    deadline: Option<Instant>,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let n = blocks.clamp(1, MAX_READAHEAD_BLOCKS) as u32;
+    let acquire = INFLIGHT.clone().acquire_many_owned(n);
+    let permit = match deadline {
+        Some(d) => tokio::time::timeout_at(d.into(), acquire)
+            .await
+            .map_err(|_| anyhow!("request timed out waiting for remote read capacity"))?,
+        None => acquire.await,
+    };
+    permit.map_err(|_| anyhow!("remote read capacity closed"))
 }
 
 /// GDAL's /vsigs/ HMAC credentials (GS_ACCESS_KEY_ID / GS_SECRET_ACCESS_KEY), if set.
@@ -819,7 +893,7 @@ pub fn fetch_vsigs_if_changed(
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        Ok(Some((f.body, etag)))
+        Ok(Some((f.into_bytes(), etag)))
     })
     .with_context(|| format!("cannot read /vsigs/{path}"))
 }
@@ -841,21 +915,63 @@ pub(crate) fn run<T: Send + 'static>(
 }
 
 impl HttpFile {
+    #[cfg(test)]
     fn open(url: &str) -> Result<HttpFile> {
-        Self::open_with(url, None)
+        let (len, _) = Self::probe(&http_client()?, url, None)?;
+        Ok(Self::new(url, len, None))
     }
 
-    /// GCS object `bucket/object` (GDAL /vsigs/).
-    fn open_vsigs(path: &str) -> Result<HttpFile> {
+    /// The open file for a URL (shared, see OPEN_FILES).
+    fn shared(url: &str) -> Result<Arc<HttpFile>> {
+        Self::shared_with(url, None)
+    }
+
+    /// GCS object `bucket/object` (GDAL /vsigs/), shared.
+    fn shared_vsigs(path: &str) -> Result<Arc<HttpFile>> {
         let (url, resource) = gcs_location(path)?;
-        Self::open_with(&url, Some(resource))
+        Self::shared_with(&url, Some(resource))
     }
 
-    fn open_with(url: &str, gcs_resource: Option<String>) -> Result<HttpFile> {
-        let client = http_client()?;
-        let (c, u, r) = (client.clone(), url.to_string(), gcs_resource.clone());
+    /// Probe the object, then reuse the open file for that URL and version (ETag, else length:
+    /// a republished object gets fresh blocks) or open it.
+    fn shared_with(url: &str, gcs_resource: Option<String>) -> Result<Arc<HttpFile>> {
+        let (len, etag) = Self::probe(&http_client()?, url, gcs_resource.as_deref())?;
+        let key = (url.to_string(), etag.unwrap_or_else(|| len.to_string()));
+        let mut open = OPEN_FILES.lock();
+        if let Some(f) = open.get(&key).and_then(std::sync::Weak::upgrade) {
+            debug!("reusing open {url}");
+            return Ok(f);
+        }
+        open.retain(|_, w| w.strong_count() > 0);
+        let f = Arc::new(Self::new(url, len, gcs_resource));
+        open.insert(key, Arc::downgrade(&f));
+        info!("opened {url} ({len} bytes)");
+        Ok(f)
+    }
+
+    fn new(url: &str, len: u64, gcs_resource: Option<String>) -> HttpFile {
+        HttpFile {
+            url: url.to_string(),
+            len,
+            client: http_client().expect("client built in probe"),
+            id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            gcs_resource,
+        }
+    }
+
+    /// Length and ETag of a remote object (a 1-byte range read).
+    fn probe(
+        client: &reqwest::Client,
+        url: &str,
+        gcs_resource: Option<&str>,
+    ) -> Result<(u64, Option<String>)> {
+        let (c, u, r) = (
+            client.clone(),
+            url.to_string(),
+            gcs_resource.map(str::to_string),
+        );
         let deadline = crate::server::deadline();
-        let len = run(async move {
+        run(async move {
             let get = || gcs_get(&c, &u, r.as_deref()).header("Range", "bytes=0-0");
             let f = fetch(get, &u, &RETRY_BACKOFF, deadline).await?;
             let total = f
@@ -865,18 +981,44 @@ impl HttpFile {
                 .and_then(|v| v.rsplit('/').next())
                 .and_then(|v| v.parse::<u64>().ok())
                 .ok_or_else(|| anyhow!("{u} does not support HTTP range requests"))?;
-            Ok(total)
+            let etag = f
+                .headers
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            Ok((total, etag))
         })
-        .with_context(|| format!("cannot open {url}"))?;
-        info!("opened {url} ({len} bytes)");
-        Ok(HttpFile {
-            url: url.to_string(),
-            len,
-            client,
-            id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            readahead: Mutex::new((u64::MAX, 1)),
-            gcs_resource,
-        })
+        .with_context(|| format!("cannot open {url}"))
+    }
+
+    /// GET blocks `first`..`first + count` into the cache, holding a share of INFLIGHT until
+    /// they are in it. Returns the first block.
+    async fn fetch_into_cache(
+        c: reqwest::Client,
+        u: String,
+        r: Option<String>,
+        (id, len): (u64, u64),
+        (first, count): (u64, u64),
+        backoff: &'static [Duration],
+        deadline: Option<Instant>,
+    ) -> Result<Arc<Vec<u8>>> {
+        let _permit = inflight_permit(count, deadline).await?;
+        let start = first * BLOCK;
+        let end = ((first + count) * BLOCK).min(len) - 1;
+        let range = format!("bytes={start}-{end}");
+        let get = || gcs_get(&c, &u, r.as_deref()).header("Range", &range);
+        let f = fetch(get, &u, backoff, deadline).await?;
+        let mut cache = BLOCK_CACHE.lock();
+        let mut head = None;
+        for (i, b) in f.body.into_iter().enumerate() {
+            let b = Arc::new(b);
+            if i == 0 {
+                head = Some(b.clone());
+            }
+            cache.insert((id, first + i as u64), b);
+        }
+        crate::metrics::block_cache_size(cache.bytes);
+        head.ok_or_else(|| anyhow!("empty range response for {u}"))
     }
 
     /// Prefetch FlatGeobuf features at `starts` (byte offsets) through `ranges` that guess their
@@ -903,8 +1045,8 @@ impl HttpFile {
     }
 
     /// Fetch the uncached blocks covering `ranges`: consecutive ones in one request (up to
-    /// MAX_READAHEAD_BLOCKS), at most 8 requests at a time. Best effort; a failed run is left to
-    /// the on-demand read.
+    /// MAX_READAHEAD_BLOCKS), at most 8 requests at a time per call and INFLIGHT overall, each
+    /// into the cache as it arrives. Best effort; a failed run is left to the on-demand read.
     fn prefetch(&self, ranges: &[(u64, u64)]) {
         let last_block = (self.len.max(1) - 1) / BLOCK;
         let mut runs: Vec<(u64, u64)> = vec![]; // (first block, count)
@@ -935,43 +1077,29 @@ impl HttpFile {
         }
         let started = std::time::Instant::now();
         let n_runs = runs.len();
-        let (c, u, r, len) = (
+        let (c, u, r, file) = (
             self.client.clone(),
             self.url.clone(),
             self.gcs_resource.clone(),
-            self.len,
+            (self.id, self.len),
         );
-        let fetched = run(async move {
+        let deadline = crate::server::deadline();
+        let _ = run(async move {
             let limit = Arc::new(tokio::sync::Semaphore::new(8));
             let mut set = tokio::task::JoinSet::new();
-            for (first, count) in runs {
+            for run in runs {
                 let (c, u, r, limit) = (c.clone(), u.clone(), r.clone(), limit.clone());
                 set.spawn(async move {
                     let _permit = limit.acquire_owned().await.ok()?;
-                    let start = first * BLOCK;
-                    let end = ((first + count) * BLOCK).min(len) - 1;
                     // No retries: the on-demand read retries what this leaves behind.
-                    let range = format!("bytes={start}-{end}");
-                    let get = || gcs_get(&c, &u, r.as_deref()).header("Range", &range);
-                    let f = fetch(get, &u, &[], None).await.ok()?;
-                    Some((first, f.body))
+                    Self::fetch_into_cache(c, u, r, file, run, &[], deadline)
+                        .await
+                        .ok()
                 });
             }
-            let mut out = vec![];
-            while let Some(res) = set.join_next().await {
-                if let Ok(Some(x)) = res {
-                    out.push(x);
-                }
-            }
-            Ok(out)
+            while set.join_next().await.is_some() {}
+            Ok(())
         });
-        let Ok(fetched) = fetched else { return };
-        let mut c = BLOCK_CACHE.lock();
-        for (first, data) in fetched {
-            for (i, chunk) in data.chunks(BLOCK as usize).enumerate() {
-                c.insert((self.id, first + i as u64), Arc::new(chunk.to_vec()));
-            }
-        }
         debug!(
             "vsicurl: prefetched {n_runs} range(s) of {} in {:?}",
             self.url,
@@ -979,7 +1107,9 @@ impl HttpFile {
         );
     }
 
-    fn block(&self, n: u64) -> Result<Arc<Vec<u8>>> {
+    /// Block `n`, fetched on a miss. `ra` is the reader's sequential-read state: (block after
+    /// its last fetch, blocks per request).
+    fn block(&self, n: u64, ra: &mut (u64, u64)) -> Result<Arc<Vec<u8>>> {
         let cached = BLOCK_CACHE.lock().get((self.id, n));
         crate::metrics::block_lookup(cached.is_some());
         if let Some(b) = cached {
@@ -989,57 +1119,42 @@ impl HttpFile {
         // contiguous): double the request up to 4 MB, as GDAL's /vsicurl/; else a lookup, one
         // block. One request per 256 KB took minutes for a 200 km view of a national file at GCS
         // latency.
-        let window = {
-            let mut ra = self.readahead.lock();
-            ra.1 = if n == ra.0 {
-                (ra.1 * 2).min(MAX_READAHEAD_BLOCKS)
-            } else {
-                1
-            };
-            ra.1
+        ra.1 = if n == ra.0 {
+            (ra.1 * 2).min(MAX_READAHEAD_BLOCKS)
+        } else {
+            1
         };
         let last_block = (self.len - 1) / BLOCK;
         let mut count = 1;
         {
             let cache = BLOCK_CACHE.lock();
-            while count < window && n + count <= last_block && !cache.contains((self.id, n + count))
-            {
+            while count < ra.1 && n + count <= last_block && !cache.contains((self.id, n + count)) {
                 count += 1;
             }
         }
-        let start = n * BLOCK;
-        let end = ((n + count) * BLOCK).min(self.len) - 1;
-        let (c, u, r) = (
+        let (c, u, r, file) = (
             self.client.clone(),
             self.url.clone(),
             self.gcs_resource.clone(),
+            (self.id, self.len),
         );
         let deadline = crate::server::deadline();
-        let data = run(async move {
-            let range = format!("bytes={start}-{end}");
-            let get = || gcs_get(&c, &u, r.as_deref()).header("Range", &range);
-            Ok(fetch(get, &u, &RETRY_BACKOFF, deadline).await?.body)
-        })?;
-        debug!(
-            "vsicurl: fetched bytes {start}-{end} ({count} blocks) of {}",
-            self.url
-        );
-        self.readahead.lock().0 = n + count;
-        let mut first = None;
-        let mut c = BLOCK_CACHE.lock();
-        for (i, chunk) in data.chunks(BLOCK as usize).enumerate() {
-            let chunk = Arc::new(chunk.to_vec());
-            if i == 0 {
-                first = Some(chunk.clone());
-            }
-            c.insert((self.id, n + i as u64), chunk);
-        }
-        crate::metrics::block_cache_size(c.bytes);
-        first.ok_or_else(|| anyhow!("empty range response for {}", self.url))
+        let head = run(Self::fetch_into_cache(
+            c,
+            u,
+            r,
+            file,
+            (n, count),
+            &RETRY_BACKOFF,
+            deadline,
+        ))?;
+        debug!("vsicurl: fetched blocks {n}+{count} of {}", self.url);
+        ra.0 = n + count;
+        Ok(head)
     }
 }
 
-// Projects reload every RGIS_REMOTE_PROJECT_TTL; their files' blocks go with them.
+// The last layer using a file is gone (project reload); its blocks go with it.
 impl Drop for HttpFile {
     fn drop(&mut self) {
         let mut c = BLOCK_CACHE.lock();
@@ -1058,14 +1173,98 @@ impl Drop for HttpFile {
     }
 }
 
+/// Feature byte ranges a request is going to read, fetched one window ahead of the decoder
+/// (HttpReader::read on a miss) instead of all up front: a wide view of a national file asked
+/// for more than the whole block cache, evicted its own blocks and fetched them again.
+#[derive(Default)]
+struct ReadPlan {
+    /// Inclusive byte ranges, ascending.
+    ranges: std::collections::VecDeque<(u64, u64)>,
+    /// Feature starts, ascending (for the tails of features longer than their range).
+    starts: std::collections::VecDeque<u64>,
+}
+
+impl ReadPlan {
+    /// The planned ranges and feature starts from `pos` on, up to `max` bytes; dropped from
+    /// the plan. Ranges ending before `pos` are skipped (already read).
+    fn next_window(&mut self, pos: u64, max: u64) -> (Vec<(u64, u64)>, Vec<u64>) {
+        while self.ranges.front().is_some_and(|r| r.1 < pos) {
+            self.ranges.pop_front();
+        }
+        let mut out = vec![];
+        let mut budget = max.max(1);
+        while budget > 0
+            && let Some((a, z)) = self.ranges.pop_front()
+        {
+            let a = a.max(pos);
+            let take = (z - a + 1).min(budget);
+            out.push((a, a + take - 1));
+            budget -= take;
+            if a + take <= z {
+                self.ranges.push_front((a + take, z));
+            }
+        }
+        let hi = out.last().map_or(0, |r| r.1);
+        let mut starts = vec![];
+        while let Some(&s) = self.starts.front()
+            && s <= hi
+        {
+            self.starts.pop_front();
+            if s >= pos {
+                starts.push(s);
+            }
+        }
+        (out, starts)
+    }
+}
+
+/// Bytes fetched ahead per window: a quarter of the block cache (so a window survives until it
+/// is read, with other requests filling the rest), at most 32 MB.
+fn plan_window() -> u64 {
+    (BLOCK_CACHE.lock().budget as u64 / 4).clamp(BLOCK, 32 << 20)
+}
+
 struct HttpReader {
     file: Arc<HttpFile>,
     pos: u64,
+    /// Sequential-read state per reader: a shared one mixed up concurrent requests' scans.
+    readahead: (u64, u64),
+    plan: Option<Arc<Mutex<ReadPlan>>>,
 }
 
 impl HttpReader {
     fn new(file: Arc<HttpFile>) -> HttpReader {
-        HttpReader { file, pos: 0 }
+        HttpReader {
+            file,
+            pos: 0,
+            readahead: (u64::MAX, 1),
+            plan: None,
+        }
+    }
+
+    fn with_plan(file: Arc<HttpFile>, plan: Arc<Mutex<ReadPlan>>) -> HttpReader {
+        HttpReader {
+            plan: Some(plan),
+            ..Self::new(file)
+        }
+    }
+
+    /// On a miss inside the plan: fetch its next window from here in parallel.
+    fn fetch_planned(&mut self, n: u64) {
+        let Some(plan) = &self.plan else { return };
+        let (ranges, starts) = plan.lock().next_window(n * BLOCK, plan_window());
+        if !ranges.is_empty() && ranges[0].0 / BLOCK == n {
+            self.file.prefetch_features(&ranges, &starts);
+        } else if !ranges.is_empty() {
+            // The miss is outside the plan: put the window back for later.
+            let mut p = plan.lock();
+            for r in ranges.into_iter().rev() {
+                p.ranges.push_front(r);
+            }
+            for s in starts.into_iter().rev() {
+                p.starts.push_front(s);
+            }
+        }
     }
 }
 
@@ -1075,7 +1274,13 @@ impl Read for HttpReader {
             return Ok(0);
         }
         let n = self.pos / BLOCK;
-        let block = self.file.block(n).map_err(std::io::Error::other)?;
+        if self.plan.is_some() && !BLOCK_CACHE.lock().contains((self.file.id, n)) {
+            self.fetch_planned(n);
+        }
+        let block = self
+            .file
+            .block(n, &mut self.readahead)
+            .map_err(std::io::Error::other)?;
         let off = (self.pos - n * BLOCK) as usize;
         let len = buf.len().min(block.len() - off);
         buf[..len].copy_from_slice(&block[off..off + len]);
@@ -1573,6 +1778,8 @@ mod tests {
         Truncate,
         /// Say nothing for longer than READ_TIMEOUT.
         Stall,
+        /// Serve this file, honouring `Range: bytes=a-b`.
+        Ranges(&'static [u8]),
     }
 
     const OK: &str = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata";
@@ -1607,6 +1814,24 @@ mod tests {
                             let _ = sock.write_all(head.as_bytes()).await;
                         }
                         Step::Stall => tokio::time::sleep(Duration::from_secs(5)).await,
+                        Step::Ranges(file) => {
+                            let req = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                            let (a, z) = req
+                                .split("range: bytes=")
+                                .nth(1)
+                                .and_then(|r| r.split("\r\n").next())
+                                .and_then(|r| r.split_once('-'))
+                                .and_then(|(a, z)| Some((a.parse().ok()?, z.parse().ok()?)))
+                                .unwrap_or((0usize, file.len() - 1));
+                            let z = z.min(file.len() - 1);
+                            let head = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{z}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                file.len(),
+                                z - a + 1
+                            );
+                            let _ = sock.write_all(head.as_bytes()).await;
+                            let _ = sock.write_all(&file[a..=z]).await;
+                        }
                     }
                 });
             }
@@ -1633,8 +1858,99 @@ mod tests {
         ])
         .await;
         let f = get(&url, None).await.unwrap();
-        assert_eq!(f.body, b"data");
+        assert_eq!(f.into_bytes(), b"data");
         assert_eq!(calls(&n), 4);
+    }
+
+    #[tokio::test]
+    async fn bodies_arrive_in_blocks() {
+        let body: &'static [u8] = Box::leak(vec![7u8; BLOCK as usize + 10].into_boxed_slice());
+        let (url, _) = scripted(vec![Step::Ranges(body)]).await;
+        let f = get(&url, None).await.unwrap();
+        let sizes: Vec<usize> = f.body.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![BLOCK as usize, 10]);
+        // Sized from Content-Length: the short last block has no spare capacity.
+        assert_eq!(f.body[1].capacity(), 10);
+    }
+
+    #[test]
+    fn read_plan_windows() {
+        let mut p = ReadPlan {
+            ranges: [(0, 99), (200, 1099), (5000, 5009)].into(),
+            starts: [0, 50, 200, 600, 1000, 5000].into(),
+        };
+        // A window ends inside a range; the rest stays planned.
+        assert_eq!(
+            p.next_window(0, 500),
+            (vec![(0, 99), (200, 599)], vec![0, 50, 200])
+        );
+        // Reading resumed further on: what lies before `pos` is skipped.
+        assert_eq!(
+            p.next_window(700, 1000),
+            (vec![(700, 1099), (5000, 5009)], vec![1000, 5000])
+        );
+        assert_eq!(p.next_window(6000, 1000), (vec![], vec![]));
+    }
+
+    #[tokio::test]
+    async fn layers_share_an_open_file() {
+        let (url, n) = scripted(vec![Step::Answer(OK)]).await;
+        let (a, b) = tokio::task::spawn_blocking(move || {
+            (
+                HttpFile::shared(&url).unwrap(),
+                HttpFile::shared(&url).unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(calls(&n), 2, "each open still probes the object");
+        // Once nobody holds it, a new open is a new file (fresh blocks).
+        let id = a.id;
+        drop((a, b));
+        let (url, _) = scripted(vec![Step::Answer(OK)]).await;
+        let c = tokio::task::spawn_blocking(move || HttpFile::shared(&url).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(c.id, id);
+    }
+
+    #[tokio::test]
+    async fn planned_reads_return_the_file() {
+        let len = 3 * BLOCK as usize + 1234;
+        let file: &'static [u8] = Box::leak(
+            (0..len)
+                .map(|i| (i * 31 % 251) as u8)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let (url, _) = scripted(vec![Step::Ranges(file)]).await;
+        tokio::task::spawn_blocking(move || {
+            let f = HttpFile::shared(&url).unwrap();
+            let plan = Arc::new(Mutex::new(ReadPlan {
+                ranges: [
+                    (10, 20),
+                    (BLOCK + 5, 2 * BLOCK + 9),
+                    (3 * BLOCK, len as u64 - 1),
+                ]
+                .into(),
+                starts: [10, BLOCK + 5, 3 * BLOCK].into(),
+            }));
+            let mut r = HttpReader::with_plan(f.clone(), plan.clone());
+            for (a, z) in [
+                (10, 20),
+                (BLOCK + 5, 2 * BLOCK + 9),
+                (3 * BLOCK, len as u64 - 1),
+            ] {
+                r.seek(SeekFrom::Start(a)).unwrap();
+                let mut buf = vec![0u8; (z - a + 1) as usize];
+                r.read_exact(&mut buf).unwrap();
+                assert_eq!(buf, &file[a as usize..=z as usize]);
+            }
+            assert!(plan.lock().ranges.is_empty(), "plan consumed");
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1672,7 +1988,7 @@ mod tests {
         let block = tokio::task::spawn_blocking(move || {
             let f = HttpFile::open(&url)?;
             assert_eq!(f.len, 4);
-            f.block(0)
+            f.block(0, &mut (u64::MAX, 1))
         })
         .await
         .unwrap()

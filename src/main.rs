@@ -34,6 +34,9 @@ ENVIRONMENT:
     RGIS_REQUEST_TIMEOUT       seconds before a request gives up with 503 (default 120,
                                0 = never); checked between layers
     RGIS_HTTP_CACHE_MB         remote-file block cache size (default 256)
+    RGIS_HTTP_INFLIGHT_MB      remote reads in flight, not yet cached, process-wide (default 64)
+    RGIS_RELEASE_IDLE_SECS     return free heap to the OS after this many idle seconds
+                               (default 5, 0 = off)
     RGIS_METRICS_ADDR          address for Prometheus GET /metrics (default: off); a separate
                                port so metrics stay off the public service port
     PGUSER, PGPASSWORD         credentials for postgres layers (override the datasource's)
@@ -114,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("metrics on http://{metrics_addr}/metrics");
         tokio::spawn(axum::serve(listener, rgis::metrics::router()).into_future());
     }
+    rgis::alloc::start_idle_release();
     let app = rgis::http::router(server);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("rGIS listening on http://{addr}");

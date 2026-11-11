@@ -5,6 +5,7 @@
 // Ported QGIS/PAL functions keep their C++ signatures and container types.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod alloc;
 mod crs;
 mod expression;
 mod geom;
