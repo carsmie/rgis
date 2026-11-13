@@ -546,11 +546,32 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
             )
         })?);
     }
+    // BBOX (+CRS, WIDTH, HEIGHT): content-based legend as QGIS Server — only symbols features in
+    // the view are drawn with; the view also gives the scale when SCALE is absent.
+    let view = match p.get("BBOX") {
+        Some(_) => Some(map_settings(ctx, p.get_or("VERSION", "1.3.0"), &layers)?),
+        None => None,
+    };
     // SCALE: layers out of range and rules outside their scale range drop out (as QGIS Server).
-    let scale = p.f64("SCALE").filter(|s| *s > 0.0);
+    let scale = p
+        .f64("SCALE")
+        .filter(|s| *s > 0.0)
+        .or_else(|| view.as_ref().map(|ms| ms.scale()));
     if let Some(sc) = scale {
         layers.retain(|l| l.visible_at(sc));
     }
+    let used = match &view {
+        Some(ms) => Some(symbols_in_view(&layers, ms, scale.unwrap_or_else(|| ms.scale()))?),
+        None => None,
+    };
+    // Legend items of layer `i`, limited to the view's symbols with BBOX.
+    let items_of = |i: usize| -> Vec<crate::symbology::LegendItem<'_>> {
+        let mut it = layers[i].renderer.legend_at(scale);
+        if let Some(Some(u)) = used.as_ref().map(|u| &u[i]) {
+            it.retain(|x| u.contains(&(x.symbol as *const _)));
+        }
+        it
+    };
     let rule = p.get("RULE");
     let format = p.get_or("FORMAT", "image/png").to_ascii_lowercase();
 
@@ -559,8 +580,11 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
             Ok(base64(&render::encode_png(pm)?))
         };
         let mut nodes = vec![];
-        for l in &layers {
-            let items = l.renderer.legend_at(scale);
+        for (i, l) in layers.iter().enumerate() {
+            let items = items_of(i);
+            if items.is_empty() {
+                continue;
+            }
             let title = l.display_title().to_string();
             if items.len() == 1 && items[0].label.is_empty() {
                 nodes.push(json!({"type": "layer", "title": title, "icon": b64(&render::symbol_patch(items[0].symbol, w, h, dpi))?}));
@@ -584,8 +608,8 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
     // RULE (single icon) and RULELABEL=false; single-symbol layers show the layer title.
     let labels = rule.is_none() && !p.get("RULELABEL").is_some_and(|v| v.eq_ignore_ascii_case("false"));
     let mut rows: Vec<(tiny_skia::Pixmap, String)> = vec![];
-    for l in &layers {
-        let items = l.renderer.legend_at(scale);
+    for (i, l) in layers.iter().enumerate() {
+        let items = items_of(i);
         let single = items.len() == 1;
         for it in items {
             if rule.is_none_or(|r| r == it.label) {
@@ -666,6 +690,40 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
         crate::text::draw_text(&mut out, &path, color, color.3 as f64 / 255.0);
     }
     Ok(Response::ok("image/png", render::encode_png(&out)?))
+}
+
+/// Per layer, the symbols its features inside `ms`'s extent are drawn with (None: not
+/// filterable, e.g. raster). Attribute-only read: the read filter records each feature's symbols
+/// and rejects it, so no geometry is decoded. Bounding-box intersection, as the provider query.
+fn symbols_in_view(
+    layers: &[Arc<MapLayer>],
+    ms: &MapSettings,
+    scale: f64,
+) -> Result<Vec<Option<std::collections::HashSet<*const crate::symbology::Symbol>>>, OwsError> {
+    let mut out = vec![];
+    for l in layers {
+        // Nothing to show at this scale: skip the read (GetMap skips such layers too).
+        if l.renderer.legend_at(Some(scale)).is_empty() || !l.renderer.active_at(scale) {
+            out.push(Some(Default::default()));
+            continue;
+        }
+        let Ok(prov) = l.provider() else {
+            out.push(None);
+            continue;
+        };
+        let q = Transform::new(&ms.crs, &l.crs()).rect(&ms.extent).ok();
+        let hits = std::cell::RefCell::new(std::collections::HashSet::new());
+        let keep = |a: &crate::expression::Attrs| {
+            for s in l.renderer.symbols_for(a, scale) {
+                hits.borrow_mut().insert(s as *const _);
+            }
+            false
+        };
+        prov.features_where(q, Some(&keep))
+            .map_err(|e| OwsError::internal(format!("{}: {e}", l.name)))?;
+        out.push(Some(hits.into_inner()));
+    }
+    Ok(out)
 }
 
 fn base64(data: &[u8]) -> String {
