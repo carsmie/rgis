@@ -546,6 +546,11 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
             )
         })?);
     }
+    // SCALE: layers out of range and rules outside their scale range drop out (as QGIS Server).
+    let scale = p.f64("SCALE").filter(|s| *s > 0.0);
+    if let Some(sc) = scale {
+        layers.retain(|l| l.visible_at(sc));
+    }
     let rule = p.get("RULE");
     let format = p.get_or("FORMAT", "image/png").to_ascii_lowercase();
 
@@ -555,7 +560,7 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
         };
         let mut nodes = vec![];
         for l in &layers {
-            let items = l.renderer.legend();
+            let items = l.renderer.legend_at(scale);
             let title = l.display_title().to_string();
             if items.len() == 1 && items[0].label.is_empty() {
                 nodes.push(json!({"type": "layer", "title": title, "icon": b64(&render::symbol_patch(items[0].symbol, w, h, dpi))?}));
@@ -575,18 +580,29 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
             format!("Output format '{format}' is not supported"),
         ));
     }
-    // PNG: symbol patches only (this server does not rasterise text).
-    let mut patches = vec![];
+    // PNG: symbol patch + rule label per row (QgsLegendRenderer, no titles). Labels off for
+    // RULE (single icon) and RULELABEL=false; single-symbol layers show the layer title.
+    let labels = rule.is_none() && !p.get("RULELABEL").is_some_and(|v| v.eq_ignore_ascii_case("false"));
+    let mut rows: Vec<(tiny_skia::Pixmap, String)> = vec![];
     for l in &layers {
-        for it in l.renderer.legend() {
+        let items = l.renderer.legend_at(scale);
+        let single = items.len() == 1;
+        for it in items {
             if rule.is_none_or(|r| r == it.label) {
-                patches.push(render::symbol_patch(it.symbol, w, h, dpi));
+                let text = if !labels {
+                    String::new()
+                } else if it.label.is_empty() && single {
+                    l.display_title().to_string()
+                } else {
+                    it.label.clone()
+                };
+                rows.push((render::symbol_patch(it.symbol, w, h, dpi), text));
             }
         }
     }
-    if patches.is_empty() {
-        // Unknown RULE = client error; a layer with nothing to show (raster, labels only) gets an
-        // empty image, not a 400: tnt-mapproxy's legend builder reads tiny images as "no legend",
+    if rows.is_empty() {
+        // Unknown RULE = client error; a layer with nothing to show (raster, labels only, out of
+        // scale) gets an empty image, not a 400: legend builders read tiny images as "no legend",
         // errors as failures.
         if rule.is_some() {
             return Err(OwsError::bad(
@@ -597,23 +613,57 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
         let empty = tiny_skia::Pixmap::new(1, 1).expect("1x1");
         return Ok(Response::ok("image/png", render::encode_png(&empty)?));
     }
+    // Item font: ITEMFONT* params, defaults Noto Sans 9 pt black (falls back to RGIS_LABEL_FONT).
+    let font = labels
+        .then(|| {
+            let req = crate::text::FontRequest {
+                family: p.get_or("ITEMFONTFAMILY", "Noto Sans").to_string(),
+                weight: if p.bool("ITEMFONTBOLD") { 700 } else { 400 },
+                italic: p.bool("ITEMFONTITALIC"),
+                style: String::new(),
+            };
+            let px = (p.f64("ITEMFONTSIZE").unwrap_or(9.0) * dpi / 72.0).round().max(1.0) as i32;
+            crate::text::font(&req, px)
+        })
+        .flatten();
+    let color = p.get("ITEMFONTCOLOR").and_then(parse_bgcolor).unwrap_or(Rgba(0, 0, 0, 255));
+    let runs: Vec<Option<Arc<crate::text::Run>>> = rows
+        .iter()
+        .map(|(_, t)| font.as_ref().filter(|_| !t.is_empty()).map(|f| f.shape(t)))
+        .collect();
+    let text_w = runs.iter().flatten().map(|r| r.width).fold(0.0, f64::max);
+    let text_h = font.as_ref().map_or(0.0, |f| f.ascent + f.descent);
+    let gap = if text_w > 0.0 { mm("ICONLABELSPACE", 2.0) } else { 0.0 };
     let pad = if rule.is_some() { 0 } else { 2 };
-    let total_h = patches.iter().map(|pm| pm.height() + pad).sum::<u32>() + pad;
-    let mut out = tiny_skia::Pixmap::new(w + 2 * pad, total_h).expect("legend size");
+    let row_h = |pm: &tiny_skia::Pixmap| (pm.height() as f64).max(text_h.ceil()) as u32;
+    let total_h = rows.iter().map(|(pm, _)| row_h(pm) + pad).sum::<u32>() + pad;
+    let total_w = w + 2 * pad + (gap + text_w).ceil() as u32;
+    let mut out = tiny_skia::Pixmap::new(total_w, total_h).expect("legend size");
     if !p.bool("TRANSPARENT") {
         out.fill(tiny_skia::Color::WHITE);
     }
+    let mut pb = tiny_skia::PathBuilder::new();
     let mut y = pad;
-    for pm in &patches {
+    for ((pm, _), run) in rows.iter().zip(&runs) {
+        let rh = row_h(pm);
         out.draw_pixmap(
             pad as i32,
-            y as i32,
+            (y + (rh - pm.height()) / 2) as i32,
             pm.as_ref(),
             &tiny_skia::PixmapPaint::default(),
             tiny_skia::Transform::identity(),
             None,
         );
-        y += pm.height() + pad;
+        if let (Some(f), Some(r)) = (&font, run) {
+            // Baseline centres the text box (ascent + descent) on the row.
+            let base = y as f64 + (rh as f64 + f.ascent - f.descent) / 2.0;
+            let x = (pad + w) as f64 + gap;
+            f.append_run(&mut pb, r, tiny_skia::Transform::from_translate(x as f32, base.round() as f32));
+        }
+        y += rh + pad;
+    }
+    if let Some(path) = pb.finish() {
+        crate::text::draw_text(&mut out, &path, color, color.3 as f64 / 255.0);
     }
     Ok(Response::ok("image/png", render::encode_png(&out)?))
 }

@@ -1274,6 +1274,12 @@ impl Renderer {
     }
 
     pub fn legend(&self) -> Vec<LegendItem<'_>> {
+        self.legend_at(None)
+    }
+
+    /// Legend items; with a scale, rules outside their range drop out with their children
+    /// (QgsRuleBasedRenderer::legendSymbolItems at a scale denominator).
+    pub fn legend_at(&self, scale: Option<f64>) -> Vec<LegendItem<'_>> {
         match self {
             Renderer::Single(s) => vec![LegendItem {
                 label: String::new(),
@@ -1308,20 +1314,24 @@ impl Renderer {
                 fn walk<'a>(
                     rs: &'a [Rule],
                     symbols: &'a HashMap<String, Symbol>,
+                    scale: Option<f64>,
                     out: &mut Vec<LegendItem<'a>>,
                 ) {
                     for r in rs {
+                        if scale.is_some_and(|sc| !in_scale(r, sc)) {
+                            continue;
+                        }
                         if let Some(s) = r.symbol.as_ref().and_then(|k| symbols.get(k)) {
                             out.push(LegendItem {
                                 label: r.label.clone(),
                                 symbol: s,
                             });
                         }
-                        walk(&r.children, symbols, out);
+                        walk(&r.children, symbols, scale, out);
                     }
                 }
                 let mut out = vec![];
-                walk(rules, symbols, &mut out);
+                walk(rules, symbols, scale, &mut out);
                 out
             }
         }
