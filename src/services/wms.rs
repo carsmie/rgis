@@ -561,7 +561,11 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
         layers.retain(|l| l.visible_at(sc));
     }
     let used = match &view {
-        Some(ms) => Some(symbols_in_view(&layers, ms, scale.unwrap_or_else(|| ms.scale()))?),
+        Some(ms) => Some(symbols_in_view(
+            &layers,
+            ms,
+            scale.unwrap_or_else(|| ms.scale()),
+        )?),
         None => None,
     };
     // Legend items of layer `i`, limited to the view's symbols with BBOX.
@@ -606,7 +610,10 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
     }
     // PNG: symbol patch + rule label per row (QgsLegendRenderer, no titles). Labels off for
     // RULE (single icon) and RULELABEL=false; single-symbol layers show the layer title.
-    let labels = rule.is_none() && !p.get("RULELABEL").is_some_and(|v| v.eq_ignore_ascii_case("false"));
+    let labels = rule.is_none()
+        && !p
+            .get("RULELABEL")
+            .is_some_and(|v| v.eq_ignore_ascii_case("false"));
     let mut rows: Vec<(tiny_skia::Pixmap, String)> = vec![];
     for (i, l) in layers.iter().enumerate() {
         let items = items_of(i);
@@ -646,18 +653,27 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
                 italic: p.bool("ITEMFONTITALIC"),
                 style: String::new(),
             };
-            let px = (p.f64("ITEMFONTSIZE").unwrap_or(9.0) * dpi / 72.0).round().max(1.0) as i32;
+            let px = (p.f64("ITEMFONTSIZE").unwrap_or(9.0) * dpi / 72.0)
+                .round()
+                .max(1.0) as i32;
             crate::text::font(&req, px)
         })
         .flatten();
-    let color = p.get("ITEMFONTCOLOR").and_then(parse_bgcolor).unwrap_or(Rgba(0, 0, 0, 255));
+    let color = p
+        .get("ITEMFONTCOLOR")
+        .and_then(parse_bgcolor)
+        .unwrap_or(Rgba(0, 0, 0, 255));
     let runs: Vec<Option<Arc<crate::text::Run>>> = rows
         .iter()
         .map(|(_, t)| font.as_ref().filter(|_| !t.is_empty()).map(|f| f.shape(t)))
         .collect();
     let text_w = runs.iter().flatten().map(|r| r.width).fold(0.0, f64::max);
     let text_h = font.as_ref().map_or(0.0, |f| f.ascent + f.descent);
-    let gap = if text_w > 0.0 { mm("ICONLABELSPACE", 2.0) } else { 0.0 };
+    let gap = if text_w > 0.0 {
+        mm("ICONLABELSPACE", 2.0)
+    } else {
+        0.0
+    };
     let pad = if rule.is_some() { 0 } else { 2 };
     let row_h = |pm: &tiny_skia::Pixmap| (pm.height() as f64).max(text_h.ceil()) as u32;
     let total_h = rows.iter().map(|(pm, _)| row_h(pm) + pad).sum::<u32>() + pad;
@@ -682,7 +698,11 @@ fn get_legend(ctx: &Context) -> Result<Response, OwsError> {
             // Baseline centres the text box (ascent + descent) on the row.
             let base = y as f64 + (rh as f64 + f.ascent - f.descent) / 2.0;
             let x = (pad + w) as f64 + gap;
-            f.append_run(&mut pb, r, tiny_skia::Transform::from_translate(x as f32, base.round() as f32));
+            f.append_run(
+                &mut pb,
+                r,
+                tiny_skia::Transform::from_translate(x as f32, base.round() as f32),
+            );
         }
         y += rh + pad;
     }
