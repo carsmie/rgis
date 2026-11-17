@@ -253,6 +253,9 @@ impl ConfigCache {
 
 pub type ApiHandler = fn(&Request, &Params, Option<&Project>) -> Result<Response, OwsError>;
 
+/// Per-process request counter; pairs `request start` with its `request` line.
+static REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     /// When the request on this thread has to give up (Settings::request_timeout).
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -447,6 +450,10 @@ impl Server {
     pub fn handle(&self, req: &Request) -> Response {
         let started = Instant::now();
         let _in_flight = crate::metrics::in_flight();
+        // Logged on arrival too: an OOM-killed request never reaches the completion line, so a
+        // `request start` id without a matching `request` line names the killer (Loki).
+        let id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        info!(id, method = %req.method, path = %req.path, query = %req.query, "request start");
         DEADLINE.set(self.settings.request_timeout.map(|t| started + t));
         let params = Params::from_query(&req.query);
         let service = params.service();
@@ -481,6 +488,7 @@ impl Server {
         };
         // One logfmt-style line per request (Loki: `| logfmt | unwrap ms` for percentiles).
         info!(
+            id,
             method = %req.method,
             path = %req.path,
             service = %service,
