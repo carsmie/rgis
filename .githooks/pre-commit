@@ -1,0 +1,10 @@
+#!/bin/sh
+# Mirror CI's fmt job so unformatted Rust never reaches a push.
+# Enable once per clone: git config core.hooksPath .githooks
+# Only gate when Rust files are staged; skip with --no-verify if you must.
+git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$' || exit 0
+if ! cargo fmt --check >/dev/null 2>&1; then
+    echo "pre-commit: cargo fmt --check failed. Run 'cargo fmt', re-stage, commit again." >&2
+    cargo fmt --check 2>&1 | grep '^Diff in' >&2
+    exit 1
+fi

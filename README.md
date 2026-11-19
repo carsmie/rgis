@@ -238,6 +238,9 @@ GDAL in the same `osgeo/gdal` image as the Dockerfile and without GDAL. Keep its
 versions in step with the Dockerfile. The commit that ran `cargo fmt` over the whole crate is
 listed in `.git-blame-ignore-revs` (`git config blame.ignoreRevsFile .git-blame-ignore-revs`).
 
+Run `git config core.hooksPath .githooks` once per clone: the pre-commit hook runs the same
+`cargo fmt --check` as CI and rejects commits of unformatted Rust.
+
 ## License
 
 GPL-2.0-or-later, the license of QGIS: much of rGIS is ported from QGIS and PAL source
