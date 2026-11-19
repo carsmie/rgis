@@ -293,7 +293,10 @@ impl InFlightGuard {
             p("BBOX"),
             p("WIDTH"),
             p("HEIGHT"),
-            params.get("DPI").map(|d| format!(" dpi={d}")).unwrap_or_default()
+            params
+                .get("DPI")
+                .map(|d| format!(" dpi={d}"))
+                .unwrap_or_default()
         );
         let e = Arc::new(InFlight {
             started: Instant::now(),
@@ -326,8 +329,11 @@ pub(crate) fn note_layer(name: &str) {
 
 /// "id=… 3.2s topo GetMap bbox=… 1024x1024 @roads; …", longest-running first.
 pub(crate) fn in_flight_summary() -> String {
-    let mut v: Vec<(u64, Arc<InFlight>)> =
-        IN_FLIGHT.lock().iter().map(|(k, e)| (*k, e.clone())).collect();
+    let mut v: Vec<(u64, Arc<InFlight>)> = IN_FLIGHT
+        .lock()
+        .iter()
+        .map(|(k, e)| (*k, e.clone()))
+        .collect();
     if v.is_empty() {
         return "none".into();
     }
@@ -551,7 +557,11 @@ impl Server {
         // it finished: layers skipped under IGNORE_RENDERING_ERRORS leave a partial image to cache.
         let turned_away = crate::alloc::busy();
         let resp = if turned_away {
-            Err(OwsError::new("ServerBusy", "shed under memory pressure", 503))
+            Err(OwsError::new(
+                "ServerBusy",
+                "shed under memory pressure",
+                503,
+            ))
         } else {
             self.dispatch(req, &params, &service)
         };
@@ -564,9 +574,15 @@ impl Server {
             _ if shed => {
                 crate::metrics::memory_shed_request();
                 if turned_away {
-                    debug!(id, "{} {}: turned away under memory pressure", req.method, req.path);
+                    debug!(
+                        id,
+                        "{} {}: turned away under memory pressure", req.method, req.path
+                    );
                 } else {
-                    warn!(id, "{} {}: shed under memory pressure", req.method, req.path);
+                    warn!(
+                        id,
+                        "{} {}: shed under memory pressure", req.method, req.path
+                    );
                 }
                 let version = if service == "WFS" { "1.2.0" } else { "1.3.0" };
                 OwsError::new(

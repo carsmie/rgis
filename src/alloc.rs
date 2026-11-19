@@ -159,12 +159,9 @@ fn stat_value(stat: &str, key: &str) -> Option<u64> {
 
 /// Container memory limit: cgroup v2 memory.max, else v1 memory.limit_in_bytes.
 fn cgroup_limit() -> Option<u64> {
-    parse_limit(&std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?)
-        .or_else(|| {
-            parse_limit(
-                &std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?,
-            )
-        })
+    parse_limit(&std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?).or_else(|| {
+        parse_limit(&std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?)
+    })
 }
 
 /// "max" and v1's "no limit" sentinel (≈ i64::MAX rounded to pages) mean unlimited.
