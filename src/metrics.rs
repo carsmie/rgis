@@ -53,6 +53,21 @@ static OVERRUNS: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("static metric")
 });
 
+static MEMORY_SHEDS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "rgis_memory_shed_total",
+        "Memory-guard episodes: RSS near the limit, in-flight requests answered 503"
+    )
+    .expect("static metric")
+});
+static MEMORY_SHED_REQUESTS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "rgis_memory_shed_requests_total",
+        "Requests answered 503 by the memory guard"
+    )
+    .expect("static metric")
+});
+
 // Counters, not a histogram: a topo deployment has hundreds of layers, and buckets × layers
 // is real series load. Sum and count give the average, which is what finds the slow layer.
 static LAYER_SECONDS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -178,6 +193,14 @@ pub fn request(service: &str, request: &str, status: u16, took: Duration, bytes:
     RESPONSE_BYTES
         .with_label_values(&[service, request])
         .inc_by(bytes as u64);
+}
+
+pub fn memory_shed() {
+    MEMORY_SHEDS.inc();
+}
+
+pub fn memory_shed_request() {
+    MEMORY_SHED_REQUESTS.inc();
 }
 
 pub fn overrun() {

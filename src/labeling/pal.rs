@@ -2943,6 +2943,10 @@ impl Pal {
         for li in (0..self.layers.len()).rev() {
             let nparts = self.layers[li].parts.len();
             for pi in 0..nparts {
+                // Shedding: stop; server::handle answers 503 anyway.
+                if crate::alloc::under_pressure() {
+                    break;
+                }
                 let part = &self.layers[li].parts[pi];
                 for h in &part.holes {
                     obstacles.push((li, h.clone()));

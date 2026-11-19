@@ -183,6 +183,9 @@ fn features_for_drawing(
     let clip = Rect::new(e.xmin - m, e.ymin - m, e.xmax + m, e.ymax + m);
     let mut prepared = Vec::with_capacity(out.len());
     for mut f in out {
+        if crate::alloc::under_pressure() {
+            anyhow::bail!("{}: shed under memory pressure", layer.name);
+        }
         let Some(g) = f.geometry.take() else { continue };
         let g = match tol {
             Some(t) => geom::simplify(&g, t),
@@ -404,8 +407,10 @@ pub fn render(jobs: &[LayerJob], ms: &MapSettings) -> Result<Pixmap> {
             &ahead,
         )
     })?;
+    // Fail rather than return layers skipped under IGNORE_RENDERING_ERRORS as a partial image.
+    crate::server::check_deadline()?;
     if let Some(engine) = labels.filter(|e| e.has_layers()) {
-        crate::server::check_deadline()?;
+        crate::server::note_layer("labels");
         let started = std::time::Instant::now();
         engine.draw(&mut pm);
         debug!("labeling took {:?}", started.elapsed());
@@ -508,6 +513,7 @@ fn render_layers(
             debug!("layer {} not visible at 1:{scale:.0}", l.name);
             continue;
         }
+        crate::server::note_layer(&l.name);
         if l.kind == "raster" {
             let started = std::time::Instant::now();
             if let Err(e) = render_raster(pm, l, ms) {
@@ -637,6 +643,10 @@ fn draw_features(
     let vars = layer_vars(l, ms, scale);
     let empty = Attrs::default();
     for (f, origin, _) in features {
+        // Stopping mid-layer is fine: server::handle answers 503 anyway.
+        if crate::alloc::under_pressure() {
+            return;
+        }
         let Some(g) = &f.geometry else { continue };
         let origin = origin.as_ref().map(to_px);
         let symbols = l.renderer.symbols_for(&f.attrs, scale);

@@ -259,6 +259,90 @@ static REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 thread_local! {
     /// When the request on this thread has to give up (Settings::request_timeout).
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// alloc::episode() when this thread's request started.
+    static SHED_EPISODE: Cell<Option<u64>> = const { Cell::new(None) };
+    /// The request on this thread, for note_layer.
+    static CURRENT: std::cell::RefCell<Option<Arc<InFlight>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// An in-flight request as the memory guard logs it: a dying pod's last WARN names what ran, and
+/// in which layer, at the spike.
+struct InFlight {
+    started: Instant,
+    what: String,
+    layer: Mutex<String>,
+}
+
+static IN_FLIGHT: std::sync::LazyLock<Mutex<HashMap<u64, Arc<InFlight>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Registers the request for in_flight_summary until dropped.
+struct InFlightGuard(u64);
+
+impl InFlightGuard {
+    fn new(id: u64, req: &Request, params: &Params) -> InFlightGuard {
+        let p = |k: &str| params.get(k).unwrap_or("");
+        let what = format!(
+            "{} {} bbox={} {}x{}{}",
+            req.path
+                .rsplit('/')
+                .next()
+                .filter(|t| !t.is_empty())
+                .unwrap_or(p("LAYERS")),
+            p("REQUEST"),
+            p("BBOX"),
+            p("WIDTH"),
+            p("HEIGHT"),
+            params.get("DPI").map(|d| format!(" dpi={d}")).unwrap_or_default()
+        );
+        let e = Arc::new(InFlight {
+            started: Instant::now(),
+            what,
+            layer: Default::default(),
+        });
+        IN_FLIGHT.lock().insert(id, e.clone());
+        CURRENT.with(|c| *c.borrow_mut() = Some(e));
+        InFlightGuard(id)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT.lock().remove(&self.0);
+        CURRENT.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Record the step the request on this thread is in (a layer name, "labels").
+pub(crate) fn note_layer(name: &str) {
+    CURRENT.with(|c| {
+        if let Some(e) = c.borrow().as_ref() {
+            let mut l = e.layer.lock();
+            l.clear();
+            l.push_str(name);
+        }
+    });
+}
+
+/// "id=… 3.2s topo GetMap bbox=… 1024x1024 @roads; …", longest-running first.
+pub(crate) fn in_flight_summary() -> String {
+    let mut v: Vec<(u64, Arc<InFlight>)> =
+        IN_FLIGHT.lock().iter().map(|(k, e)| (*k, e.clone())).collect();
+    if v.is_empty() {
+        return "none".into();
+    }
+    v.sort_by_key(|(_, e)| e.started);
+    v.iter()
+        .map(|(id, e)| {
+            format!(
+                "id={id} {:.1}s {} @{}",
+                e.started.elapsed().as_secs_f64(),
+                e.what,
+                e.layer.lock()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The current request's deadline, if it has one.
@@ -269,6 +353,9 @@ pub(crate) fn deadline() -> Option<Instant> {
 /// Fail past the request's deadline. Called between units of work (layers, the label solver), so a
 /// runaway request frees its thread rather than only losing its response.
 pub(crate) fn check_deadline() -> anyhow::Result<()> {
+    if crate::alloc::shed_since(SHED_EPISODE.get()) {
+        anyhow::bail!("shed under memory pressure");
+    }
     match DEADLINE.get() {
         Some(d) if Instant::now() >= d => anyhow::bail!("request timed out"),
         _ => Ok(()),
@@ -455,12 +542,40 @@ impl Server {
         let id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!(id, method = %req.method, path = %req.path, query = %req.query, "request start");
         DEADLINE.set(self.settings.request_timeout.map(|t| started + t));
+        let shed_start = Some(crate::alloc::episode());
+        SHED_EPISODE.set(shed_start);
         let params = Params::from_query(&req.query);
         let service = params.service();
-        let resp = self.dispatch(req, &params, &service);
-        let timed_out = check_deadline().is_err();
+        let in_flight = InFlightGuard::new(id, req, &params);
+        // Over the warn line: no new work. A request overlapping a shed episode fails whole even if
+        // it finished: layers skipped under IGNORE_RENDERING_ERRORS leave a partial image to cache.
+        let turned_away = crate::alloc::busy();
+        let resp = if turned_away {
+            Err(OwsError::new("ServerBusy", "shed under memory pressure", 503))
+        } else {
+            self.dispatch(req, &params, &service)
+        };
+        drop(in_flight);
+        let shed = turned_away || crate::alloc::shed_since(shed_start);
+        let timed_out = !shed && check_deadline().is_err();
         DEADLINE.set(None);
+        SHED_EPISODE.set(None);
         let resp = match resp {
+            _ if shed => {
+                crate::metrics::memory_shed_request();
+                if turned_away {
+                    debug!(id, "{} {}: turned away under memory pressure", req.method, req.path);
+                } else {
+                    warn!(id, "{} {}: shed under memory pressure", req.method, req.path);
+                }
+                let version = if service == "WFS" { "1.2.0" } else { "1.3.0" };
+                OwsError::new(
+                    "ServerBusy",
+                    "The server is short of memory; retry the request",
+                    503,
+                )
+                .to_response(version)
+            }
             Ok(r) => r,
             Err(e) => {
                 warn!("{} {}: {} ({})", req.method, req.path, e.message, e.code);

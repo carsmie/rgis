@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(axum::serve(listener, rgis::metrics::router()).into_future());
     }
     rgis::alloc::start_idle_release();
+    rgis::alloc::start_memory_guard();
     let app = rgis::http::router(server);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("rGIS listening on http://{addr}");

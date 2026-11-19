@@ -511,6 +511,9 @@ fn fgb_features<R: Read + Seek>(
             let mut it = FgbReader::open(&mut r)?.select_bbox(b.xmin, b.ymin, b.xmax, b.ymax)?;
             let mut ids = hits.iter().map(|h| h.index);
             while let Some(f) = it.next()? {
+                if crate::alloc::under_pressure() {
+                    anyhow::bail!("shed under memory pressure");
+                }
                 push(
                     ids.next()
                         .ok_or_else(|| anyhow!("FlatGeobuf index mismatch"))?,
@@ -523,6 +526,9 @@ fn fgb_features<R: Read + Seek>(
             let mut it = FgbReader::open(&mut r)?.select_all()?;
             let mut i = 0;
             while let Some(f) = it.next()? {
+                if crate::alloc::under_pressure() {
+                    anyhow::bail!("shed under memory pressure");
+                }
                 let keep = match (filter, f.to_geo()) {
                     (Some(b), Ok(g)) => bbox(&g).intersects(&b),
                     _ => true,
