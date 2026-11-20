@@ -157,15 +157,63 @@ fn ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// One client per connection string; tokio-postgres pipelines concurrent queries on it.
-static CLIENTS: std::sync::LazyLock<Mutex<HashMap<String, Arc<tokio_postgres::Client>>>> =
+/// Connections per connection string (RGIS_PG_POOL_SIZE, default 4). One pipelined client
+/// serialised every query of a pod in its one server backend: during slow on-prem bursts (lag26/
+/// 29/30, 5-14 s) all PostGIS layers of all in-flight renders queued behind each other.
+fn pool_size() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("RGIS_PG_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4)
+    });
+    *N
+}
+
+/// A pooled client and its in-flight query count (picks the least busy).
+struct Conn {
+    client: Arc<tokio_postgres::Client>,
+    busy: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Held for one query: counts towards its connection's load until dropped.
+pub(crate) struct PgClient {
+    client: Arc<tokio_postgres::Client>,
+    busy: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for PgClient {
+    fn drop(&mut self) {
+        self.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+static CLIENTS: std::sync::LazyLock<Mutex<HashMap<String, Vec<Conn>>>> =
     std::sync::LazyLock::new(Default::default);
 
-fn client(conninfo: &str, name: &str) -> Result<Arc<tokio_postgres::Client>> {
-    if let Some(c) = CLIENTS.lock().get(conninfo)
-        && !c.is_closed()
+fn checkout(c: &Conn) -> PgClient {
+    c.busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PgClient {
+        client: c.client.clone(),
+        busy: c.busy.clone(),
+    }
+}
+
+/// An idle pooled connection, else a new one while under the pool size, else the least busy.
+/// Connecting happens outside the lock (connect_timeout 5 s must not stall other layers).
+fn client(conninfo: &str, name: &str) -> Result<PgClient> {
+    use std::sync::atomic::Ordering::Relaxed;
     {
-        return Ok(c.clone());
+        let mut pools = CLIENTS.lock();
+        let conns = pools.entry(conninfo.to_string()).or_default();
+        conns.retain(|c| !c.client.is_closed());
+        let least = conns.iter().min_by_key(|c| c.busy.load(Relaxed));
+        if let Some(c) = least
+            && (c.busy.load(Relaxed) == 0 || conns.len() >= pool_size())
+        {
+            return Ok(checkout(c));
+        }
     }
     let ci = conninfo.to_string();
     let c = run(async move {
@@ -175,16 +223,33 @@ fn client(conninfo: &str, name: &str) -> Result<Arc<tokio_postgres::Client>> {
                 warn!("postgres connection closed: {e}");
             }
         });
-        // A runaway query must not hold a render slot forever.
+        // A runaway query must not hold a render slot forever. Synchronized seq scans start a
+        // concurrent scan mid-table: with several connections, row (= drawing) order of the same
+        // query varied between requests (overlapping features → different pixels on reseed).
         client
-            .batch_execute("SET statement_timeout = 30000")
+            .batch_execute("SET statement_timeout = 30000; SET synchronize_seqscans = off")
             .await?;
         Ok(Arc::new(client))
     })
     .with_context(|| format!("cannot connect to postgres {name}"))?;
-    info!("connected to postgres {name}");
-    CLIENTS.lock().insert(conninfo.to_string(), c.clone());
-    Ok(c)
+    let mut pools = CLIENTS.lock();
+    let conns = pools.entry(conninfo.to_string()).or_default();
+    // Threads that raced past the size check may have connected too: keep at most the pool size.
+    if conns.len() >= pool_size()
+        && let Some(c) = conns.iter().min_by_key(|c| c.busy.load(Relaxed))
+    {
+        return Ok(checkout(c));
+    }
+    info!(
+        "connected to postgres {name} ({} of {})",
+        conns.len() + 1,
+        pool_size()
+    );
+    conns.push(Conn {
+        client: c,
+        busy: Default::default(),
+    });
+    Ok(checkout(conns.last().expect("just pushed")))
 }
 
 pub struct PgSource {
@@ -224,13 +289,14 @@ impl PgSource {
         let c = client(&conninfo, &display)?;
         let (schema, table, geom) = (uri.schema.clone(), uri.table.clone(), uri.geom.clone());
         let rows = run(async move {
-            Ok(c.query(
-                "SELECT column_name::text, data_type::text FROM information_schema.columns \
+            Ok(c.client
+                .query(
+                    "SELECT column_name::text, data_type::text FROM information_schema.columns \
                  WHERE table_schema = $1 AND table_name = $2 AND column_name <> $3 \
                  AND udt_name NOT IN ('geometry', 'geography', 'raster') ORDER BY ordinal_position",
-                &[&schema, &table, &geom],
-            )
-            .await?)
+                    &[&schema, &table, &geom],
+                )
+                .await?)
         })
         .with_context(|| format!("cannot read columns of {display}"))?;
         let columns: Vec<Field> = rows
@@ -302,16 +368,41 @@ impl PgSource {
         };
         let c = client(&self.conninfo, &self.display)?;
         let started = std::time::Instant::now();
-        let rows = run(async move { Ok(c.query(query.as_str(), &[]).await?) })
-            .with_context(|| format!("postgres query on {} failed", self.display))?;
-        debug!(
-            "postgres {}: {} rows in {:?}",
-            self.display,
-            rows.len(),
-            started.elapsed()
-        );
-        let mut out = Vec::with_capacity(rows.len());
-        for (i, row) in rows.iter().enumerate() {
+        // Rows stream through a small bounded channel and become features (or are filtered out)
+        // as they arrive: the whole result set is never buffered (it was, as Rows, then again as
+        // features), and a slow consumer backs the stream up instead of growing memory.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<tokio_postgres::Row>>(256);
+        spawn_io(async move {
+            use futures_util::StreamExt;
+            let none: [&(dyn tokio_postgres::types::ToSql + Sync); 0] = [];
+            let stream = match c.client.query_raw(query.as_str(), none).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(e.into())).await;
+                    return;
+                }
+            };
+            let mut stream = std::pin::pin!(stream);
+            while let Some(r) = stream.next().await {
+                // Receiver gone (error, deadline, shed): stop; the connection drains the rest.
+                if tx.send(r.map_err(Into::into)).await.is_err() {
+                    break;
+                }
+            }
+            drop(c);
+        });
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while let Some(row) = rx.blocking_recv() {
+            let row = row.with_context(|| format!("postgres query on {} failed", self.display))?;
+            if crate::alloc::under_pressure() {
+                bail!("shed under memory pressure");
+            }
+            if i % 1024 == 1023 {
+                crate::server::check_deadline()?;
+            }
+            let fid_default = i as i64;
+            i += 1;
             let mut attrs = Attrs::default();
             for (j, f) in self.columns.iter().enumerate() {
                 let raw: Option<String> = row.get(j + 1);
@@ -340,8 +431,8 @@ impl PgSource {
                 .as_ref()
                 .and_then(|k| attrs.get(k))
                 .and_then(|v| v.as_i64())
-                .unwrap_or(i as i64);
-            let wkb: Option<Vec<u8>> = row.get(0);
+                .unwrap_or(fid_default);
+            let wkb: Option<&[u8]> = row.get(0);
             let geometry = wkb.and_then(|b| geozero::wkb::Wkb(b).to_geo().ok());
             out.push(Feature {
                 fid,
@@ -349,6 +440,12 @@ impl PgSource {
                 attrs,
             });
         }
+        debug!(
+            "postgres {}: {i} rows, {} kept in {:?}",
+            self.display,
+            out.len(),
+            started.elapsed()
+        );
         Ok(out)
     }
 }

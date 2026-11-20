@@ -87,6 +87,7 @@ environment variables; in addition:
   `subset=` filters on all of them; OGR's exact rectangle filter.
 * PostGIS: QGIS `postgres` datasources, queried as QGIS renders them (`geom && ST_MakeEnvelope`
   plus the datasource's `sql=`); `PGUSER`/`PGPASSWORD` override the datasource's credentials.
+  Up to `RGIS_PG_POOL_SIZE` (default 4) connections per connection string; rows are streamed.
 * Projects can live on GCS too: `MAP=/vsigs/bucket/key.qgs` (cached for
   `RGIS_REMOTE_PROJECT_TTL` seconds), and with `--projects-dir` the tnt-qgis URL scheme
   `/qgis/QLR/<name>` serves `<projects-dir><name>.qgs`. `GET /health` for probes; CORS headers

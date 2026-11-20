@@ -40,6 +40,7 @@ ENVIRONMENT:
     RGIS_METRICS_ADDR          address for Prometheus GET /metrics (default: off); a separate
                                port so metrics stay off the public service port
     PGUSER, PGPASSWORD         credentials for postgres layers (override the datasource's)
+    RGIS_PG_POOL_SIZE          postgres connections per datasource connection (default 4)
 
     GET /health answers 200 (liveness); GET /ready answers 503 until the warm-up is done.
 ";
