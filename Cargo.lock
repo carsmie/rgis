@@ -838,6 +838,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harfrust"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "741c9cd8fb2f39c393366b9cf13e8c31ad6adbbd9d817f0a18fe47cff36a3cca"
+dependencies = [
+ "bitflags 2.13.2",
+ "bytemuck",
+ "read-fonts 0.47.0",
+ "smallvec",
+ "yoke",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1964,7 +1977,7 @@ dependencies = [
  "gdal-sys",
  "geo-types",
  "geozero",
- "harfrust",
+ "harfrust 0.16.0",
  "hmac",
  "httpdate",
  "indexmap",
@@ -2938,7 +2951,7 @@ dependencies = [
  "data-url",
  "flate2",
  "fontdb",
- "harfrust",
+ "harfrust 0.15.0",
  "imagesize",
  "kurbo",
  "log",
