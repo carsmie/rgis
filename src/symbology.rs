@@ -690,6 +690,9 @@ fn stroke(
                 unit,
             )
         });
+    // A custom dash replaces the pen style, "no" included
+    // (QgsSimpleLineSymbolLayer::startRender; lag20 FKB sti relies on it).
+    let dashed = custom_dash.as_ref().is_some_and(|(d, _)| !d.is_empty());
     Stroke {
         color: p
             .get(color_key)
@@ -702,7 +705,7 @@ fn stroke(
         ),
         dash: dash_for(style),
         custom_dash,
-        visible: style != "no",
+        visible: style != "no" || dashed,
         join: p
             .get("joinstyle")
             .cloned()
@@ -1404,6 +1407,26 @@ mod tests {
         );
         assert_eq!(Rgba::parse("#ff0000"), Some(Rgba(255, 0, 0, 255)));
         assert_eq!(Rgba::parse("1,2,3"), Some(Rgba(1, 2, 3, 255)));
+    }
+
+    /// QGIS draws "no" + custom dash as dashed (3.40: same pixels as "solid" + custom dash).
+    #[test]
+    fn custom_dash_overrides_no_pen() {
+        let visible = |style: &str, on: &str, dash: &str, width: &str| {
+            let x = format!(
+                r#"<symbol type="line" alpha="1" name="0"><layer class="SimpleLine" enabled="1"><Option type="Map"><Option name="line_style" value="{style}"/><Option name="use_custom_dash" value="{on}"/><Option name="customdash" value="{dash}"/><Option name="customdash_unit" value="MM"/><Option name="line_width" value="{width}"/><Option name="line_width_unit" value="MM"/></Option></layer></symbol>"#
+            );
+            let d = roxmltree::Document::parse(&x).unwrap();
+            match &parse_symbol(d.root_element()).layers[0].kind {
+                SymbolLayer::SimpleLine { stroke, .. } => stroke.visible,
+                _ => panic!(),
+            }
+        };
+        assert!(visible("no", "1", "1.4;0.56", "0.28"));
+        assert!(visible("solid", "0", "1.4;0.56", "0.28"));
+        assert!(!visible("no", "0", "1.4;0.56", "0.28"));
+        assert!(!visible("no", "1", "", "0.28"));
+        assert!(visible("no", "1", "1.4;0.56", "0"));
     }
 
     #[test]
