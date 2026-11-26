@@ -642,34 +642,44 @@ fn draw_features(
     };
     let vars = layer_vars(l, ms, scale);
     let empty = Attrs::default();
-    for (f, origin, _) in features {
+    // (pass, feature, symbol) in drawing order; the stable sort keeps feature and rule order
+    // within a pass.
+    let mut queue: Vec<(Option<i32>, usize, &Symbol)> = vec![];
+    for (i, (f, _, _)) in features.iter().enumerate() {
+        if f.geometry.is_none() {
+            continue;
+        }
+        for sym in l.renderer.symbols_for(&f.attrs, scale) {
+            for pass in l.renderer.passes_of(sym) {
+                queue.push((pass, i, sym));
+            }
+        }
+    }
+    queue.sort_by_key(|j| j.0);
+    for (pass, i, sym) in queue {
         // Stopping mid-layer is fine: server::handle answers 503 anyway.
         if crate::alloc::under_pressure() {
             return;
         }
+        let (f, origin, _) = &features[i];
         let Some(g) = &f.geometry else { continue };
-        let origin = origin.as_ref().map(to_px);
-        let symbols = l.renderer.symbols_for(&f.attrs, scale);
         // Only symbols with data-defined properties need the merged context.
-        let ctx = if symbols.iter().any(|s| s.data_defined) {
+        let ctx = sym.data_defined.then(|| {
             let mut c = f.attrs.clone();
             c.extend(vars.iter().map(|(k, v)| (k.clone(), v.clone())));
             c.insert("$id".into(), json!(f.fid));
-            Some(c)
-        } else {
-            None
-        };
-        for sym in symbols {
-            draw_symbol(
-                pm,
-                sym,
-                g,
-                &to_px,
-                &units,
-                ctx.as_ref().unwrap_or(&empty),
-                origin,
-            );
-        }
+            c
+        });
+        draw_symbol_pass(
+            pm,
+            sym,
+            pass,
+            g,
+            &to_px,
+            &units,
+            ctx.as_ref().unwrap_or(&empty),
+            origin.as_ref().map(to_px),
+        );
     }
 }
 
@@ -880,7 +890,25 @@ pub fn draw_symbol(
     // Pixel position of the feature's (xmin, ymin): image fills in feature mode anchor here.
     origin: Option<(f32, f32)>,
 ) {
+    draw_symbol_pass(pm, sym, None, g, to_px, u, ctx, origin);
+}
+
+/// draw_symbol restricted to the symbol layers of one rendering pass (None = all).
+#[allow(clippy::too_many_arguments)]
+fn draw_symbol_pass(
+    pm: &mut Pixmap,
+    sym: &Symbol,
+    pass: Option<i32>,
+    g: &Geometry<f64>,
+    to_px: &dyn Fn(&Coord<f64>) -> (f32, f32),
+    u: &RenderUnits,
+    ctx: &Attrs,
+    origin: Option<(f32, f32)>,
+) {
     for layer in &sym.layers {
+        if pass.is_some_and(|p| p != layer.pass) {
+            continue;
+        }
         // Data-defined overrides for this feature (or the layer as is).
         let Some(kind) = layer.resolve(ctx) else {
             continue;
@@ -1209,6 +1237,7 @@ fn draw_point_symbol(
                     kind: kind.into_owned(),
                     dd: Default::default(),
                     effects: vec![],
+                    pass: 0,
                 }],
             };
             let g: Geometry<f64> = geo_types::Point::new(at.0 as f64, at.1 as f64).into();
@@ -1468,6 +1497,7 @@ fn draw_with_effects(
             kind,
             dd: Default::default(),
             effects: vec![],
+            pass: 0,
         }],
     };
     let (lf, tf) = (l as f32, t as f32);

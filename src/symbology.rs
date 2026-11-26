@@ -245,6 +245,8 @@ pub struct Layer {
     pub dd: HashMap<String, Expr>,
     /// Enabled paint effects (QgsEffectStack) in stack order; empty draws the layer as is.
     pub effects: Vec<Effect>,
+    /// Rendering pass (symbol level); only the rule renderer orders by it.
+    pub pass: i32,
 }
 
 /// One rendered entry of a symbol layer's QgsEffectStack.
@@ -975,6 +977,10 @@ pub fn parse_symbol(n: Node) -> Symbol {
             kind,
             dd: data_defined(l),
             effects: parse_effects(l),
+            pass: l
+                .attribute("pass")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         });
     }
     Symbol {
@@ -1179,6 +1185,18 @@ impl Renderer {
                 Renderer::Null
             }
         }
+    }
+
+    /// Rendering passes of a feature's symbols. QgsRuleBasedRenderer::stopRender always draws pass
+    /// by pass over all features, whatever `symbollevels` says. None = whole symbols in one go.
+    pub fn passes_of(&self, symbol: &Symbol) -> Vec<Option<i32>> {
+        if !matches!(self, Renderer::Rules { .. }) {
+            return vec![None];
+        }
+        let mut passes: Vec<i32> = symbol.layers.iter().map(|l| l.pass).collect();
+        passes.sort_unstable();
+        passes.dedup();
+        passes.into_iter().map(Some).collect()
     }
 
     /// Symbols to draw for a feature (QgsFeatureRenderer::symbolsForFeature).
@@ -1410,6 +1428,22 @@ mod tests {
     }
 
     /// QGIS draws "no" + custom dash as dashed (3.40: same pixels as "solid" + custom dash).
+    #[test]
+    fn rule_renderer_draws_by_pass() {
+        // Casing (pass 1) and fill (pass 2) as separate rules, fill rule first (lag28 s100 Veg).
+        let xml = r#"<renderer-v2 type="RuleRenderer"><rules key="r"><rule symbol="0" filter="1"/><rule symbol="1" filter="1"/></rules><symbols>
+            <symbol type="line" alpha="1" name="0"><layer class="SimpleLine" enabled="1" pass="2"/></symbol>
+            <symbol type="line" alpha="1" name="1"><layer class="SimpleLine" enabled="1" pass="1"/><layer class="SimpleLine" enabled="1" pass="1"/></symbol>
+        </symbols></renderer-v2>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let r = Renderer::parse(doc.root_element());
+        let syms = r.symbols_for(&Attrs::default(), 1000.0);
+        assert_eq!(r.passes_of(syms[0]), vec![Some(2)]);
+        assert_eq!(r.passes_of(syms[1]), vec![Some(1)]);
+        let single = Renderer::Single(syms[0].clone());
+        assert_eq!(single.passes_of(syms[0]), vec![None]);
+    }
+
     #[test]
     fn custom_dash_overrides_no_pen() {
         let visible = |style: &str, on: &str, dash: &str, width: &str| {
