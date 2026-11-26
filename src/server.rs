@@ -378,6 +378,8 @@ pub struct Settings {
     pub projects_dir: Option<PathBuf>,
     /// Requests still working after this long stop at the next layer and answer 503.
     pub request_timeout: Option<Duration>,
+    /// Requests slower than this log their access line at warn (RGIS_SLOW_REQUEST_MS).
+    pub slow_request: Option<Duration>,
 }
 
 pub struct Server {
@@ -546,7 +548,9 @@ impl Server {
         // Logged on arrival too: an OOM-killed request never reaches the completion line, so a
         // `request start` id without a matching `request` line names the killer (Loki).
         let id = REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        info!(id, method = %req.method, path = %req.path, query = %req.query, "request start");
+        // Target `rgis::access`: RUST_LOG=info,rgis::access=warn keeps only slow/failed requests.
+        // Debug: ~half the log volume under seeding; memory-guard warns list in-flight requests.
+        debug!(target: "rgis::access", id, method = %req.method, path = %req.path, query = %req.query, "request start");
         DEADLINE.set(self.settings.request_timeout.map(|t| started + t));
         let shed_start = Some(crate::alloc::episode());
         SHED_EPISODE.set(shed_start);
@@ -618,19 +622,33 @@ impl Server {
             }
         };
         // One logfmt-style line per request (Loki: `| logfmt | unwrap ms` for percentiles).
-        info!(
-            id,
-            method = %req.method,
-            path = %req.path,
-            service = %service,
-            request = %params.get("REQUEST").unwrap_or(""),
-            status = resp.status,
-            r#type = %resp.content_type.split(';').next().unwrap_or(""),
-            bytes = resp.body.len(),
-            ms = (started.elapsed().as_secs_f64() * 1e4).round() / 10.0,
-            query = %req.query,
-            "request"
-        );
+        // Warn when failed (5xx) or slow, so `rgis::access=warn` still surfaces the ones that matter.
+        let elapsed = started.elapsed();
+        let notable =
+            resp.status >= 500 || self.settings.slow_request.is_some_and(|t| elapsed >= t);
+        macro_rules! access {
+            ($lvl:ident) => {
+                $lvl!(
+                    target: "rgis::access",
+                    id,
+                    method = %req.method,
+                    path = %req.path,
+                    service = %service,
+                    request = %params.get("REQUEST").unwrap_or(""),
+                    status = resp.status,
+                    r#type = %resp.content_type.split(';').next().unwrap_or(""),
+                    bytes = resp.body.len(),
+                    ms = (elapsed.as_secs_f64() * 1e4).round() / 10.0,
+                    query = %req.query,
+                    "request"
+                )
+            };
+        }
+        if notable {
+            access!(warn);
+        } else {
+            access!(info);
+        }
         crate::metrics::request(
             &service,
             params.get("REQUEST").unwrap_or(""),

@@ -50,7 +50,8 @@ environment variables; in addition:
 | `RGIS_SVG_FONT` | default font family for text inside SVGs |
 | `RGIS_REQUEST_TIMEOUT` | seconds before a request stops at the next layer and answers 503 (default 120; 0 = never) |
 | `RGIS_RASTER_HIDPI=full` | render rasters at full density for HiDPI requests (see deliberate differences) |
-| `RUST_LOG` | log filter; `rgis::labels=debug` logs every placed label for diffing against QGIS |
+| `RGIS_SLOW_REQUEST_MS` | requests slower than this (or failing with 5xx) log their access line at warn instead of info (default 5000; 0 = never) |
+| `RUST_LOG` | log filter; `rgis::labels=debug` logs every placed label for diffing against QGIS; `info,rgis::access=warn` logs only slow/failed requests (`rgis::access=debug` adds a `request start` line per request) |
 
 ## Architecture: QGIS Server → this crate
 

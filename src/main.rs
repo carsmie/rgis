@@ -33,6 +33,9 @@ ENVIRONMENT:
     RGIS_RENDER_BUDGET_MPX     megapixels rendered at once (default 16)
     RGIS_REQUEST_TIMEOUT       seconds before a request gives up with 503 (default 120,
                                0 = never); checked between layers
+    RGIS_SLOW_REQUEST_MS       requests slower than this log their access line at warn
+                               (default 5000, 0 = never); with RUST_LOG=info,rgis::access=warn
+                               only slow and failed requests are logged
     RGIS_HTTP_CACHE_MB         remote-file block cache size (default 256)
     RGIS_HTTP_INFLIGHT_MB      remote reads in flight, not yet cached, process-wide (default 64)
     RGIS_RELEASE_IDLE_SECS     return free heap to the OS after this many idle seconds
@@ -100,6 +103,14 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => anyhow::bail!("RGIS_REQUEST_TIMEOUT must be a number of seconds"),
             },
             Err(_) => Some(std::time::Duration::from_secs(120)),
+        },
+        slow_request: match std::env::var("RGIS_SLOW_REQUEST_MS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+                Err(_) => anyhow::bail!("RGIS_SLOW_REQUEST_MS must be a number of milliseconds"),
+            },
+            Err(_) => Some(std::time::Duration::from_secs(5)),
         },
     };
     let server = Arc::new(Server::new(settings));
