@@ -219,6 +219,26 @@ pub fn layer_rendered(layer: &str, features: usize, took: Duration) {
     }
 }
 
+// PNG output split into its two CPU steps: un-premultiplying the pixmap and deflate. With
+// rgis_layer_render_microseconds_total this shows how much of a GetMap is encoding.
+static PNG_ENCODE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "rgis_png_encode_microseconds_total",
+        "Time encoding PNG responses, by step (unpremultiply, deflate)",
+        &["step"]
+    )
+    .expect("static metric")
+});
+
+pub fn png_encoded(unpremultiply: Duration, deflate: Duration) {
+    PNG_ENCODE
+        .with_label_values(&["unpremultiply"])
+        .inc_by(unpremultiply.as_micros() as u64);
+    PNG_ENCODE
+        .with_label_values(&["deflate"])
+        .inc_by(deflate.as_micros() as u64);
+}
+
 pub fn gate_waited(took: Duration) {
     GATE_WAIT.observe(took.as_secs_f64());
 }

@@ -2680,6 +2680,7 @@ pub fn scale(pm: &Pixmap, width: u32, height: u32) -> Pixmap {
 /// ARGB32 conversion: round to nearest, but exact halves round down (Qt's SSE4 path
 /// multiplies by an approximate 255/alpha that lands just below).
 pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
+    let t0 = std::time::Instant::now();
     let mut rgba = Vec::with_capacity(pm.pixels().len() * 4);
     for p in pm.pixels() {
         let a = p.alpha() as u32;
@@ -2700,6 +2701,7 @@ pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
             }
         }
     }
+    let t1 = std::time::Instant::now();
     let mut out = vec![];
     let fail = |e: png::EncodingError| {
         warn!("png encoding failed: {e}");
@@ -2714,6 +2716,7 @@ pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
     let mut w = enc.write_header().map_err(fail)?;
     w.write_image_data(&rgba).map_err(fail)?;
     w.finish().map_err(fail)?;
+    crate::metrics::png_encoded(t1 - t0, t1.elapsed());
     Ok(out)
 }
 
