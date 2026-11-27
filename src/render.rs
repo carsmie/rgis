@@ -2676,53 +2676,287 @@ pub fn scale(pm: &Pixmap, width: u32, height: u32) -> Pixmap {
     out
 }
 
-/// RGBA PNG of a premultiplied pixmap, un-premultiplied like Qt's ARGB32_Premultiplied ->
-/// ARGB32 conversion: round to nearest, but exact halves round down (Qt's SSE4 path
-/// multiplies by an approximate 255/alpha that lands just below).
-pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
-    let t0 = std::time::Instant::now();
-    let mut rgba = Vec::with_capacity(pm.pixels().len() * 4);
-    for p in pm.pixels() {
-        let a = p.alpha() as u32;
-        match a {
-            0 => rgba.extend([0; 4]),
-            255 => rgba.extend([p.red(), p.green(), p.blue(), 255]),
-            _ => {
-                for c in [p.red(), p.green(), p.blue()] {
-                    let twice = c as u32 * 510; // 2 * c * 255
-                    let v = if twice.is_multiple_of(a) && (twice / a) % 2 == 1 {
-                        twice / a / 2
-                    } else {
-                        (twice + a) / (2 * a)
-                    };
-                    rgba.push(v.min(255) as u8);
-                }
-                rgba.push(a as u8);
+/// Straight value of premultiplied channel `c` at alpha `a` (1..=255), like Qt's
+/// ARGB32_Premultiplied -> ARGB32 conversion: round to nearest, but exact halves round down
+/// (Qt's SSE4 path multiplies by an approximate 255/alpha that lands just below).
+fn unpremultiply_qt(c: u32, a: u32) -> u8 {
+    let twice = c * 510; // 2 * c * 255
+    let v = if twice.is_multiple_of(a) && (twice / a) % 2 == 1 {
+        twice / a / 2
+    } else {
+        (twice + a) / (2 * a)
+    };
+    v.min(255) as u8
+}
+
+/// `unpremultiply_qt` for every (alpha, channel), indexed `alpha << 8 | channel`: one lookup
+/// instead of two divisions per channel. A 2x metatile layer is ~2 Mpx, and the division loop
+/// cost about as much as the deflate after it (2026-11-27 measurement).
+static UNPREMULTIPLY: std::sync::LazyLock<Box<[u8]>> = std::sync::LazyLock::new(|| {
+    let mut t = vec![0u8; 256 * 256];
+    for a in 1..256u32 {
+        for c in 0..256u32 {
+            t[(a as usize) << 8 | c as usize] = unpremultiply_qt(c, a);
+        }
+    }
+    t.into_boxed_slice()
+});
+
+/// Straight RGBA of premultiplied `src` into `out` (same length), `unpremultiply_qt` per channel.
+fn unpremultiply_into(src: &[u8], out: &mut [u8]) {
+    let lut = &*UNPREMULTIPLY;
+    for (o, p) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
+        match p[3] {
+            0 => *o = [0; 4],
+            255 => *o = *p,
+            a => {
+                let row = &lut[(a as usize) << 8..][..256];
+                o[0] = row[p[0] as usize];
+                o[1] = row[p[1] as usize];
+                o[2] = row[p[2] as usize];
+                o[3] = a;
             }
         }
     }
-    let t1 = std::time::Instant::now();
-    let mut out = vec![];
+}
+
+/// Straight RGBA of a premultiplied pixmap (`unpremultiply_qt` per channel).
+#[cfg(test)]
+fn unpremultiplied_rgba(pm: &Pixmap) -> Vec<u8> {
+    let mut rgba = vec![0u8; pm.data().len()];
+    unpremultiply_into(pm.data(), &mut rgba);
+    rgba
+}
+
+/// Rows un-premultiplied per block before they go to the encoder: no full-size straight copy
+/// of the image (8 MB for a 2x metatile layer), and only a few timer reads per image.
+const ENCODE_BLOCK_ROWS: usize = 64;
+
+/// RGBA PNG of a premultiplied pixmap, un-premultiplied like Qt (`unpremultiply_qt`), streamed
+/// to the encoder in row blocks. 2026-11-27, 28 real 2x metatile layers: 143 → 98 ms per
+/// metatile (table + streaming); same pixels, deflate output ~0.25 % larger.
+pub fn encode_png(pm: &Pixmap) -> Result<Vec<u8>> {
+    use std::io::Write;
+    let t0 = std::time::Instant::now();
     let fail = |e: png::EncodingError| {
         warn!("png encoding failed: {e}");
         anyhow::anyhow!("png encoding failed: {e}")
     };
-    let mut enc = png::Encoder::new(&mut out, pm.width(), pm.height());
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    // fdeflate: ~zlib level 1 speed (the QGIS fork serves PNG level 1); Balanced spent ~14%
-    // of a dense lag21 render compressing.
-    enc.set_compression(png::Compression::Fast);
-    let mut w = enc.write_header().map_err(fail)?;
-    w.write_image_data(&rgba).map_err(fail)?;
-    w.finish().map_err(fail)?;
-    crate::metrics::png_encoded(t1 - t0, t1.elapsed());
+    let stride = pm.width() as usize * 4;
+    let mut unpremultiply = std::time::Duration::ZERO;
+    let mut out = vec![];
+    {
+        let mut enc = png::Encoder::new(&mut out, pm.width(), pm.height());
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        // fdeflate: ~zlib level 1 speed (the QGIS fork serves PNG level 1); Balanced spent ~14%
+        // of a dense lag21 render compressing.
+        enc.set_compression(png::Compression::Fast);
+        let mut w = enc.write_header().map_err(fail)?;
+        let mut sw = w.stream_writer().map_err(fail)?;
+        let mut block = vec![0u8; stride * ENCODE_BLOCK_ROWS.min(pm.height() as usize)];
+        for rows in pm.data().chunks(stride * ENCODE_BLOCK_ROWS) {
+            let t = std::time::Instant::now();
+            let block = &mut block[..rows.len()];
+            unpremultiply_into(rows, block);
+            unpremultiply += t.elapsed();
+            sw.write_all(block)
+                .map_err(|e| anyhow::anyhow!("png encoding failed: {e}"))?;
+        }
+        sw.finish().map_err(fail)?;
+    }
+    crate::metrics::png_encoded(unpremultiply, t0.elapsed().saturating_sub(unpremultiply));
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-2026-11-27 loop, kept as the reference for the table version.
+    fn unpremultiplied_rgba_reference(pm: &Pixmap) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(pm.pixels().len() * 4);
+        for p in pm.pixels() {
+            let a = p.alpha() as u32;
+            match a {
+                0 => rgba.extend([0; 4]),
+                255 => rgba.extend([p.red(), p.green(), p.blue(), 255]),
+                _ => {
+                    for c in [p.red(), p.green(), p.blue()] {
+                        let twice = c as u32 * 510;
+                        let v = if twice.is_multiple_of(a) && (twice / a) % 2 == 1 {
+                            twice / a / 2
+                        } else {
+                            (twice + a) / (2 * a)
+                        };
+                        rgba.push(v.min(255) as u8);
+                    }
+                    rgba.push(a as u8);
+                }
+            }
+        }
+        rgba
+    }
+
+    /// Pixmap with every alpha and a spread of valid premultiplied channels (c <= a).
+    fn test_pixmap(w: u32, h: u32) -> Pixmap {
+        let mut pm = Pixmap::new(w, h).unwrap();
+        let mut x: u32 = 0x9e37_79b9;
+        for p in pm.data_mut().as_chunks_mut::<4>().0 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let a = (x >> 24) as u8;
+            p[3] = a;
+            for (i, c) in p[..3].iter_mut().enumerate() {
+                *c = (((x >> (i * 8)) & 0xff) as u16 % (a as u16 + 1)) as u8;
+            }
+        }
+        pm
+    }
+
+    #[test]
+    fn unpremultiply_table_matches_formula_everywhere() {
+        let lut = &*UNPREMULTIPLY;
+        for a in 1..256u32 {
+            for c in 0..256u32 {
+                assert_eq!(
+                    lut[(a as usize) << 8 | c as usize],
+                    unpremultiply_qt(c, a),
+                    "a={a} c={c}"
+                );
+            }
+        }
+    }
+
+    /// The streamed PNG decodes to exactly the old loop's straight RGBA (odd sizes: partial
+    /// last block, single row).
+    #[test]
+    fn encode_png_decodes_to_reference_pixels() {
+        for (w, h) in [(331, 197), (1, 1), (700, 64), (5, 129)] {
+            let pm = test_pixmap(w, h);
+            let png_bytes = encode_png(&pm).unwrap();
+            let mut r = png::Decoder::new(std::io::Cursor::new(png_bytes))
+                .read_info()
+                .unwrap();
+            let mut buf = vec![0; r.output_buffer_size().unwrap()];
+            r.next_frame(&mut buf).unwrap();
+            assert_eq!(buf, unpremultiplied_rgba_reference(&pm), "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn unpremultiplied_rgba_matches_reference_loop() {
+        let pm = test_pixmap(331, 197);
+        assert_eq!(
+            unpremultiplied_rgba(&pm),
+            unpremultiplied_rgba_reference(&pm)
+        );
+    }
+
+    /// `cargo test --release --no-default-features unpremultiply_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn unpremultiply_speed() {
+        let pm = test_pixmap(1424, 1424);
+        let _ = unpremultiplied_rgba(&pm);
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(unpremultiplied_rgba_reference(&pm));
+        }
+        let old = t.elapsed() / 10;
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(unpremultiplied_rgba(&pm));
+        }
+        let new = t.elapsed() / 10;
+        println!("1424² unpremultiply: reference {old:?}, table {new:?}");
+    }
+
+    /// Same on real layer PNGs: `PNGBENCH_DIR=<dir of GetMap PNGs> cargo test --release
+    /// --no-default-features unpremultiply_real -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn unpremultiply_real() {
+        let Ok(dir) = std::env::var("PNGBENCH_DIR") else {
+            return;
+        };
+        let mut pms = vec![];
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let dec = png::Decoder::new(std::io::BufReader::new(
+                std::fs::File::open(e.path()).unwrap(),
+            ));
+            let mut r = dec.read_info().unwrap();
+            let mut buf = vec![0; r.output_buffer_size().unwrap()];
+            let info = r.next_frame(&mut buf).unwrap();
+            assert_eq!(info.color_type, png::ColorType::Rgba);
+            let mut pm = Pixmap::new(info.width, info.height).unwrap();
+            for (d, s) in pm
+                .data_mut()
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(buf.as_chunks::<4>().0)
+            {
+                let a = s[3] as u32;
+                for i in 0..3 {
+                    d[i] = ((s[i] as u32 * a + 127) / 255) as u8;
+                }
+                d[3] = s[3];
+            }
+            pms.push(pm);
+        }
+        let time = |f: &dyn Fn(&Pixmap) -> Vec<u8>| {
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                for pm in &pms {
+                    std::hint::black_box(f(pm));
+                }
+            }
+            t.elapsed() / 5
+        };
+        for pm in &pms {
+            assert_eq!(unpremultiplied_rgba(pm), unpremultiplied_rgba_reference(pm));
+        }
+        println!(
+            "{} real layers, per metatile: reference {:?}, table {:?}",
+            pms.len(),
+            time(&unpremultiplied_rgba_reference),
+            time(&unpremultiplied_rgba)
+        );
+        // Whole encode: the old loop + one-shot deflate vs encode_png (table, streamed rows).
+        let old_png = |pm: &Pixmap| {
+            let mut out = vec![];
+            let mut e = png::Encoder::new(&mut out, pm.width(), pm.height());
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Eight);
+            e.set_compression(png::Compression::Fast);
+            let mut wr = e.write_header().unwrap();
+            wr.write_image_data(&unpremultiplied_rgba_reference(pm))
+                .unwrap();
+            wr.finish().unwrap();
+            out.len()
+        };
+        let t = |f: &dyn Fn(&Pixmap) -> usize| {
+            let t = std::time::Instant::now();
+            let mut bytes = 0;
+            for _ in 0..3 {
+                bytes = pms.iter().map(f).sum();
+            }
+            (t.elapsed() / 3, bytes)
+        };
+        let old = t(&old_png);
+        let new = t(&|pm| encode_png(pm).unwrap().len());
+        println!(
+            "encode per metatile: old {:?} ({} B), encode_png {:?} ({} B)",
+            old.0, old.1, new.0, new.1
+        );
+    }
 
     #[test]
     fn simple_line_offset_goes_into_rings_either_winding() {
