@@ -85,6 +85,12 @@ async fn handle(
             }
             out.headers_mut()
                 .insert(header::SERVER, HeaderValue::from_static("rGIS"));
+            for (k, v) in r.headers {
+                out.headers_mut().insert(
+                    header::HeaderName::from_static(k),
+                    HeaderValue::from_static(v),
+                );
+            }
             cors(out.headers_mut());
             out
         }

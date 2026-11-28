@@ -230,6 +230,18 @@ static PNG_ENCODE: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("static metric")
 });
 
+static EMPTY_IMAGES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "rgis_empty_images_total",
+        "GetMap responses with nothing drawn (cached empty PNG, X-Empty-Image)"
+    )
+    .expect("static metric")
+});
+
+pub fn empty_image() {
+    EMPTY_IMAGES.inc();
+}
+
 pub fn png_encoded(unpremultiply: Duration, deflate: Duration) {
     PNG_ENCODE
         .with_label_values(&["unpremultiply"])

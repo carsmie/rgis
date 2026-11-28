@@ -26,6 +26,8 @@ pub struct Response {
     pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Extra response headers (e.g. `X-Empty-Image` on a fully transparent GetMap).
+    pub headers: Vec<(&'static str, &'static str)>,
 }
 
 impl Response {
@@ -34,6 +36,7 @@ impl Response {
             status: 200,
             content_type: content_type.to_string(),
             body: body.into(),
+            headers: vec![],
         }
     }
     pub fn json(v: &serde_json::Value) -> Response {
@@ -76,6 +79,7 @@ impl OwsError {
             status: self.status,
             content_type: "text/xml; charset=utf-8".into(),
             body: body.into_bytes(),
+            headers: vec![],
         }
     }
 }

@@ -2737,6 +2737,48 @@ fn unpremultiplied_rgba(pm: &Pixmap) -> Vec<u8> {
 /// of the image (8 MB for a 2x metatile layer), and only a few timer reads per image.
 const ENCODE_BLOCK_ROWS: usize = 64;
 
+/// True if nothing was drawn: every byte zero (premultiplied transparent = 0,0,0,0). OR-folds
+/// fixed blocks so it vectorises; a drawn layer usually stops in the first block.
+pub fn is_fully_transparent(pm: &Pixmap) -> bool {
+    pm.data()
+        .chunks(16 * 1024)
+        .all(|c| c.iter().fold(0u8, |a, &b| a | b) == 0)
+}
+
+/// PNG of a fully transparent `w` x `h` image, compressed hard (~8 KB at 1424², vs 43 KB from
+/// the fast encoder) and kept per size: empty layers are common (sea layers inland, Svalbard
+/// layers on the mainland: 16 of 28 layers of a 2026-11-27 metatile) and cost a full
+/// un-premultiply + deflate otherwise. Same pixels as `encode_png` of an empty pixmap.
+pub fn empty_png(w: u32, h: u32) -> Result<std::sync::Arc<[u8]>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<(u32, u32), Arc<[u8]>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if let Some(p) = CACHE.lock().unwrap().get(&(w, h)) {
+        return Ok(p.clone());
+    }
+    let mut out = vec![];
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::High);
+        let mut wr = enc
+            .write_header()
+            .map_err(|e| anyhow::anyhow!("png encoding failed: {e}"))?;
+        wr.write_image_data(&vec![0u8; w as usize * h as usize * 4])
+            .map_err(|e| anyhow::anyhow!("png encoding failed: {e}"))?;
+    }
+    let png: Arc<[u8]> = out.into();
+    let mut cache = CACHE.lock().unwrap();
+    // Coverage sub-images come in many sizes: bound the cache instead of evicting smartly.
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert((w, h), png.clone());
+    Ok(png)
+}
+
 /// RGBA PNG of a premultiplied pixmap, un-premultiplied like Qt (`unpremultiply_qt`), streamed
 /// to the encoder in row blocks. 2026-11-27, 28 real 2x metatile layers: 143 → 98 ms per
 /// metatile (table + streaming); same pixels, deflate output ~0.25 % larger.
@@ -2832,6 +2874,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Empty detection and the cached empty PNG: decodes to all-zero RGBA of the size, like
+    /// `encode_png` of an untouched pixmap; one drawn pixel is not empty.
+    #[test]
+    fn empty_png_matches_encoded_empty_pixmap() {
+        let mut pm = Pixmap::new(301, 77).unwrap();
+        assert!(is_fully_transparent(&pm));
+        let decode = |bytes: &[u8]| {
+            let mut r = png::Decoder::new(std::io::Cursor::new(bytes.to_vec()))
+                .read_info()
+                .unwrap();
+            let mut buf = vec![0; r.output_buffer_size().unwrap()];
+            let info = r.next_frame(&mut buf).unwrap();
+            (info.width, info.height, buf)
+        };
+        let cached = empty_png(301, 77).unwrap();
+        assert_eq!(decode(&cached), decode(&encode_png(&pm).unwrap()));
+        assert!(std::sync::Arc::ptr_eq(
+            &cached,
+            &empty_png(301, 77).unwrap()
+        ));
+        let last = pm.data().len() - 1;
+        pm.data_mut()[last] = 1;
+        assert!(!is_fully_transparent(&pm));
     }
 
     /// The streamed PNG decodes to exactly the old loop's straight RGBA (odd sizes: partial

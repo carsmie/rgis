@@ -454,6 +454,7 @@ fn get_feature(ctx: &Context) -> Result<Response, OwsError> {
             status: 200,
             content_type: "application/vnd.geo+json; charset=utf-8".into(),
             body: serde_json::to_vec(&doc).unwrap_or_default(),
+            headers: vec![],
         });
     }
 

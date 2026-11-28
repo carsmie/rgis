@@ -326,6 +326,17 @@ fn get_map(ctx: &Context, version: &str) -> Result<Response, OwsError> {
         .map_err(|e| OwsError::internal(format!("Rendering error : '{e:#}'")))?;
     let pm = render::scale(&pm, requested.0, requested.1);
     let rendered = t.elapsed();
+    if render::is_fully_transparent(&pm) {
+        // Nothing drawn: a cached PNG instead of un-premultiplying and deflating zeros; the
+        // header lets a compositing client (rMapproxy) skip decoding it too.
+        crate::metrics::empty_image();
+        let mut r = Response::ok(
+            "image/png",
+            render::empty_png(pm.width(), pm.height())?.to_vec(),
+        );
+        r.headers.push(("x-empty-image", "1"));
+        return Ok(r);
+    }
     let png = render::encode_png(&pm)?;
     tracing::debug!(
         "GetMap: render {rendered:?}, png encode {:?}",
